@@ -248,6 +248,7 @@ tbody tr:hover{ background: var(--surface-2); }
   background:#fff; border-radius:16px; width:100%; max-width:560px; box-shadow: var(--shadow-lg);
   animation: pop .16s ease; margin-bottom:40px;
 }
+.modal.modal-wide{ max-width:820px; }
 @keyframes pop{ from{ opacity:0; transform: translateY(6px) scale(.98);} to{opacity:1; transform:none;} }
 .modal-header{ display:flex; align-items:center; justify-content:space-between; padding:18px 22px; border-bottom:1px solid var(--border); }
 .modal-header h2{ margin:0; font-size:16px; font-weight:700; }

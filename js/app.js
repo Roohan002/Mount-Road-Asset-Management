@@ -175,6 +175,7 @@ function openModal(title, bodyHtml, onMount) {
 function closeModal() {
   document.getElementById("modalOverlay").classList.remove("open");
   document.getElementById("modalBody").innerHTML = "";
+  document.getElementById("modal").classList.remove("modal-wide");
 }
 document.getElementById("modalClose").addEventListener("click", closeModal);
 document.getElementById("modalOverlay").addEventListener("click", (e) => {
@@ -268,6 +269,7 @@ const PAGES = {
   assignment: { title: "Asset Assignment", render: renderAssignment },
   inventory: { title: "Master Inventory", render: renderInventory },
   employees: { title: "Employees", render: renderEmployees },
+  empHistory: { title: "Employee History", render: renderEmployeeHistory },
   stock: { title: "Stock Summary", render: renderStock },
   refill: { title: "Stock Refill Log", render: renderRefill },
   categories: { title: "Asset Categories", render: renderCategories },
@@ -1094,6 +1096,131 @@ function importEmployeeRows(rawRows) {
     </div>
     <div class="form-actions"><button class="btn btn-primary" id="closeImport">Done</button></div>
   `, () => { document.getElementById("closeImport").onclick = () => { closeModal(); goto("employees"); }; });
+}
+
+/* =========================================================
+   EMPLOYEE HISTORY  (per-employee asset usage record)
+   ========================================================= */
+let empHistFilter = { q: "", dept: "" };
+
+// All assignment records that belong to a given employee — matched by
+// Employee ID first (most reliable), falling back to a case-insensitive
+// name match so records entered before an ID existed still show up.
+function getAssignmentsForEmployee(emp) {
+  const nameKey = (emp.name || "").trim().toLowerCase();
+  const idKey = (emp.id || "").trim().toLowerCase();
+  return DB.assignments
+    .filter(a => {
+      const aId = (a.employeeId || "").trim().toLowerCase();
+      const aName = (a.employeeName || "").trim().toLowerCase();
+      if (idKey && aId) return aId === idKey;
+      return aName === nameKey;
+    })
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+}
+
+// "Currently assigned" = anything not yet marked Returned (covers
+// "Assigned" and "Overdue", and any custom status the sheet may add).
+function currentlyHeldCount(records) {
+  return records.filter(a => (a.status || "").toLowerCase() !== "returned").length;
+}
+
+function renderEmployeeHistory() {
+  const content = document.getElementById("content");
+  const depts = [...new Set(DB.employees.map(e => e.department).filter(Boolean))].sort();
+
+  content.innerHTML = `
+    ${viewerNotice()}
+    <div class="card">
+      <div class="card-header">
+        <div><h2>Employee History</h2><div class="sub">Complete asset-usage record for every employee — items ever issued and what's currently with them</div></div>
+      </div>
+      <div class="toolbar">
+        <div class="search-box"><input type="text" id="empHistSearch" placeholder="Search name or ID..." /></div>
+        <select class="filter-select" id="empHistDeptFilter">
+          <option value="">All departments</option>
+          ${depts.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Employee ID</th><th>Name</th><th>Department</th>
+          <th>Total Assets Issued</th><th>Currently Assigned</th><th>Returned</th><th></th>
+        </tr></thead>
+        <tbody id="empHistTbody"></tbody>
+      </table></div>
+    </div>
+  `;
+
+  document.getElementById("empHistSearch").oninput = (e) => { empHistFilter.q = e.target.value.toLowerCase(); paintEmpHistTable(); };
+  document.getElementById("empHistDeptFilter").onchange = (e) => { empHistFilter.dept = e.target.value; paintEmpHistTable(); };
+
+  paintEmpHistTable();
+}
+
+function paintEmpHistTable() {
+  const tbody = document.getElementById("empHistTbody");
+  if (!tbody) return;
+
+  let rows = [...DB.employees];
+  if (empHistFilter.q) rows = rows.filter(e => `${e.id} ${e.name}`.toLowerCase().includes(empHistFilter.q));
+  if (empHistFilter.dept) rows = rows.filter(e => e.department === empHistFilter.dept);
+
+  const withCounts = rows.map(e => {
+    const records = getAssignmentsForEmployee(e);
+    const current = currentlyHeldCount(records);
+    return { emp: e, records, total: records.length, current, returned: records.length - current };
+  }).sort((a, b) => b.total - a.total);
+
+  tbody.innerHTML = withCounts.length ? withCounts.map(({ emp, total, current, returned }) => `
+    <tr>
+      <td>${escapeHtml(emp.id || "—")}</td>
+      <td>${escapeHtml(emp.name)}</td>
+      <td>${escapeHtml(emp.department || "—")}</td>
+      <td>${total}</td>
+      <td>${current > 0 ? `<span class="badge badge-blue">${current}</span>` : `<span class="badge badge-grey">0</span>`}</td>
+      <td>${returned}</td>
+      <td><button class="btn btn-secondary btn-sm" onclick="openEmpHistoryModal('${emp.uid}')">View Record</button></td>
+    </tr>
+  `).join("") : `<tr class="empty-row"><td colspan="7">No employees found</td></tr>`;
+}
+
+function openEmpHistoryModal(empUid) {
+  const emp = DB.employees.find(e => e.uid === empUid);
+  if (!emp) return;
+  const records = getAssignmentsForEmployee(emp);
+  const current = currentlyHeldCount(records);
+
+  openModal(`${emp.name} — Full Record`, `
+    <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:16px;">
+      <div class="muted">Employee ID: <strong>${escapeHtml(emp.id || "—")}</strong></div>
+      <div class="muted">Department: <strong>${escapeHtml(emp.department || "—")}</strong></div>
+      <div class="muted">Total Assets Issued: <strong>${records.length}</strong></div>
+      <div class="muted">Currently Assigned: <strong>${current}</strong></div>
+    </div>
+    <div class="table-wrap">
+      <table style="min-width:640px">
+        <thead><tr><th>Date</th><th>Asset</th><th>Status</th><th>Assigned By</th><th>Return Date</th><th>Remarks</th></tr></thead>
+        <tbody>
+          ${records.length ? records.map(a => `
+            <tr>
+              <td>${fmtDate(a.date)}</td>
+              <td>${escapeHtml(a.assetName)}</td>
+              <td>${statusBadge(a.status)}</td>
+              <td>${escapeHtml(a.assignedBy || "—")}</td>
+              <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}</td>
+              <td>${escapeHtml(a.remarks || "—")}</td>
+            </tr>`).join("") : `<tr class="empty-row"><td colspan="6">No assets have been issued to this employee yet</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="closeEmpHist">Close</button>
+    </div>
+  `, () => {
+    document.getElementById("modal").classList.add("modal-wide");
+    document.getElementById("closeEmpHist").onclick = closeModal;
+  });
 }
 
 /* =========================================================
