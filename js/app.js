@@ -1,6 +1,7 @@
 /* =========================================================
    Mount Road Office — Asset Management System
-   Pure client-side app. Data persists in localStorage.
+   Cloud-backed: data lives in Cloud Firestore so anyone with the
+   link can view it live, and only signed-in admins can edit it.
    Mirrors the logic of the original Excel workbook:
      - Total Stock (auto)      = SUM of Stock Refill Log qty per category
      - Assigned / In Use (auto)= COUNT of assignments with status "Assigned"
@@ -8,83 +9,84 @@
      - Stock Alert              = "Low Stock" when Available <= Threshold
    ========================================================= */
 
-const DB_KEY = "mountRoadAssetDB_v1";
-const ROLE_KEY = "mountRoadAssetRole_v1";
-const ADMIN_PASSWORD = "admin123"; // basic client-side gate — change this if you like
-
 let DB = null;
 let currentPage = "dashboard";
+let fbApp = null, fdb = null, fauth = null;
+const FIRESTORE_COLLECTION = "assetTracker";
+const FIRESTORE_DOC = "data";
 
-/* ---------------- Role management ---------------- */
-// NOTE: this is a lightweight UI gate (everything runs in the browser, so a
-// technical user could bypass it). It's meant to stop accidental edits, not
-// to be bank-grade security. For real access control you'd need a backend.
-function getRole() {
-  return localStorage.getItem(ROLE_KEY) || "viewer";
+/* ---------------- Firebase bootstrap ---------------- */
+function firebaseConfigured() {
+  return typeof firebaseConfig !== "undefined"
+    && firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY"
+    && firebaseConfig.projectId && firebaseConfig.projectId !== "YOUR_PROJECT_ID";
 }
-function setRole(role) {
-  localStorage.setItem(ROLE_KEY, role);
-  paintRoleUI();
+function initFirebase() {
+  fbApp = firebase.initializeApp(firebaseConfig);
+  fdb = firebase.firestore();
+  fauth = firebase.auth();
 }
+function docRef() {
+  return fdb.collection(FIRESTORE_COLLECTION).doc(FIRESTORE_DOC);
+}
+
+/* ---------------- Role management (Firebase Auth) ---------------- */
+// Viewer = not signed in (read-only, live data). Admin = signed in with an
+// email/password account you create yourself in the Firebase console under
+// Authentication > Users. Actual write protection is enforced server-side by
+// your Firestore Security Rules (see README.txt) — not just this UI.
 function isAdmin() {
-  return getRole() === "admin";
+  return !!(fauth && fauth.currentUser);
 }
 function paintRoleUI() {
   const badge = document.getElementById("roleBadge");
   const btn = document.getElementById("roleSwitchBtn");
   if (!badge || !btn) return;
   const admin = isAdmin();
-  badge.textContent = admin ? "Admin" : "Viewer";
+  badge.textContent = admin ? (fauth.currentUser.email || "Admin") : "Viewer";
   badge.className = "role-badge " + (admin ? "admin" : "viewer");
-  btn.textContent = admin ? "Switch to Viewer" : "Switch to Admin";
+  btn.textContent = admin ? "Sign Out" : "Admin Sign In";
 }
 document.getElementById("roleSwitchBtn").addEventListener("click", () => {
+  if (!fauth) { toast("Still connecting to Firebase — try again in a moment", "info"); return; }
   if (isAdmin()) {
-    setRole("viewer");
-    toast("Switched to Viewer mode");
-    goto(currentPage);
+    fauth.signOut();
+    toast("Signed out — Viewer mode");
     return;
   }
-  openModal("Switch to Admin", `
-    <p class="muted" style="margin-top:0">Enter the admin password to make changes (add, edit, delete, bulk actions, imports).</p>
-    <div class="field"><label>Password</label><input type="password" id="f_pw" placeholder="Admin password"></div>
+  openModal("Admin Sign In", `
+    <p class="muted" style="margin-top:0">Sign in with an admin account (created in your Firebase console under
+    Authentication → Users → Add user) to add, edit, delete or import data.</p>
+    <div class="field"><label>Email</label><input type="email" id="f_email" placeholder="admin@example.com" autocomplete="username"></div>
+    <div class="field"><label>Password</label><input type="password" id="f_pw" placeholder="Password" autocomplete="current-password"></div>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelPw">Cancel</button>
-      <button class="btn btn-primary" id="confirmPw">Unlock Admin</button>
+      <button class="btn btn-primary" id="confirmPw">Sign In</button>
     </div>
   `, () => {
-    const input = document.getElementById("f_pw");
-    input.focus();
+    const emailInp = document.getElementById("f_email");
+    const pwInp = document.getElementById("f_pw");
+    emailInp.focus();
     const attempt = () => {
-      if (input.value === ADMIN_PASSWORD) {
-        setRole("admin");
-        closeModal();
-        toast("Admin mode enabled");
-        goto(currentPage);
-      } else {
-        toast("Incorrect password", "err");
-      }
+      const email = emailInp.value.trim();
+      const pw = pwInp.value;
+      if (!email || !pw) { toast("Enter email and password", "err"); return; }
+      fauth.signInWithEmailAndPassword(email, pw)
+        .then(() => { closeModal(); toast("Signed in as Admin"); })
+        .catch(err => toast(err.message.replace(/^Firebase:\s*/, ""), "err"));
     };
     document.getElementById("cancelPw").onclick = closeModal;
     document.getElementById("confirmPw").onclick = attempt;
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); });
+    [emailInp, pwInp].forEach(inp => inp.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); }));
   });
 });
 
 function viewerNotice() {
   if (isAdmin()) return "";
-  return `<div class="viewer-note">👁️ You're in <strong>Viewer</strong> mode — changes are turned off. Switch to Admin from the sidebar to edit.</div>`;
+  return `<div class="viewer-note">👁️ You're viewing live shared data in <strong>read-only</strong> mode — sign in as Admin from the sidebar to make changes.</div>`;
 }
 
-/* ---------------- Persistence ---------------- */
-function loadDB() {
-  const raw = localStorage.getItem(DB_KEY);
-  if (raw) {
-    try { return JSON.parse(raw); } catch (e) { /* fall through to seed */ }
-  }
-  return seedFromSource();
-}
-
+/* ---------------- Persistence (Cloud Firestore) ---------------- */
 function seedFromSource() {
   const d = JSON.parse(JSON.stringify(SEED_DATA));
   return {
@@ -98,8 +100,37 @@ function seedFromSource() {
   };
 }
 
+async function loadInitialData() {
+  const snap = await docRef().get();
+  if (snap.exists) {
+    DB = snap.data();
+  } else if (isAdmin()) {
+    // First time this Firestore project is used, and we're already signed in — seed it.
+    DB = seedFromSource();
+    await docRef().set(DB);
+  } else {
+    // No data yet, and nobody's signed in — don't attempt a write (Firestore Rules will
+    // correctly block it). Show an empty shell; once an admin signs in, we seed it then.
+    DB = { employees: [], categories: [], lists: (SEED_DATA.lists || {}), assignments: [], refills: [], inventory: [], stockManual: {}, __uninitialized: true };
+  }
+  if (!DB.inventory) DB.inventory = [];
+}
+
 function saveDB() {
-  localStorage.setItem(DB_KEY, JSON.stringify(DB));
+  if (!fdb) return;
+  docRef().set(DB).catch(err => {
+    console.error(err);
+    toast("Couldn't save to the cloud — check your connection or admin sign-in", "err");
+  });
+}
+
+function attachRealtimeListener() {
+  docRef().onSnapshot(snap => {
+    if (!snap.exists) return;
+    DB = snap.data();
+    if (!DB.inventory) DB.inventory = [];
+    goto(currentPage); // keep every open browser (viewers + admins) in sync live
+  }, err => console.error("Firestore listener error:", err));
 }
 
 function uid() {
@@ -264,10 +295,11 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
   if (!requireAdminOrWarn()) return;
   openModal("Reset all data?", `
     <p class="muted" style="margin-top:0">This restores the dashboard, assignments, employees and logs back to the
-    original uploaded sheet. Anything you've added or edited in this browser will be lost.</p>
+    original uploaded sheet — for <strong>everyone</strong> viewing this app, since data is shared live via Firebase.
+    Anything anyone has added or edited will be lost.</p>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelReset">Cancel</button>
-      <button class="btn btn-danger" id="confirmReset">Yes, reset data</button>
+      <button class="btn btn-danger" id="confirmReset">Yes, reset data for everyone</button>
     </div>
   `, () => {
     document.getElementById("cancelReset").onclick = closeModal;
@@ -303,7 +335,10 @@ function renderDashboard() {
   const lowStockRows = s.rows.filter(r => r.low);
 
   content.innerHTML = `
-    ${viewerNotice()}
+    ${DB.__uninitialized ? `<div class="viewer-note" style="background:var(--amber-light); border-color:#f0d9ab;">
+      ⚠️ No data has been loaded into Firebase yet. Sign in as <strong>Admin</strong> from the sidebar once —
+      that will automatically load the original sheet data for everyone.
+    </div>` : viewerNotice()}
     <div class="stat-grid">
       ${cards.map(c => `
         <div class="stat-card">
@@ -1420,7 +1455,7 @@ function renderSettings() {
     <div class="card">
       <div class="card-header"><div><h2>Access</h2><div class="sub">Who can make changes</div></div></div>
       <p class="muted" style="margin-top:0"><strong>Viewer</strong> mode: browse everything, no edits. <strong>Admin</strong> mode: add / edit / delete / bulk-delete / import data. Switch modes from the sidebar (admin requires the password).</p>
-      <p class="muted">Everything is stored only in this browser (localStorage) — nothing is sent to a server. Use <strong>Reset Data</strong> in the sidebar to restore the original sheet contents at any time.</p>
+      <p class="muted">Everything is stored in your Cloud Firestore database and synced live to everyone viewing this app. Use <strong>Reset Data</strong> in the sidebar to restore the original sheet contents for everyone at any time.</p>
     </div>
   `;
 
@@ -1477,11 +1512,67 @@ function removeListItem(key, encodedVal) {
 /* =========================================================
    INIT
    ========================================================= */
-function init() {
-  DB = loadDB();
-  if (!DB.inventory) DB.inventory = [];
-  saveDB();
-  paintRoleUI();
-  goto("dashboard");
+function showLoadingScreen() {
+  const el = document.getElementById("loadingScreen");
+  if (el) el.classList.add("show");
+}
+function hideLoadingScreen() {
+  const el = document.getElementById("loadingScreen");
+  if (el) el.classList.remove("show");
+}
+function showFirebaseSetupScreen(isError) {
+  const shell = document.querySelector(".app-shell");
+  if (shell) shell.style.display = "none";
+  const el = document.getElementById("firebaseSetupScreen");
+  if (el) {
+    el.classList.add("show");
+    const note = document.getElementById("setupErrorNote");
+    if (note) note.style.display = isError ? "block" : "none";
+  }
+}
+
+async function init() {
+  if (!firebaseConfigured()) {
+    showFirebaseSetupScreen(false);
+    return;
+  }
+  try {
+    initFirebase();
+    showLoadingScreen();
+
+    // Wait for Firebase to restore any existing sign-in session before we decide
+    // whether we're allowed to seed the initial data (avoids a false "permission
+    // denied" on first load if nobody has signed in yet).
+    await new Promise((resolve) => {
+      const unsub = fauth.onAuthStateChanged(() => { unsub(); resolve(); });
+    });
+
+    await loadInitialData();
+    attachRealtimeListener();
+
+    fauth.onAuthStateChanged(async (user) => {
+      paintRoleUI();
+      if (user && DB && DB.__uninitialized) {
+        // An admin just signed in and Firestore is still empty — seed it now that
+        // we're authenticated (this is what makes the very first setup work).
+        try {
+          DB = seedFromSource();
+          await docRef().set(DB);
+          toast("Loaded the original sheet data into Firebase");
+        } catch (err) {
+          console.error(err);
+          toast("Couldn't load initial data — check your Firestore Rules", "err");
+        }
+      }
+      if (DB) goto(currentPage);
+    });
+
+    hideLoadingScreen();
+    goto("dashboard");
+  } catch (err) {
+    console.error(err);
+    hideLoadingScreen();
+    showFirebaseSetupScreen(true);
+  }
 }
 document.addEventListener("DOMContentLoaded", init);
