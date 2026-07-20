@@ -279,6 +279,36 @@ tbody tr:hover{ background: var(--surface-2); }
 
 .footer-note{ text-align:center; color:var(--text-faint); font-size:11.5px; padding: 30px 0 10px; }
 
+/* ---------- Role box ---------- */
+.role-box{ margin-bottom:12px; }
+.role-row{ display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+.role-label{ font-size:11px; color:#8b90ab; }
+.role-badge{
+  font-size:11px; font-weight:800; padding:3px 10px; border-radius:99px; letter-spacing:.02em;
+  background: rgba(255,255,255,.1); color:#dfe2f2;
+}
+.role-badge.admin{ background: linear-gradient(135deg, var(--teal), #0a9a8b); color:#fff; }
+.role-badge.viewer{ background: rgba(255,255,255,.1); color:#c7cbe3; }
+
+/* ---------- Bulk selection ---------- */
+.select-ck{ width:16px; height:16px; cursor:pointer; accent-color: var(--primary); }
+th.ck-col, td.ck-col{ width:38px; }
+.bulk-actions{ display:flex; align-items:center; gap:8px; margin-left:auto; }
+.bulk-count{ font-size:12.5px; color:var(--text-muted); font-weight:600; }
+
+/* ---------- Viewer / disabled states ---------- */
+.viewer-note{
+  display:flex; align-items:center; gap:8px; background: var(--amber-light); color:#8a5c15;
+  border:1px solid #f2ddb0; border-radius:10px; padding:10px 14px; font-size:12.8px; margin-bottom:16px;
+}
+input:disabled, select:disabled, textarea:disabled{ background:var(--grey-light); color:var(--text-faint); cursor:not-allowed; }
+.btn:disabled{ opacity:.45; cursor:not-allowed; }
+.btn:disabled:hover{ filter:none; }
+
+/* ---------- Upload dropzone ---------- */
+.upload-hint{ font-size:12px; color:var(--text-muted); margin-top:8px; line-height:1.5; }
+.upload-hint code{ background:var(--surface-2); padding:1px 6px; border-radius:5px; font-size:11.5px; }
+
 @media (max-width: 980px){
   .stat-grid{ grid-template-columns: repeat(2,1fr); }
   .grid-2{ grid-template-columns: 1fr; }

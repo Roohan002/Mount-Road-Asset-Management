@@ -22,6 +22,46 @@ WHAT'S INSIDE (mirrors your original Excel workbook)
 - Asset Categories   -> manage the categories used everywhere else
 - Settings           -> edit the dropdown lists (Departments, Floors, Conditions, Statuses)
 
+ADMIN vs VIEWER MODE
+---------------------
+The app opens in VIEWER mode by default — everyone can browse and search, but
+add / edit / delete / import buttons are hidden and Stock Summary fields are
+locked.
+
+To make changes, click "Switch to Admin" at the bottom of the sidebar and
+enter the admin password:
+
+    Password: admin123
+
+You can change this password yourself by opening js/app.js in a text editor
+and editing the ADMIN_PASSWORD line near the top. Note this is a simple
+in-browser gate to prevent accidental edits — since the whole app runs
+locally with no server, it isn't secure against someone who edits the code
+directly. Ask me if you'd like a version with real server-side login.
+
+BULK DELETE
+-----------
+On Asset Assignment, Master Inventory, Employees, Stock Refill Log and Asset
+Categories (in Admin mode), each row has a checkbox. Tick the ones you want
+and click "Delete Selected", use "Select All" in the header to tick everything
+currently shown, or click "Delete All" to clear every row matching your
+current search/filter in one go.
+
+AUTO-FILL ON ASSET ASSIGNMENT
+------------------------------
+When you type or pick an Employee Name (Admin mode, "+ New Assignment"), if
+that name matches someone in your Employees list, their Employee ID and
+Department fields fill in automatically.
+
+BULK-IMPORT EMPLOYEES
+----------------------
+On the Employees page (Admin mode), click "Upload CSV / Excel" and choose a
+.csv, .xlsx or .xls file. Expected columns (any order, case-insensitive):
+Employee ID, Employee Name, Department, Email, Phone — extra columns are
+ignored. Rows are matched to existing employees by ID (or by name+department)
+and updated; anything new is added. You'll see a summary of how many were
+added/updated/skipped after the import.
+
 DATA
 ----
 All your original sheet data (241 employees, 50 assignments, 9 categories,
