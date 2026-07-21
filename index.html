@@ -68,10 +68,6 @@
       <header class="topbar">
         <button class="hamburger" id="hamburger">☰</button>
         <h1 class="page-title" id="pageTitle">Dashboard</h1>
-        <div class="topbar-right">
-          <span class="live-dot"></span>
-          <span class="live-text">Live shared data · powered by Firebase</span>
-        </div>
       </header>
 
       <main class="content" id="content">
@@ -130,17 +126,26 @@
   </div>
 
   <!-- Shown instead of the app when nobody is signed in — this app requires a login to view anything -->
-  <div class="setup-screen" id="signInGateScreen">
-    <div class="setup-box" style="max-width:400px; text-align:center;">
-      <img class="brand-mark" style="margin:0 auto 16px" src="assets/speelfinance-icon.png" alt="Speelfinance">
-      <h1 style="text-align:center">Sign in required</h1>
-      <p style="text-align:center">This tracker's data is private. Sign in with an account created for you to view or edit it.</p>
-      <div class="field" style="text-align:left; margin-top:20px"><label>Email</label><input type="email" id="gate_email" placeholder="you@example.com" autocomplete="username"></div>
-      <div class="field" style="text-align:left"><label>Password</label><input type="password" id="gate_pw" placeholder="Password" autocomplete="current-password"></div>
-      <p id="gateErrorNote" style="display:none; color:var(--red); font-weight:600; text-align:center; font-size:13px;"></p>
-      <button class="btn btn-primary" id="gateSignInBtn" style="width:100%; margin-top:8px;">Sign In</button>
-      <p class="muted" style="text-align:center; margin-top:18px; font-size:12px;">Don't have a login? Ask whoever set up this app to add you under
-      Firebase → Authentication → Users.</p>
+  <div class="signin-screen" id="signInGateScreen">
+    <div class="signin-orb signin-orb-a"></div>
+    <div class="signin-orb signin-orb-b"></div>
+    <div class="signin-card">
+      <div class="signin-logo-ring"><img src="assets/speelfinance-icon.png" alt="Speelfinance"></div>
+      <h1>Welcome back</h1>
+      <p class="signin-sub">Sign in to open the Speelfinance asset tracker</p>
+
+      <div class="signin-field">
+        <label for="gate_email">Email</label>
+        <input type="email" id="gate_email" placeholder="you@company.com" autocomplete="username">
+      </div>
+      <div class="signin-field">
+        <label for="gate_pw">Password</label>
+        <input type="password" id="gate_pw" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <p id="gateErrorNote" class="signin-error" style="display:none;"></p>
+      <button class="signin-btn" id="gateSignInBtn">Sign In</button>
+
+      <div class="signin-footer">Speelfinance · Asset Management</div>
     </div>
   </div>
 

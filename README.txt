@@ -140,8 +140,15 @@ is loaded into your Firestore database automatically the very first time the
 app connects. After that, everyone who signs in sees the same live data, and
 any change one person makes appears on every other signed-in browser within a second or two, no refresh needed.
 
-"Reset Data" in the sidebar (Admin mode) restores everyone's view back to
-the original sheet contents — use it carefully, since it affects all users.
+"Reset Data" in the sidebar restores everyone's view back to the original
+sheet contents — use it carefully, since it affects all users. As an extra
+safety net, it now also asks for a confirmation password before it will run:
+
+    Confirmation password: reset123
+
+You can change this yourself by opening js/app.js, finding the line
+`const RESET_CONFIRM_PASSWORD = "reset123";` near the Reset Data button
+handler, and editing the text between the quotes.
 
 TROUBLESHOOTING
 -----------------

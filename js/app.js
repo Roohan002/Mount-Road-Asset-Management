@@ -294,25 +294,40 @@ document.getElementById("nav").addEventListener("click", (e) => {
 document.getElementById("hamburger").addEventListener("click", () => {
   document.getElementById("sidebar").classList.toggle("open");
 });
+const RESET_CONFIRM_PASSWORD = "reset123"; // change this to whatever you like — required to actually run a reset
+
 document.getElementById("resetDataBtn").addEventListener("click", () => {
   if (!requireAdminOrWarn()) return;
   openModal("Reset all data?", `
     <p class="muted" style="margin-top:0">This restores the dashboard, assignments, employees and logs back to the
     original uploaded sheet — for <strong>everyone</strong> viewing this app, since data is shared live via Firebase.
     Anything anyone has added or edited will be lost.</p>
+    <div class="field"><label>Type the confirmation password to continue</label>
+      <input type="password" id="resetConfirmPw" placeholder="Confirmation password" autocomplete="off">
+    </div>
+    <p id="resetPwError" style="display:none; color:var(--red); font-weight:600; font-size:12.5px; margin-top:-6px;">Incorrect password.</p>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelReset">Cancel</button>
       <button class="btn btn-danger" id="confirmReset">Yes, reset data for everyone</button>
     </div>
   `, () => {
+    const pwInp = document.getElementById("resetConfirmPw");
+    pwInp.focus();
     document.getElementById("cancelReset").onclick = closeModal;
-    document.getElementById("confirmReset").onclick = () => {
+    const attempt = () => {
+      if (pwInp.value !== RESET_CONFIRM_PASSWORD) {
+        document.getElementById("resetPwError").style.display = "block";
+        pwInp.focus();
+        return;
+      }
       DB = seedFromSource();
       saveDB();
       closeModal();
       toast("Data reset to original sheet");
       goto(currentPage);
     };
+    document.getElementById("confirmReset").onclick = attempt;
+    pwInp.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); });
   });
 });
 
@@ -531,13 +546,35 @@ function openAssignForm(uidVal) {
   const depts = DB.lists.department || [];
   const statuses = DB.lists.assignmentStatus || ["Assigned", "Returned", "Overdue"];
 
+  const assetFieldHtml = editing
+    ? `<div class="field"><label>Asset</label>
+        <select id="f_asset">${cats.map(c => `<option ${editing.assetName === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select>
+      </div>`
+    : `<div class="field">
+        <label>Assets <span class="muted" style="font-weight:500;">(tick one or more — one entry gets logged for each, so you don't have to retype the employee)</span></label>
+        <div class="asset-multiselect" id="assetMultiSelect">
+          <div class="asset-multiselect-actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="assetSelectAll">Select All</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="assetSelectNone">Clear</button>
+          </div>
+          ${cats.map((c, i) => `
+            <label class="asset-check-row">
+              <input type="checkbox" class="f_asset_multi" value="${escapeHtml(c)}" ${i === 0 ? "checked" : ""}>
+              <span>${escapeHtml(c)}</span>
+            </label>
+          `).join("")}
+        </div>
+      </div>`;
+
   openModal(editing ? "Edit Assignment" : "New Assignment", `
+    ${editing ? `
     <div class="field-row">
-      <div class="field"><label>Date</label><input type="date" id="f_date" value="${editing ? editing.date || "" : todayISO()}"></div>
-      <div class="field"><label>Asset</label>
-        <select id="f_asset">${cats.map(c => `<option ${editing && editing.assetName === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select>
-      </div>
-    </div>
+      <div class="field"><label>Date</label><input type="date" id="f_date" value="${editing.date || ""}"></div>
+      ${assetFieldHtml}
+    </div>` : `
+    <div class="field"><label>Date</label><input type="date" id="f_date" value="${todayISO()}"></div>
+    ${assetFieldHtml}
+    `}
     <div class="field-row">
       <div class="field"><label>Employee Name</label>
         <input type="text" id="f_emp" list="empList" value="${escapeHtml(editing ? editing.employeeName : "")}" placeholder="Type or pick a name — ID & department auto-fill">
@@ -581,13 +618,22 @@ function openAssignForm(uidVal) {
     empInput.addEventListener("change", autofillFromName);
     if (!editing) autofillFromName();
 
+    if (!editing) {
+      document.getElementById("assetSelectAll").onclick = () => {
+        document.querySelectorAll(".f_asset_multi").forEach(cb => cb.checked = true);
+      };
+      document.getElementById("assetSelectNone").onclick = () => {
+        document.querySelectorAll(".f_asset_multi").forEach(cb => cb.checked = false);
+      };
+    }
+
     document.getElementById("cancelBtn").onclick = closeModal;
     document.getElementById("saveBtn").onclick = () => {
       const empName = document.getElementById("f_emp").value.trim();
       if (!empName) { toast("Employee name is required", "err"); return; }
-      const rec = {
+
+      const common = {
         date: document.getElementById("f_date").value,
-        assetName: document.getElementById("f_asset").value,
         employeeName: empName,
         employeeId: document.getElementById("f_empid").value.trim(),
         department: document.getElementById("f_dept").value,
@@ -596,12 +642,20 @@ function openAssignForm(uidVal) {
         returnDate: document.getElementById("f_return").value,
         remarks: document.getElementById("f_remarks").value.trim(),
       };
+
       if (editing) {
+        const rec = { ...common, assetName: document.getElementById("f_asset").value };
         Object.assign(editing, rec);
         toast("Assignment updated");
       } else {
-        DB.assignments.push({ uid: uid(), id: DB.assignments.length + 1, ...rec });
-        toast("Assignment added");
+        const selectedAssets = [...document.querySelectorAll(".f_asset_multi:checked")].map(cb => cb.value);
+        if (!selectedAssets.length) { toast("Select at least one asset", "err"); return; }
+        selectedAssets.forEach(assetName => {
+          DB.assignments.push({ uid: uid(), id: DB.assignments.length + 1, ...common, assetName });
+        });
+        toast(selectedAssets.length > 1
+          ? `${selectedAssets.length} assignments added for ${empName}`
+          : "Assignment added");
       }
       saveDB();
       closeModal();
