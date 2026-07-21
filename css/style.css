@@ -68,12 +68,11 @@ body{
   border-bottom: 1px solid rgba(255,255,255,.08);
 }
 .brand-mark{
-  width:38px; height:38px; border-radius:10px;
-  background: linear-gradient(135deg, var(--primary), var(--purple));
-  display:flex; align-items:center; justify-content:center;
-  font-weight:700; font-size:13px; color:#fff;
-  box-shadow: var(--shadow-md);
+  width:40px; height:40px;
+  object-fit: contain;
+  display:block;
 }
+.setup-box .brand-mark{ width:64px; height:64px; }
 .brand-title{ font-weight:700; font-size:14.5px; color:#fff; line-height:1.2; }
 .brand-sub{ font-size:11.5px; color:#9096b5; margin-top:2px; }
 

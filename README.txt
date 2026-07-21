@@ -1,7 +1,7 @@
-MOUNT ROAD OFFICE — ASSET MANAGEMENT WEB APP
+SPEELFINANCE — ASSET MANAGEMENT WEB APP
 =============================================
-Now backed by Firebase, so data is stored online and anyone with the link
-can view it live — signed-in admins can edit it.
+Backed by Firebase — data is stored online and private: nobody can view or
+edit anything unless they sign in with an account you create for them.
 
 ------------------------------------------------------------
 PART 1 — CONNECT THE APP TO YOUR OWN FIREBASE PROJECT
@@ -26,19 +26,20 @@ This is a one-time setup, ~10 minutes.
      b) Authentication -> "Get started" -> Sign-in method tab ->
         enable "Email/Password" -> Save.
      c) Authentication -> Users tab -> "Add user" -> enter an email
-        and password. This is your ADMIN LOGIN for the app (you can
-        add more admin users the same way any time).
+        and password for EVERYONE who should be able to open this app
+        at all (there's no public/guest view — see "LOGIN REQUIRED"
+        below). Add yourself first; add more people the same way any time.
 
 5. Still in Firestore Database, go to the "Rules" tab, delete the
    existing text, and paste in the contents of firestore.rules
    (included in this folder). Click "Publish".
-   These rules mean: anyone can VIEW the data, but only someone
-   signed in (an admin you added in step 4c) can change it.
+   These rules mean: nobody can view OR change the data unless they're
+   signed in with an account you added in step 4c.
 
-6. Open index.html in your browser. The first time it runs, it will
-   automatically create the data in Firestore using the original
-   sheet contents. From then on, every visitor sees that same live
-   data, and it updates in real time as admins make changes.
+6. Open index.html in your browser. You'll be asked to sign in. The
+   first time anyone signs in, the app automatically creates the data
+   in Firestore using the original sheet contents. From then on, every
+   signed-in visitor sees that same live data, updating in real time.
 
 If you see a "Connect this app to Firebase" screen, it means step 3
 still has placeholder values, or steps 4/5 aren't complete yet.
@@ -62,8 +63,9 @@ since you're already using Firebase, is Firebase Hosting (also free):
 3. Deploy:
      firebase deploy --only hosting
 4. Firebase will print a URL like https://your-project.web.app —
-   share that link with anyone you want to be able to view (or, if
-   they sign in as admin, edit) the tracker.
+   share that link with anyone you've added a login for in step 4c.
+   Nobody else will be able to see any data — they'll just get a
+   sign-in screen.
 
 (Alternatives if you'd rather not use Firebase Hosting: any static
 host works the same way — Netlify, Vercel, GitHub Pages, etc. — just
@@ -85,21 +87,28 @@ WHAT'S INSIDE (mirrors your original Excel workbook)
 - Asset Categories   -> manage the categories used everywhere else
 - Settings           -> edit the dropdown lists (Departments, Floors, Conditions, Statuses)
 
-ADMIN vs VIEWER MODE
----------------------
-The app opens in VIEWER mode — anyone with the link can browse and search,
-but add / edit / delete / import buttons are hidden and Stock Summary fields
-are locked.
+LOGIN REQUIRED — NOBODY CAN VIEW WITHOUT SIGNING IN
+-----------------------------------------------------
+This app shows nothing at all until you sign in. Opening the link (or
+index.html) always presents a "Sign in required" screen first. Only people
+you've added under Authentication > Users in the Firebase console (Part 1,
+step 4c) can sign in, and once signed in they can both view AND edit
+everything (there's no separate "view only, can't edit" account type — see
+note below if you want that).
 
-To make changes, click "Admin Sign In" at the bottom of the sidebar and sign
-in with an admin email/password you created in Part 1, step 4c. Click
-"Sign Out" to go back to Viewer mode. You can add as many admin accounts as
-you like from Authentication > Users in the Firebase console — no code
-changes needed.
+Click "Sign Out" at the bottom of the sidebar to leave; you'll be dropped
+straight back to the sign-in screen. You can add or remove people's access
+any time from Authentication > Users — no code changes needed, and removing
+someone there instantly cuts off their access.
 
-Security note: the actual write protection is enforced by your Firestore
-Rules (Part 1, step 5) on Google's servers, not just by this webpage — so
-this is real access control, not just a UI toggle.
+Security note: this is enforced by your Firestore Rules (Part 1, step 5) on
+Google's servers, not just by this webpage — so it's real access control,
+not just a UI toggle. Someone without a login cannot see your data even if
+they inspect the page's code.
+
+Want separate "can view but can't edit" accounts instead of everyone who
+can sign in also being able to edit? That needs a bit more setup (assigning
+roles per account) — just ask and I can add it.
 
 BULK DELETE
 -----------
@@ -128,9 +137,8 @@ DATA & LIVE SYNC
 -----------------
 All data (241 employees, 50 assignments, 9 categories, 9 refill log entries)
 is loaded into your Firestore database automatically the very first time the
-app connects. After that, everyone who opens the link — whether Viewer or
-Admin — sees the same live data, and any change an admin makes appears on
-every other open browser within a second or two, no refresh needed.
+app connects. After that, everyone who signs in sees the same live data, and
+any change one person makes appears on every other signed-in browser within a second or two, no refresh needed.
 
 "Reset Data" in the sidebar (Admin mode) restores everyone's view back to
 the original sheet contents — use it carefully, since it affects all users.

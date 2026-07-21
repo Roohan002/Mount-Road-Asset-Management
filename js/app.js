@@ -1,5 +1,5 @@
 /* =========================================================
-   Mount Road Office — Asset Management System
+   Speelfinance — Asset Management System
    Cloud-backed: data lives in Cloud Firestore so anyone with the
    link can view it live, and only signed-in admins can edit it.
    Mirrors the logic of the original Excel workbook:
@@ -104,14 +104,11 @@ async function loadInitialData() {
   const snap = await docRef().get();
   if (snap.exists) {
     DB = snap.data();
-  } else if (isAdmin()) {
-    // First time this Firestore project is used, and we're already signed in — seed it.
+  } else {
+    // First time this Firestore project is used — seed it with the original sheet data.
+    // (Safe to write here because loadInitialData is only ever called after sign-in.)
     DB = seedFromSource();
     await docRef().set(DB);
-  } else {
-    // No data yet, and nobody's signed in — don't attempt a write (Firestore Rules will
-    // correctly block it). Show an empty shell; once an admin signs in, we seed it then.
-    DB = { employees: [], categories: [], lists: (SEED_DATA.lists || {}), assignments: [], refills: [], inventory: [], stockManual: {}, __uninitialized: true };
   }
   if (!DB.inventory) DB.inventory = [];
 }
@@ -124,13 +121,17 @@ function saveDB() {
   });
 }
 
+let unsubscribeSnapshot = null;
 function attachRealtimeListener() {
-  docRef().onSnapshot(snap => {
+  unsubscribeSnapshot = docRef().onSnapshot(snap => {
     if (!snap.exists) return;
     DB = snap.data();
     if (!DB.inventory) DB.inventory = [];
-    goto(currentPage); // keep every open browser (viewers + admins) in sync live
+    goto(currentPage); // keep every open browser (signed-in users) in sync live
   }, err => console.error("Firestore listener error:", err));
+}
+function detachRealtimeListener() {
+  if (unsubscribeSnapshot) { unsubscribeSnapshot(); unsubscribeSnapshot = null; }
 }
 
 function uid() {
@@ -337,10 +338,7 @@ function renderDashboard() {
   const lowStockRows = s.rows.filter(r => r.low);
 
   content.innerHTML = `
-    ${DB.__uninitialized ? `<div class="viewer-note" style="background:var(--amber-light); border-color:#f0d9ab;">
-      ⚠️ No data has been loaded into Firebase yet. Sign in as <strong>Admin</strong> from the sidebar once —
-      that will automatically load the original sheet data for everyone.
-    </div>` : viewerNotice()}
+    ${viewerNotice()}
     <div class="stat-grid">
       ${cards.map(c => `
         <div class="stat-card">
@@ -394,7 +392,7 @@ function renderDashboard() {
       </div>
     </div>
 
-    <p class="footer-note">Mount Road Office · Asset Management Tracker — last updated ${fmtDate(todayISO())}</p>
+    <p class="footer-note">Speelfinance · Asset Management Tracker — last updated ${fmtDate(todayISO())}</p>
   `;
 }
 
@@ -1647,9 +1645,16 @@ function hideLoadingScreen() {
   const el = document.getElementById("loadingScreen");
   if (el) el.classList.remove("show");
 }
+function hideAllGateScreens() {
+  document.getElementById("firebaseSetupScreen")?.classList.remove("show");
+  document.getElementById("signInGateScreen")?.classList.remove("show");
+  const shell = document.querySelector(".app-shell");
+  if (shell) shell.style.display = "";
+}
 function showFirebaseSetupScreen(isError) {
   const shell = document.querySelector(".app-shell");
   if (shell) shell.style.display = "none";
+  document.getElementById("signInGateScreen")?.classList.remove("show");
   const el = document.getElementById("firebaseSetupScreen");
   if (el) {
     el.classList.add("show");
@@ -1657,6 +1662,37 @@ function showFirebaseSetupScreen(isError) {
     if (note) note.style.display = isError ? "block" : "none";
   }
 }
+function showSignInGate(errorMsg) {
+  const shell = document.querySelector(".app-shell");
+  if (shell) shell.style.display = "none";
+  document.getElementById("firebaseSetupScreen")?.classList.remove("show");
+  const el = document.getElementById("signInGateScreen");
+  if (el) el.classList.add("show");
+  const note = document.getElementById("gateErrorNote");
+  if (note) {
+    if (errorMsg) { note.textContent = errorMsg; note.style.display = "block"; }
+    else { note.style.display = "none"; }
+  }
+}
+
+function attemptGateSignIn() {
+  if (!fauth) return;
+  const emailInp = document.getElementById("gate_email");
+  const pwInp = document.getElementById("gate_pw");
+  const email = emailInp.value.trim();
+  const pw = pwInp.value;
+  if (!email || !pw) { showSignInGate("Enter your email and password."); return; }
+  fauth.signInWithEmailAndPassword(email, pw).catch(err => {
+    showSignInGate(err.message.replace(/^Firebase:\s*/, ""));
+  });
+  // On success, the onAuthStateChanged listener below handles loading data + showing the app.
+}
+document.getElementById("gateSignInBtn").addEventListener("click", attemptGateSignIn);
+["gate_email", "gate_pw"].forEach(id => {
+  document.getElementById(id).addEventListener("keydown", (e) => { if (e.key === "Enter") attemptGateSignIn(); });
+});
+
+let dataBootstrapped = false; // whether we've successfully loaded Firestore data at least once this session
 
 async function init() {
   if (!firebaseConfigured()) {
@@ -1665,41 +1701,44 @@ async function init() {
   }
   try {
     initFirebase();
-    showLoadingScreen();
-
-    // Wait for Firebase to restore any existing sign-in session before we decide
-    // whether we're allowed to seed the initial data (avoids a false "permission
-    // denied" on first load if nobody has signed in yet).
-    await new Promise((resolve) => {
-      const unsub = fauth.onAuthStateChanged(() => { unsub(); resolve(); });
-    });
-
-    await loadInitialData();
-    attachRealtimeListener();
-
-    fauth.onAuthStateChanged(async (user) => {
-      paintRoleUI();
-      if (user && DB && DB.__uninitialized) {
-        // An admin just signed in and Firestore is still empty — seed it now that
-        // we're authenticated (this is what makes the very first setup work).
-        try {
-          DB = seedFromSource();
-          await docRef().set(DB);
-          toast("Loaded the original sheet data into Firebase");
-        } catch (err) {
-          console.error(err);
-          toast("Couldn't load initial data — check your Firestore Rules", "err");
-        }
-      }
-      if (DB) goto(currentPage);
-    });
-
-    hideLoadingScreen();
-    goto("dashboard");
   } catch (err) {
     console.error(err);
-    hideLoadingScreen();
     showFirebaseSetupScreen(true);
+    return;
   }
+  showLoadingScreen();
+
+  // This app requires sign-in to view OR edit anything (private data). This single
+  // listener is the source of truth for every state change: signed out -> gate,
+  // signed in -> load data once, then keep the app in sync.
+  fauth.onAuthStateChanged(async (user) => {
+    paintRoleUI();
+
+    if (!user) {
+      detachRealtimeListener();
+      DB = null;
+      dataBootstrapped = false;
+      hideLoadingScreen();
+      showSignInGate();
+      return;
+    }
+
+    hideAllGateScreens();
+    if (!dataBootstrapped) {
+      showLoadingScreen();
+      try {
+        await loadInitialData();
+        attachRealtimeListener();
+        dataBootstrapped = true;
+      } catch (err) {
+        console.error(err);
+        hideLoadingScreen();
+        showFirebaseSetupScreen(true);
+        return;
+      }
+    }
+    hideLoadingScreen();
+    goto(currentPage);
+  });
 }
 document.addEventListener("DOMContentLoaded", init);

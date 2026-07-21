@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Mount Road Office — Asset Management</title>
+<title>Speelfinance — Asset Management</title>
+<link rel="icon" type="image/png" href="assets/speelfinance-icon.png" />
 <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
@@ -13,9 +14,9 @@
     <!-- Sidebar -->
     <aside class="sidebar" id="sidebar">
       <div class="brand">
-        <div class="brand-mark">MR</div>
+        <img class="brand-mark" src="assets/speelfinance-icon.png" alt="Speelfinance">
         <div class="brand-text">
-          <div class="brand-title">Mount Road Office</div>
+          <div class="brand-title">Speelfinance</div>
           <div class="brand-sub">Asset Management</div>
         </div>
       </div>
@@ -108,23 +109,38 @@
        or if Firebase can't be reached (wrong config / rules / offline) -->
   <div class="setup-screen" id="firebaseSetupScreen">
     <div class="setup-box">
-      <div class="brand-mark" style="margin-bottom:16px">MR</div>
+      <img class="brand-mark" style="margin-bottom:16px" src="assets/speelfinance-icon.png" alt="Speelfinance">
       <h1>Connect this app to Firebase</h1>
       <p id="setupErrorNote" style="display:none; color:var(--red); font-weight:600;">
         Firebase is configured, but the app couldn't load data — double-check your config values,
         that Firestore + Authentication are enabled, and that your Security Rules are published.
       </p>
-      <p>This app stores its data in <strong>Cloud Firestore</strong> so anyone with the link can view it
-      live, and signed-in admins can edit it. Open <code>js/firebase-config.js</code> in a text editor and
-      follow the steps written at the top of that file, then reload this page.</p>
+      <p>This app stores its data in <strong>Cloud Firestore</strong>, private to people you give a login to.
+      Open <code>js/firebase-config.js</code> in a text editor and follow the steps written at the top of
+      that file, then reload this page.</p>
       <ol>
         <li>Create a free project at <a href="https://console.firebase.google.com" target="_blank" rel="noopener">console.firebase.google.com</a></li>
         <li>Register a Web app and copy its config values into <code>js/firebase-config.js</code></li>
         <li>Enable <strong>Firestore Database</strong> and <strong>Authentication → Email/Password</strong></li>
-        <li>Add yourself as a user under Authentication → Users — that's your admin login</li>
-        <li>Paste the Firestore rules from <code>README.txt</code> and publish them</li>
+        <li>Add each person who should have access under Authentication → Users</li>
+        <li>Paste the Firestore rules from <code>firestore.rules</code> and publish them</li>
       </ol>
       <p class="muted">Full walkthrough with step-by-step details is in <code>README.txt</code> inside this download.</p>
+    </div>
+  </div>
+
+  <!-- Shown instead of the app when nobody is signed in — this app requires a login to view anything -->
+  <div class="setup-screen" id="signInGateScreen">
+    <div class="setup-box" style="max-width:400px; text-align:center;">
+      <img class="brand-mark" style="margin:0 auto 16px" src="assets/speelfinance-icon.png" alt="Speelfinance">
+      <h1 style="text-align:center">Sign in required</h1>
+      <p style="text-align:center">This tracker's data is private. Sign in with an account created for you to view or edit it.</p>
+      <div class="field" style="text-align:left; margin-top:20px"><label>Email</label><input type="email" id="gate_email" placeholder="you@example.com" autocomplete="username"></div>
+      <div class="field" style="text-align:left"><label>Password</label><input type="password" id="gate_pw" placeholder="Password" autocomplete="current-password"></div>
+      <p id="gateErrorNote" style="display:none; color:var(--red); font-weight:600; text-align:center; font-size:13px;"></p>
+      <button class="btn btn-primary" id="gateSignInBtn" style="width:100%; margin-top:8px;">Sign In</button>
+      <p class="muted" style="text-align:center; margin-top:18px; font-size:12px;">Don't have a login? Ask whoever set up this app to add you under
+      Firebase → Authentication → Users.</p>
     </div>
   </div>
 
