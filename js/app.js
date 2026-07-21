@@ -433,26 +433,44 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
 function renderDashboard() {
   const s = computeDashboard();
   const content = document.getElementById("content");
+  const admin = isAdmin();
 
+  // Cards link to wherever that number actually lives, so the dashboard
+  // works as a jumping-off point rather than a dead-end summary.
   const cards = [
-    { label: "Asset Categories", value: s.categories, icon: "🏷️", cls: "icon-indigo", foot: "Tracked categories" },
-    { label: "Total Inventory", value: s.total, icon: "📦", cls: "icon-blue", foot: "Units added via refills" },
-    { label: "Available", value: s.available, icon: "🟢", cls: "icon-teal", foot: "Ready to assign" },
-    { label: "Assigned", value: s.assigned, icon: "🔵", cls: "icon-purple", foot: "Currently in use" },
-    { label: "Under Repair", value: s.underRepair, icon: "🟡", cls: "icon-amber", foot: "Being serviced" },
-    { label: "Faulty", value: s.faulty, icon: "🔴", cls: "icon-red", foot: "Needs attention" },
-    { label: "Lost", value: s.lost, icon: "✖", cls: "icon-grey", foot: "Unaccounted" },
-    { label: "Scrap", value: s.scrap, icon: "⚫", cls: "icon-grey", foot: "Decommissioned" },
+    { label: "Asset Categories", value: s.categories, icon: "🏷️", cls: "icon-indigo", foot: "Tracked categories", goto: "categories" },
+    { label: "Total Inventory", value: s.total, icon: "📦", cls: "icon-blue", foot: "Units added via refills", goto: "stock" },
+    { label: "Available", value: s.available, icon: "🟢", cls: "icon-teal", foot: "Ready to assign", goto: "stock" },
+    { label: "Assigned", value: s.assigned, icon: "🔵", cls: "icon-purple", foot: "Currently in use", goto: "assignment", presetFilter: "Assigned" },
+    { label: "Under Repair", value: s.underRepair, icon: "🟡", cls: "icon-amber", foot: "Being serviced", goto: "stock" },
+    { label: "Faulty", value: s.faulty, icon: "🔴", cls: "icon-red", foot: "Needs attention", goto: "stock" },
+    { label: "Lost", value: s.lost, icon: "✖", cls: "icon-grey", foot: "Unaccounted", goto: "stock" },
+    { label: "Scrap", value: s.scrap, icon: "⚫", cls: "icon-grey", foot: "Decommissioned", goto: "stock" },
   ];
 
   const recentAssignments = sortAssignmentsNewestFirst(DB.assignments).slice(0, 6);
   const lowStockRows = s.rows.filter(r => r.low);
+  const isFreshOffice = s.categories === 0;
 
   content.innerHTML = `
     ${viewerNotice()}
+    ${isFreshOffice ? `
+      <div class="viewer-note" style="align-items:flex-start;">
+        <span style="font-size:16px;line-height:1.4;">👋</span>
+        <div>
+          <strong>This office doesn't have any asset categories yet.</strong>
+          <div style="margin-top:2px;">${admin
+            ? `Start on <a href="#" onclick="goto('categories');return false;" style="color:inherit;text-decoration:underline;">Asset Categories</a>, then log your starting stock in the <a href="#" onclick="goto('refill');return false;" style="color:inherit;text-decoration:underline;">Stock Refill Log</a> — the numbers below will fill in from there.`
+            : `Ask an Admin to add categories and log starting stock — the numbers below will fill in from there.`}</div>
+        </div>
+      </div>
+    ` : ""}
     <div class="stat-grid">
       ${cards.map(c => `
-        <div class="stat-card">
+        <div class="stat-card" role="button" tabindex="0" title="View in ${c.goto === "assignment" ? "Asset Assignment" : c.goto === "categories" ? "Asset Categories" : "Stock Summary"}"
+          style="cursor:pointer"
+          onclick="${c.presetFilter ? `assignFilter.status='${c.presetFilter}';` : ""}goto('${c.goto}')"
+          onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
           <div class="stat-top">
             <div class="stat-icon ${c.cls}">${c.icon}</div>
             <div class="stat-label">${c.label}</div>
@@ -466,7 +484,7 @@ function renderDashboard() {
     <div class="grid-2">
       <div class="card">
         <div class="card-header">
-          <div><h2>Recent Assignments</h2><div class="sub">Latest activity from the assignment log</div></div>
+          <div><h2>Recent Assignments</h2><div class="sub">Latest activity from the assignment log${admin ? " — click a row to edit" : ""}</div></div>
           <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">View all →</button>
         </div>
         <div class="table-wrap">
@@ -474,7 +492,7 @@ function renderDashboard() {
             <thead><tr><th>Date</th><th>Asset</th><th>Employee</th><th>Dept</th><th>Status</th></tr></thead>
             <tbody>
               ${recentAssignments.length ? recentAssignments.map(a => `
-                <tr>
+                <tr ${admin ? `style="cursor:pointer" title="Click to edit" onclick="openAssignForm('${a.uid}')"` : ""}>
                   <td>${fmtAssignDateCell(a)}</td>
                   <td>${escapeHtml(a.assetName)}</td>
                   <td>${escapeHtml(a.employeeName)}</td>
@@ -492,7 +510,7 @@ function renderDashboard() {
           <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
         </div>
         ${lowStockRows.length ? lowStockRows.map(r => `
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border);cursor:pointer" title="View in Stock Summary" onclick="goto('stock')">
             <div>
               <div style="font-weight:600">${escapeHtml(r.category)}</div>
               <div class="muted" style="font-size:12px">Available: ${r.available} · Threshold: ${r.threshold}</div>
@@ -503,7 +521,7 @@ function renderDashboard() {
       </div>
     </div>
 
-    <p class="footer-note">Speelfinance · Asset Management Tracker — last updated ${fmtDate(todayISO())}</p>
+    <p class="footer-note"><span class="live-dot" style="display:inline-block;vertical-align:middle;margin-right:6px;"></span>Speelfinance · Asset Management Tracker — live, synced in real time</p>
   `;
 }
 
@@ -521,24 +539,25 @@ function renderAssignment() {
     ${viewerNotice()}
     <div class="card">
       <div class="card-header">
-        <div><h2>Asset Assignment</h2><div class="sub">${DB.assignments.length} records</div></div>
+        <div><h2>Asset Assignment</h2><div class="sub" id="assignCountSub">${DB.assignments.length} records</div></div>
         ${isAdmin() ? `<button class="btn btn-primary" id="addAssignBtn">+ New Assignment</button>` : ""}
       </div>
       <div class="toolbar">
-        <div class="search-box"><input type="text" id="assignSearch" placeholder="Search employee, asset, assigned by..." /></div>
+        <div class="search-box"><input type="text" id="assignSearch" placeholder="Search employee, asset, assigned by..." value="${escapeHtml(assignFilter.q)}" /></div>
         <select class="filter-select" id="assignStatusFilter">
           <option value="">All statuses</option>
-          ${(DB.lists.assignmentStatus || []).map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join("")}
+          ${(DB.lists.assignmentStatus || []).map(s => `<option value="${escapeHtml(s)}" ${assignFilter.status === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
         </select>
         <select class="filter-select" id="assignDeptFilter">
           <option value="">All departments</option>
-          ${depts.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join("")}
+          ${depts.map(d => `<option value="${escapeHtml(d)}" ${assignFilter.dept === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}
         </select>
+        <button class="btn btn-secondary btn-sm" id="assignClearFiltersBtn" style="display:none">Clear filters</button>
         <div id="assignBulkBar"></div>
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
-          ${isAdmin() ? `<th class="ck-col"><input type="checkbox" class="select-ck" id="assignSelectAll"></th>` : ""}
+          ${isAdmin() ? `<th class="ck-col"><input type="checkbox" class="select-ck" id="assignSelectAll" aria-label="Select all assignments"></th>` : ""}
           <th>Date</th><th>Asset</th><th>Employee</th><th>Dept</th><th>Assigned By</th>
           <th>Return Date</th><th>Status</th><th>Remarks</th>${isAdmin() ? "<th></th>" : ""}
         </tr></thead>
@@ -551,6 +570,13 @@ function renderAssignment() {
   document.getElementById("assignSearch").oninput = (e) => { assignFilter.q = e.target.value.toLowerCase(); paintAssignTable(); };
   document.getElementById("assignStatusFilter").onchange = (e) => { assignFilter.status = e.target.value; paintAssignTable(); };
   document.getElementById("assignDeptFilter").onchange = (e) => { assignFilter.dept = e.target.value; paintAssignTable(); };
+  document.getElementById("assignClearFiltersBtn").onclick = () => {
+    assignFilter = { q: "", status: "", dept: "" };
+    document.getElementById("assignSearch").value = "";
+    document.getElementById("assignStatusFilter").value = "";
+    document.getElementById("assignDeptFilter").value = "";
+    paintAssignTable();
+  };
 
   paintAssignTable();
 }
@@ -570,10 +596,20 @@ function paintAssignTable() {
   if (!tbody) return;
   const rows = getFilteredAssignments();
   const admin = isAdmin();
+  const filterActive = !!(assignFilter.q || assignFilter.status || assignFilter.dept);
+
+  const countSub = document.getElementById("assignCountSub");
+  if (countSub) {
+    countSub.textContent = filterActive
+      ? `${rows.length} of ${DB.assignments.length} records (filtered)`
+      : `${DB.assignments.length} records`;
+  }
+  const clearBtn = document.getElementById("assignClearFiltersBtn");
+  if (clearBtn) clearBtn.style.display = filterActive ? "" : "none";
 
   tbody.innerHTML = rows.length ? rows.map(a => `
     <tr>
-      ${admin ? `<td class="ck-col"><input type="checkbox" class="select-ck row-ck" data-uid="${a.uid}" ${assignSelected.has(a.uid) ? "checked" : ""}></td>` : ""}
+      ${admin ? `<td class="ck-col"><input type="checkbox" class="select-ck row-ck" data-uid="${a.uid}" aria-label="Select assignment for ${escapeHtml(a.employeeName)}" ${assignSelected.has(a.uid) ? "checked" : ""}></td>` : ""}
       <td>${fmtAssignDateCell(a)}</td>
       <td>${escapeHtml(a.assetName)}</td>
       <td>${escapeHtml(a.employeeName)}</td>
@@ -584,14 +620,16 @@ function paintAssignTable() {
       <td>${escapeHtml(a.remarks || "—")}</td>
       ${admin ? `<td>
         <div class="row-actions">
-          <button class="btn btn-secondary btn-sm btn-icon" title="Edit" onclick="openAssignForm('${a.uid}')">✏️</button>
-          <button class="btn btn-danger btn-sm btn-icon" title="Delete" onclick="deleteAssignment('${a.uid}')">🗑️</button>
+          <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit assignment for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
+          <button class="btn btn-danger btn-sm btn-icon" title="Delete" aria-label="Delete assignment for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>
         </div>
       </td>` : ""}
     </tr>
-  `).join("") : `<tr class="empty-row"><td colspan="10">No matching records</td></tr>`;
+  `).join("") : `<tr class="empty-row"><td colspan="10">${filterActive ? `No records match your search/filters. <a href="#" id="assignEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No assignments yet"}</td></tr>`;
 
   document.getElementById("assignBulkBar").innerHTML = bulkToolbarHtml(assignSelected.size, rows.length);
+  const emptyClear = document.getElementById("assignEmptyClear");
+  if (emptyClear) emptyClear.onclick = (e) => { e.preventDefault(); document.getElementById("assignClearFiltersBtn").click(); };
   wireAssignBulk(rows);
 }
 
@@ -623,16 +661,19 @@ function wireAssignBulk(rows) {
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
-  if (delAll) delAll.onclick = () => {
-    if (!requireAdminOrWarn()) return;
-    confirmBulkDelete(rows.length, "assignments (matching current filters)", () => {
-      const idsToDelete = new Set(rows.map(r => r.uid));
-      DB.assignments = DB.assignments.filter(a => !idsToDelete.has(a.uid));
-      assignSelected = new Set();
-      saveDB(); toast("All matching assignments deleted"); paintAssignTable();
-      if (currentPage === "dashboard") renderDashboard();
-    });
-  };
+  if (delAll) {
+    delAll.title = "Deletes only the assignments currently shown by your search/filters — not the whole log";
+    delAll.onclick = () => {
+      if (!requireAdminOrWarn()) return;
+      confirmBulkDelete(rows.length, "assignments (matching your current search/filters)", () => {
+        const idsToDelete = new Set(rows.map(r => r.uid));
+        DB.assignments = DB.assignments.filter(a => !idsToDelete.has(a.uid));
+        assignSelected = new Set();
+        saveDB(); toast("All matching assignments deleted"); paintAssignTable();
+        if (currentPage === "dashboard") renderDashboard();
+      });
+    };
+  }
 }
 
 function openAssignForm(uidVal) {
@@ -653,9 +694,9 @@ function openAssignForm(uidVal) {
             <button type="button" class="btn btn-secondary btn-sm" id="assetSelectAll">Select All</button>
             <button type="button" class="btn btn-secondary btn-sm" id="assetSelectNone">Clear</button>
           </div>
-          ${cats.map((c, i) => `
+          ${cats.map(c => `
             <label class="asset-check-row">
-              <input type="checkbox" class="f_asset_multi" value="${escapeHtml(c)}" ${i === 0 ? "checked" : ""}>
+              <input type="checkbox" class="f_asset_multi" value="${escapeHtml(c)}">
               <span>${escapeHtml(c)}</span>
             </label>
           `).join("")}
@@ -696,18 +737,25 @@ function openAssignForm(uidVal) {
       <button class="btn btn-primary" id="saveBtn">${editing ? "Save Changes" : "Add Assignment"}</button>
     </div>
   `, () => {
-    // Auto-fill Employee ID + Department when a known employee name is entered/selected
+    // Auto-fill Employee ID + Department when a known employee name is entered/selected.
+    // Only touches fields the user hasn't already typed into themselves, so it can't
+    // silently overwrite a manual correction while someone is mid-edit.
+    const empIdInput = document.getElementById("f_empid");
+    const deptSel = document.getElementById("f_dept");
+    let empIdTouched = !!empIdInput.value.trim();
+    let deptTouched = editing ? !!deptSel.value : false;
+    empIdInput.addEventListener("input", () => { empIdTouched = true; });
+    deptSel.addEventListener("change", () => { deptTouched = true; });
+
     const empInput = document.getElementById("f_emp");
     const autofillFromName = () => {
       const typed = empInput.value.trim().toLowerCase();
       if (!typed) return;
       const match = DB.employees.find(e => (e.name || "").trim().toLowerCase() === typed);
-      if (match) {
-        document.getElementById("f_empid").value = match.id || "";
-        const deptSel = document.getElementById("f_dept");
-        if (match.department && [...deptSel.options].some(o => o.value === match.department)) {
-          deptSel.value = match.department;
-        }
+      if (!match) return;
+      if (!empIdTouched && match.id) empIdInput.value = match.id;
+      if (!deptTouched && match.department && [...deptSel.options].some(o => o.value === match.department)) {
+        deptSel.value = match.department;
       }
     };
     empInput.addEventListener("input", autofillFromName);
@@ -727,6 +775,7 @@ function openAssignForm(uidVal) {
     document.getElementById("saveBtn").onclick = () => {
       const empName = document.getElementById("f_emp").value.trim();
       if (!empName) { toast("Employee name is required", "err"); return; }
+      if (!document.getElementById("f_date").value) { toast("Date is required", "err"); return; }
 
       const common = {
         date: document.getElementById("f_date").value,
@@ -763,8 +812,10 @@ function openAssignForm(uidVal) {
 
 function deleteAssignment(uidVal) {
   if (!requireAdminOrWarn()) return;
+  const rec = DB.assignments.find(a => a.uid === uidVal);
+  const desc = rec ? `<strong>${escapeHtml(rec.assetName)}</strong> assigned to <strong>${escapeHtml(rec.employeeName)}</strong>` : "this assignment";
   openModal("Delete assignment?", `
-    <p class="muted" style="margin-top:0">This action can't be undone.</p>
+    <p class="muted" style="margin-top:0">Delete ${desc}? This action can't be undone.</p>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelDel">Cancel</button>
       <button class="btn btn-danger" id="confirmDel">Delete</button>
