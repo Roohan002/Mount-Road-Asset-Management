@@ -72,7 +72,7 @@ function emptyOfficeDB() {
   // Blank starting data for a brand-new office — keeps the generic dropdown
   // option lists (status/condition/floor/department) but no actual records.
   const lists = JSON.parse(JSON.stringify(SEED_DATA.lists || {}));
-  return { employees: [], categories: [], lists, assignments: [], refills: [], inventory: [], stockManual: {} };
+  return { employees: [], categories: [], lists, assignments: [], refills: [], inventory: [], stockManual: {}, auditLog: [] };
 }
 async function createOffice(name, city) {
   const id = uniqueOfficeId(slugify(name));
@@ -161,6 +161,7 @@ function seedFromSource() {
     refills: d.refills.map(r => ({ ...r, uid: uid() })),
     inventory: [],
     stockManual: d.stockManual,
+    auditLog: [],
   };
 }
 
@@ -175,6 +176,7 @@ async function loadInitialData() {
     await docRef().set(DB);
   }
   if (!DB.inventory) DB.inventory = [];
+  if (!DB.auditLog) DB.auditLog = [];
 }
 
 function saveDB() {
@@ -191,6 +193,7 @@ function attachRealtimeListener() {
     if (!snap.exists) return;
     DB = snap.data();
     if (!DB.inventory) DB.inventory = [];
+    if (!DB.auditLog) DB.auditLog = [];
     goto(currentPage); // keep every open browser (signed-in users) in sync live
   }, err => console.error("Firestore listener error:", err));
 }
@@ -200,6 +203,23 @@ function detachRealtimeListener() {
 
 function uid() {
   return "id_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+}
+
+/* ---------------- Audit Log — master trail of who added/edited/deleted what ---------------- */
+// Every mutating action across the app calls this right before saveDB(), so there's
+// a single, consistent record of who did what and when — even across multiple admins.
+const AUDIT_LOG_MAX = 3000; // keep the doc size sane; trims oldest entries beyond this
+function logAudit(action, entity, summary) {
+  if (!DB.auditLog) DB.auditLog = [];
+  DB.auditLog.push({
+    uid: uid(),
+    ts: nowISO(),
+    user: (fauth && fauth.currentUser && fauth.currentUser.email) || "Unknown",
+    action,   // "Added" | "Edited" | "Deleted" | "Bulk Deleted" | "Imported" | "Reset"
+    entity,   // "Employee" | "Category" | "Assignment" | "Refill" | "Inventory" | "Stock Setting" | "Dropdown List" | "System"
+    summary,  // short human-readable description of what changed
+  });
+  if (DB.auditLog.length > AUDIT_LOG_MAX) DB.auditLog = DB.auditLog.slice(DB.auditLog.length - AUDIT_LOG_MAX);
 }
 
 function escapeHtml(str) {
@@ -460,6 +480,7 @@ const PAGES = {
   stock: { title: "Stock Summary", render: renderStock },
   refill: { title: "Stock Refill Log", render: renderRefill },
   categories: { title: "Asset Categories", render: renderCategories },
+  auditLog: { title: "Audit Log", render: renderAuditLog },
   settings: { title: "Settings", render: renderSettings },
 };
 
@@ -511,7 +532,10 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
         pwInp.focus();
         return;
       }
+      const priorLog = DB.auditLog || [];
       DB = isDefaultOffice ? seedFromSource() : emptyOfficeDB();
+      DB.auditLog = priorLog; // audit history survives a reset — that's the whole point
+      logAudit("Reset", "System", `Reset ${escapeHtml(officeName)}'s data ${isDefaultOffice ? "to the original uploaded sheet" : "to a blank slate"}`);
       saveDB();
       closeModal();
       toast("Data reset for this office");
@@ -880,8 +904,10 @@ function wireAssignBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || assignSelected.size === 0) return;
     confirmBulkDelete(assignSelected.size, "assignments", () => {
+      const removed = DB.assignments.filter(a => assignSelected.has(a.uid));
       DB.assignments = DB.assignments.filter(a => !assignSelected.has(a.uid));
       assignSelected = new Set();
+      logAudit("Bulk Deleted", "Assignment", `Deleted ${removed.length} assignment(s): ${removed.slice(0, 5).map(a => `${a.assetName} → ${a.employeeName}`).join(", ")}${removed.length > 5 ? ", …" : ""}`);
       saveDB(); toast("Selected assignments deleted"); paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
     });
@@ -895,6 +921,7 @@ function wireAssignBulk(rows) {
         const idsToDelete = new Set(rows.map(r => r.uid));
         DB.assignments = DB.assignments.filter(a => !idsToDelete.has(a.uid));
         assignSelected = new Set();
+        logAudit("Bulk Deleted", "Assignment", `Deleted ${rows.length} assignment(s) matching filters`);
         saveDB(); toast("All matching assignments deleted"); paintAssignTable();
         if (currentPage === "dashboard") renderDashboard();
       });
@@ -1017,6 +1044,7 @@ function openAssignForm(uidVal) {
       if (editing) {
         const rec = { ...common, assetName: document.getElementById("f_asset").value };
         Object.assign(editing, rec);
+        logAudit("Edited", "Assignment", `Edited assignment: ${rec.assetName} → ${rec.employeeName} (status: ${rec.status})`);
         toast("Assignment updated");
       } else {
         const selectedAssets = [...document.querySelectorAll(".f_asset_multi:checked")].map(cb => cb.value);
@@ -1024,6 +1052,7 @@ function openAssignForm(uidVal) {
         selectedAssets.forEach(assetName => {
           DB.assignments.push({ uid: uid(), id: DB.assignments.length + 1, createdAt: nowISO(), ...common, assetName });
         });
+        logAudit("Added", "Assignment", `Added ${selectedAssets.length} assignment(s) for ${empName}: ${selectedAssets.join(", ")}`);
         toast(selectedAssets.length > 1
           ? `${selectedAssets.length} assignments added for ${empName}`
           : "Assignment added");
@@ -1050,6 +1079,7 @@ function deleteAssignment(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.assignments = DB.assignments.filter(a => a.uid !== uidVal);
       assignSelected.delete(uidVal);
+      logAudit("Deleted", "Assignment", `Deleted assignment: ${rec ? `${rec.assetName} → ${rec.employeeName}` : uidVal}`);
       saveDB(); closeModal(); toast("Assignment deleted"); paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
     };
@@ -1152,8 +1182,10 @@ function wireInvBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || invSelected.size === 0) return;
     confirmBulkDelete(invSelected.size, "assets", () => {
+      const removed = DB.inventory.filter(r => invSelected.has(r.uid));
       DB.inventory = DB.inventory.filter(r => !invSelected.has(r.uid));
       invSelected = new Set();
+      logAudit("Bulk Deleted", "Inventory", `Deleted ${removed.length} asset(s): ${removed.slice(0, 5).map(r => r.assetId).join(", ")}${removed.length > 5 ? ", …" : ""}`);
       saveDB(); toast("Selected assets deleted"); paintInvTable();
     });
   };
@@ -1164,6 +1196,7 @@ function wireInvBulk(rows) {
       const idsToDelete = new Set(rows.map(r => r.uid));
       DB.inventory = DB.inventory.filter(r => !idsToDelete.has(r.uid));
       invSelected = new Set();
+      logAudit("Bulk Deleted", "Inventory", `Deleted ${rows.length} asset(s) matching search`);
       saveDB(); toast("All matching assets deleted"); paintInvTable();
     });
   };
@@ -1244,8 +1277,8 @@ function openInvForm(uidVal) {
         condition: document.getElementById("f_cond").value,
         remarks: document.getElementById("f_remarks").value.trim(),
       };
-      if (editing) { Object.assign(editing, rec); toast("Asset updated"); }
-      else { DB.inventory.push({ uid: uid(), ...rec }); toast("Asset added"); }
+      if (editing) { Object.assign(editing, rec); logAudit("Edited", "Inventory", `Edited asset: ${rec.assetId} (${rec.assetName})`); toast("Asset updated"); }
+      else { DB.inventory.push({ uid: uid(), ...rec }); logAudit("Added", "Inventory", `Added asset: ${rec.assetId} (${rec.assetName})`); toast("Asset added"); }
       saveDB(); closeModal(); paintInvTable();
     };
   });
@@ -1253,6 +1286,7 @@ function openInvForm(uidVal) {
 
 function deleteInv(uidVal) {
   if (!requireAdminOrWarn()) return;
+  const rec = DB.inventory.find(r => r.uid === uidVal);
   openModal("Delete asset?", `
     <p class="muted" style="margin-top:0">This action can't be undone.</p>
     <div class="form-actions">
@@ -1263,6 +1297,7 @@ function deleteInv(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.inventory = DB.inventory.filter(r => r.uid !== uidVal);
       invSelected.delete(uidVal);
+      logAudit("Deleted", "Inventory", `Deleted asset: ${rec ? `${rec.assetId} (${rec.assetName})` : uidVal}`);
       saveDB(); closeModal(); toast("Asset deleted"); paintInvTable();
     };
   });
@@ -1369,8 +1404,10 @@ function wireEmpBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || empSelected.size === 0) return;
     confirmBulkDelete(empSelected.size, "employees", () => {
+      const removed = DB.employees.filter(e => empSelected.has(e.uid));
       DB.employees = DB.employees.filter(e => !empSelected.has(e.uid));
       empSelected = new Set();
+      logAudit("Bulk Deleted", "Employee", `Deleted ${removed.length} employee(s): ${removed.slice(0, 5).map(e => e.name).join(", ")}${removed.length > 5 ? ", …" : ""}`);
       saveDB(); toast("Selected employees deleted"); paintEmpTable();
     });
   };
@@ -1381,6 +1418,7 @@ function wireEmpBulk(rows) {
       const idsToDelete = new Set(rows.map(r => r.uid));
       DB.employees = DB.employees.filter(e => !idsToDelete.has(e.uid));
       empSelected = new Set();
+      logAudit("Bulk Deleted", "Employee", `Deleted ${rows.length} employee(s) matching search`);
       saveDB(); toast("All matching employees deleted"); paintEmpTable();
     });
   };
@@ -1418,8 +1456,8 @@ function openEmpForm(uidVal) {
         phone: document.getElementById("f_phone").value.trim(),
         email: document.getElementById("f_email").value.trim(),
       };
-      if (editing) { Object.assign(editing, rec); toast("Employee updated"); }
-      else { DB.employees.push({ uid: uid(), ...rec }); toast("Employee added"); }
+      if (editing) { Object.assign(editing, rec); logAudit("Edited", "Employee", `Edited employee: ${rec.name}${rec.id ? ` (${rec.id})` : ""}`); toast("Employee updated"); }
+      else { DB.employees.push({ uid: uid(), ...rec }); logAudit("Added", "Employee", `Added employee: ${rec.name}${rec.id ? ` (${rec.id})` : ""}`); toast("Employee added"); }
       saveDB(); closeModal(); paintEmpTable();
     };
   });
@@ -1427,6 +1465,7 @@ function openEmpForm(uidVal) {
 
 function deleteEmp(uidVal) {
   if (!requireAdminOrWarn()) return;
+  const rec = DB.employees.find(e => e.uid === uidVal);
   openModal("Remove employee?", `
     <p class="muted" style="margin-top:0">This action can't be undone.</p>
     <div class="form-actions">
@@ -1437,6 +1476,7 @@ function deleteEmp(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.employees = DB.employees.filter(e => e.uid !== uidVal);
       empSelected.delete(uidVal);
+      logAudit("Deleted", "Employee", `Removed employee: ${rec ? rec.name : uidVal}`);
       saveDB(); closeModal(); toast("Employee removed"); paintEmpTable();
     };
   });
@@ -1512,6 +1552,7 @@ function importEmployeeRows(rawRows) {
     }
   });
 
+  logAudit("Imported", "Employee", `Imported employees from file: ${added} added, ${updated} updated${skipped ? `, ${skipped} skipped` : ""}`);
   saveDB();
   openModal("Import complete", `
     <p style="margin-top:0">✅ <strong>${added}</strong> new employee${added === 1 ? "" : "s"} added.</p>
@@ -1692,7 +1733,11 @@ function renderStock() {
       inp.onchange = () => {
         const cat = inp.dataset.cat, field = inp.dataset.field;
         if (!DB.stockManual[cat]) DB.stockManual[cat] = { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
-        DB.stockManual[cat][field] = Number(inp.value) || 0;
+        const oldVal = DB.stockManual[cat][field];
+        const newVal = Number(inp.value) || 0;
+        DB.stockManual[cat][field] = newVal;
+        const FIELD_LABEL = { underRepair: "Under Repair", faulty: "Faulty", lost: "Lost", scrap: "Scrap", threshold: "Threshold" };
+        logAudit("Edited", "Stock Setting", `Set ${FIELD_LABEL[field] || field} for "${cat}" from ${oldVal} to ${newVal}`);
         saveDB();
         renderStock();
       };
@@ -1776,8 +1821,10 @@ function wireRefillBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || refillSelected.size === 0) return;
     confirmBulkDelete(refillSelected.size, "refill entries", () => {
+      const removed = DB.refills.filter(r => refillSelected.has(r.uid));
       DB.refills = DB.refills.filter(r => !refillSelected.has(r.uid));
       refillSelected = new Set();
+      logAudit("Bulk Deleted", "Refill", `Deleted ${removed.length} refill entr${removed.length === 1 ? "y" : "ies"}: ${removed.slice(0, 5).map(r => `${r.category} +${r.quantity}`).join(", ")}${removed.length > 5 ? ", …" : ""}`);
       saveDB(); toast("Selected entries deleted"); paintRefillTable();
     });
   };
@@ -1785,8 +1832,10 @@ function wireRefillBulk(rows) {
   if (delAll) delAll.onclick = () => {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "refill entries", () => {
+      const count = DB.refills.length;
       DB.refills = [];
       refillSelected = new Set();
+      logAudit("Bulk Deleted", "Refill", `Deleted all ${count} refill entries`);
       saveDB(); toast("All refill entries deleted"); paintRefillTable();
     });
   };
@@ -1814,14 +1863,16 @@ function openRefillForm() {
     document.getElementById("saveBtn").onclick = () => {
       const qty = Number(document.getElementById("f_qty").value);
       if (!qty || qty <= 0) { toast("Enter a valid quantity", "err"); return; }
+      const cat = document.getElementById("f_cat").value;
       DB.refills.push({
         uid: uid(), id: DB.refills.length + 1,
         date: document.getElementById("f_date").value,
-        category: document.getElementById("f_cat").value,
+        category: cat,
         quantity: qty,
         addedBy: document.getElementById("f_by").value.trim(),
         source: document.getElementById("f_source").value.trim(),
       });
+      logAudit("Added", "Refill", `Logged refill: +${qty} ${cat}`);
       saveDB(); closeModal(); toast("Refill logged"); paintRefillTable();
     };
   });
@@ -1829,6 +1880,7 @@ function openRefillForm() {
 
 function deleteRefill(uidVal) {
   if (!requireAdminOrWarn()) return;
+  const rec = DB.refills.find(r => r.uid === uidVal);
   openModal("Delete refill entry?", `
     <p class="muted" style="margin-top:0">This will reduce Total Stock for that category.</p>
     <div class="form-actions">
@@ -1839,6 +1891,7 @@ function deleteRefill(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.refills = DB.refills.filter(r => r.uid !== uidVal);
       refillSelected.delete(uidVal);
+      logAudit("Deleted", "Refill", `Deleted refill entry: ${rec ? `+${rec.quantity} ${rec.category}` : uidVal}`);
       saveDB(); closeModal(); toast("Refill entry deleted"); paintRefillTable();
     };
   });
@@ -1918,8 +1971,10 @@ function wireCatBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || catSelected.size === 0) return;
     confirmBulkDelete(catSelected.size, "categories", () => {
+      const removed = DB.categories.filter(c => catSelected.has(c.uid));
       DB.categories = DB.categories.filter(c => !catSelected.has(c.uid));
       catSelected = new Set();
+      logAudit("Bulk Deleted", "Category", `Deleted ${removed.length} categor${removed.length === 1 ? "y" : "ies"}: ${removed.map(c => c.name).join(", ")}`);
       saveDB(); toast("Selected categories deleted"); paintCatTable();
     });
   };
@@ -1927,8 +1982,10 @@ function wireCatBulk(rows) {
   if (delAll) delAll.onclick = () => {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "categories", () => {
+      const count = DB.categories.length;
       DB.categories = [];
       catSelected = new Set();
+      logAudit("Bulk Deleted", "Category", `Deleted all ${count} categories`);
       saveDB(); toast("All categories deleted"); paintCatTable();
     });
   };
@@ -1957,11 +2014,15 @@ function openCatForm(uidVal) {
           DB.assignments.forEach(a => { if (a.assetName === oldName) a.assetName = name; });
           DB.refills.forEach(r => { if (r.category === oldName) r.category = name; });
           if (DB.stockManual[oldName]) { DB.stockManual[name] = DB.stockManual[oldName]; delete DB.stockManual[oldName]; }
+          logAudit("Edited", "Category", `Renamed category: "${oldName}" → "${name}"`);
+        } else {
+          logAudit("Edited", "Category", `Edited category: ${name}`);
         }
         toast("Category updated");
       } else {
         DB.categories.push({ uid: uid(), name, notes: document.getElementById("f_notes").value.trim() });
         DB.stockManual[name] = { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
+        logAudit("Added", "Category", `Added category: ${name}`);
         toast("Category added");
       }
       saveDB(); closeModal(); paintCatTable();
@@ -1971,6 +2032,7 @@ function openCatForm(uidVal) {
 
 function deleteCat(uidVal) {
   if (!requireAdminOrWarn()) return;
+  const rec = DB.categories.find(c => c.uid === uidVal);
   openModal("Delete category?", `
     <p class="muted" style="margin-top:0">Existing assignments and refill entries referencing it will keep their history but stop appearing in dropdowns.</p>
     <div class="form-actions">
@@ -1981,9 +2043,135 @@ function deleteCat(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.categories = DB.categories.filter(c => c.uid !== uidVal);
       catSelected.delete(uidVal);
+      logAudit("Deleted", "Category", `Deleted category: ${rec ? rec.name : uidVal}`);
       saveDB(); closeModal(); toast("Category deleted"); paintCatTable();
     };
   });
+}
+
+/* =========================================================
+   AUDIT LOG — master trail of who added/edited/deleted what
+   ========================================================= */
+let auditFilter = { q: "", user: "", action: "", entity: "", from: "", to: "" };
+
+function renderAuditLog() {
+  const content = document.getElementById("content");
+
+  if (!isAdmin()) {
+    content.innerHTML = `
+      <div class="card" style="text-align:center; padding:60px 24px;">
+        <div style="font-size:34px; margin-bottom:10px;">🔒</div>
+        <h2 style="margin:0 0 6px;">Admin access required</h2>
+        <p class="muted" style="margin:0;">Sign in as Admin from the sidebar to view who added, edited or deleted what.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const log = DB.auditLog || [];
+  const users = [...new Set(log.map(l => l.user))].sort();
+  const entities = [...new Set(log.map(l => l.entity))].sort();
+
+  content.innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <div><h2>Audit Log</h2><div class="sub">${log.length} recorded action${log.length === 1 ? "" : "s"} — every add, edit and delete across this office, with who and when</div></div>
+        <button class="btn btn-secondary btn-sm" id="exportAuditBtn">⬇ Export CSV</button>
+      </div>
+      <div class="toolbar">
+        <div class="search-box"><input type="text" id="auditSearch" placeholder="Search details..." value="${escapeHtml(auditFilter.q)}" /></div>
+        <select class="filter-select" id="auditUserFilter">
+          <option value="">All users</option>
+          ${users.map(u => `<option value="${escapeHtml(u)}" ${auditFilter.user === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+        </select>
+        <select class="filter-select" id="auditActionFilter">
+          <option value="">All actions</option>
+          ${["Added", "Edited", "Deleted", "Bulk Deleted", "Imported", "Reset"].map(a => `<option value="${a}" ${auditFilter.action === a ? "selected" : ""}>${a}</option>`).join("")}
+        </select>
+        <select class="filter-select" id="auditEntityFilter">
+          <option value="">All types</option>
+          ${entities.map(e => `<option value="${escapeHtml(e)}" ${auditFilter.entity === e ? "selected" : ""}>${escapeHtml(e)}</option>`).join("")}
+        </select>
+        <input type="date" class="filter-select" id="auditFromDate" title="From date" value="${auditFilter.from}">
+        <input type="date" class="filter-select" id="auditToDate" title="To date" value="${auditFilter.to}">
+        <button class="btn btn-secondary btn-sm" id="auditClearFiltersBtn" style="display:none">Clear filters</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date &amp; Time</th><th>User</th><th>Action</th><th>Type</th><th>Details</th></tr></thead>
+        <tbody id="auditTbody"></tbody>
+      </table></div>
+    </div>
+  `;
+
+  document.getElementById("auditSearch").oninput = (e) => { auditFilter.q = e.target.value.toLowerCase(); paintAuditTable(); };
+  document.getElementById("auditUserFilter").onchange = (e) => { auditFilter.user = e.target.value; paintAuditTable(); };
+  document.getElementById("auditActionFilter").onchange = (e) => { auditFilter.action = e.target.value; paintAuditTable(); };
+  document.getElementById("auditEntityFilter").onchange = (e) => { auditFilter.entity = e.target.value; paintAuditTable(); };
+  document.getElementById("auditFromDate").onchange = (e) => { auditFilter.from = e.target.value; paintAuditTable(); };
+  document.getElementById("auditToDate").onchange = (e) => { auditFilter.to = e.target.value; paintAuditTable(); };
+  document.getElementById("auditClearFiltersBtn").onclick = () => {
+    auditFilter = { q: "", user: "", action: "", entity: "", from: "", to: "" };
+    renderAuditLog();
+  };
+  document.getElementById("exportAuditBtn").onclick = exportAuditLogCSV;
+
+  paintAuditTable();
+}
+
+function getFilteredAuditLog() {
+  let rows = [...(DB.auditLog || [])];
+  if (auditFilter.q) rows = rows.filter(l => (l.summary || "").toLowerCase().includes(auditFilter.q));
+  if (auditFilter.user) rows = rows.filter(l => l.user === auditFilter.user);
+  if (auditFilter.action) rows = rows.filter(l => l.action === auditFilter.action);
+  if (auditFilter.entity) rows = rows.filter(l => l.entity === auditFilter.entity);
+  if (auditFilter.from) rows = rows.filter(l => (l.ts || "").slice(0, 10) >= auditFilter.from);
+  if (auditFilter.to) rows = rows.filter(l => (l.ts || "").slice(0, 10) <= auditFilter.to);
+  return rows.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+}
+
+function auditActionBadge(action) {
+  const map = {
+    "Added": "badge-green", "Edited": "badge-blue", "Deleted": "badge-red",
+    "Bulk Deleted": "badge-red", "Imported": "badge-purple", "Reset": "badge-amber",
+  };
+  return `<span class="badge ${map[action] || "badge-grey"}">${escapeHtml(action)}</span>`;
+}
+
+function paintAuditTable() {
+  const tbody = document.getElementById("auditTbody");
+  if (!tbody) return;
+  const rows = getFilteredAuditLog();
+  const anyFilterActive = !!(auditFilter.q || auditFilter.user || auditFilter.action || auditFilter.entity || auditFilter.from || auditFilter.to);
+  const clearBtn = document.getElementById("auditClearFiltersBtn");
+  if (clearBtn) clearBtn.style.display = anyFilterActive ? "" : "none";
+
+  tbody.innerHTML = rows.length ? rows.map(l => `
+    <tr>
+      <td>${fmtDate(l.ts)} <span class="muted" style="font-size:11px;">${fmtTimeOnly(l.ts)}</span></td>
+      <td>${escapeHtml(l.user)}</td>
+      <td>${auditActionBadge(l.action)}</td>
+      <td>${escapeHtml(l.entity)}</td>
+      <td>${escapeHtml(l.summary)}</td>
+    </tr>
+  `).join("") : `<tr class="empty-row"><td colspan="5">No actions recorded yet${anyFilterActive ? " for these filters" : ""}</td></tr>`;
+}
+
+function exportAuditLogCSV() {
+  const rows = getFilteredAuditLog();
+  if (!rows.length) { toast("Nothing to export", "err"); return; }
+  const esc = (v) => `"${String(v ?? "").replaceAll('"', '""')}"`;
+  const lines = [["Date/Time", "User", "Action", "Type", "Details"].map(esc).join(",")];
+  rows.forEach(l => lines.push([l.ts, l.user, l.action, l.entity, l.summary].map(esc).join(",")));
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `audit-log-${todayISO()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  toast("Audit log exported");
 }
 
 /* =========================================================
@@ -2038,6 +2226,7 @@ function renderSettings() {
         if (!DB.lists[key]) DB.lists[key] = [];
         if (DB.lists[key].includes(val)) { toast("Already exists", "err"); return; }
         DB.lists[key].push(val);
+        logAudit("Added", "Dropdown List", `Added "${val}" to ${key} list`);
         saveDB(); input.value = ""; paintChips(key); toast("Added");
       };
     });
@@ -2058,6 +2247,7 @@ function removeListItem(key, encodedVal) {
   if (!requireAdminOrWarn()) return;
   const val = decodeURIComponent(encodedVal);
   DB.lists[key] = (DB.lists[key] || []).filter(v => v !== val);
+  logAudit("Deleted", "Dropdown List", `Removed "${val}" from ${key} list`);
   saveDB();
   paintChips(key);
   toast("Removed");
