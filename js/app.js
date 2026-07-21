@@ -10,10 +10,21 @@
    ========================================================= */
 
 let DB = null;
-let currentPage = "dashboard";
+let currentPage = localStorage.getItem("assetTracker_lastPage") || "dashboard";
 let fbApp = null, fdb = null, fauth = null;
 const FIRESTORE_COLLECTION = "assetTracker";
-const FIRESTORE_DOC = "data";
+const FIRESTORE_DOC = "data"; // legacy default office doc id (kept for backward compatibility)
+const OFFICES_DOC_ID = "_offices"; // single doc holding the list of every office { id, name, city }
+const DEFAULT_OFFICE_ID = FIRESTORE_DOC;
+
+/* ---------------- Multi-office state ---------------- */
+// Every office's data lives in its own Firestore document
+// (assetTracker/{officeId}), completely separate from every other office —
+// nothing is shared or synced between them.
+let OFFICES = [];            // [{id, name, city}]
+let currentOfficeId = null;  // id of the office currently open
+const LAST_OFFICE_KEY = "assetTracker_lastOfficeId";
+const LAST_PAGE_KEY = "assetTracker_lastPage";
 
 /* ---------------- Firebase bootstrap ---------------- */
 function firebaseConfigured() {
@@ -27,7 +38,60 @@ function initFirebase() {
   fauth = firebase.auth();
 }
 function docRef() {
-  return fdb.collection(FIRESTORE_COLLECTION).doc(FIRESTORE_DOC);
+  return fdb.collection(FIRESTORE_COLLECTION).doc(currentOfficeId || DEFAULT_OFFICE_ID);
+}
+function officesDocRef() {
+  return fdb.collection(FIRESTORE_COLLECTION).doc(OFFICES_DOC_ID);
+}
+
+/* ---------------- Office directory (list of offices) ---------------- */
+function slugify(str) {
+  return String(str).toLowerCase().trim()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "office";
+}
+function uniqueOfficeId(base) {
+  let id = base, n = 2;
+  const taken = new Set(OFFICES.map(o => o.id));
+  while (taken.has(id) || id === OFFICES_DOC_ID) { id = `${base}-${n++}`; }
+  return id;
+}
+async function loadOfficesList() {
+  const snap = await officesDocRef().get();
+  if (snap.exists && Array.isArray(snap.data().offices) && snap.data().offices.length) {
+    OFFICES = snap.data().offices;
+  } else {
+    // First run — seed the directory with the original office so existing data isn't orphaned.
+    OFFICES = [{ id: DEFAULT_OFFICE_ID, name: "Mount Road", city: "Mumbai" }];
+    await officesDocRef().set({ offices: OFFICES });
+  }
+}
+async function saveOfficesList() {
+  await officesDocRef().set({ offices: OFFICES });
+}
+function emptyOfficeDB() {
+  // Blank starting data for a brand-new office — keeps the generic dropdown
+  // option lists (status/condition/floor/department) but no actual records.
+  const lists = JSON.parse(JSON.stringify(SEED_DATA.lists || {}));
+  return { employees: [], categories: [], lists, assignments: [], refills: [], inventory: [], stockManual: {} };
+}
+async function createOffice(name, city) {
+  const id = uniqueOfficeId(slugify(name));
+  OFFICES.push({ id, name: name.trim(), city: (city || "").trim() });
+  await saveOfficesList();
+  await fdb.collection(FIRESTORE_COLLECTION).doc(id).set(emptyOfficeDB());
+  return id;
+}
+async function deleteOffice(id) {
+  OFFICES = OFFICES.filter(o => o.id !== id);
+  await saveOfficesList();
+  await fdb.collection(FIRESTORE_COLLECTION).doc(id).delete().catch(() => {});
+}
+async function renameOffice(id, name, city) {
+  const o = OFFICES.find(o => o.id === id);
+  if (!o) return;
+  o.name = name.trim();
+  o.city = (city || "").trim();
+  await saveOfficesList();
 }
 
 /* ---------------- Role management (Firebase Auth) ---------------- */
@@ -156,6 +220,33 @@ function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function nowISO() {
+  return new Date().toISOString();
+}
+
+// Assignment rows get an auto-captured `createdAt` timestamp when added, used
+// (a) to order the list by real time — newest on top — rather than just by
+// the user-entered Date field, and (b) to show a time alongside the date.
+function fmtTimeOnly(iso) {
+  if (!iso) return "";
+  const dt = new Date(iso);
+  if (isNaN(dt)) return "";
+  return dt.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
+}
+function fmtAssignDateCell(a) {
+  const dateStr = fmtDate(a.date);
+  const t = fmtTimeOnly(a.createdAt);
+  return t ? `${dateStr} <span class="muted" style="font-size:11px;">${t}</span>` : dateStr;
+}
+function assignSortKey(a) {
+  // Records created before this feature don't have createdAt — fall back to
+  // the Date field (treated as midnight) so old and new rows still sort together.
+  return a.createdAt || (a.date ? a.date + "T00:00:00" : "");
+}
+function sortAssignmentsNewestFirst(list) {
+  return [...list].sort((a, b) => assignSortKey(b).localeCompare(assignSortKey(a)));
+}
+
 /* ---------------- Toast ---------------- */
 let toastTimer = null;
 function toast(msg, kind = "ok") {
@@ -278,7 +369,9 @@ const PAGES = {
 };
 
 function goto(page) {
+  if (!PAGES[page]) page = "dashboard"; // guard against a stale/invalid saved page
   currentPage = page;
+  localStorage.setItem(LAST_PAGE_KEY, page);
   document.querySelectorAll(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page === page));
   document.getElementById("pageTitle").textContent = PAGES[page].title;
   document.getElementById("content").innerHTML = "";
@@ -298,17 +391,20 @@ const RESET_CONFIRM_PASSWORD = "reset123"; // change this to whatever you like �
 
 document.getElementById("resetDataBtn").addEventListener("click", () => {
   if (!requireAdminOrWarn()) return;
-  openModal("Reset all data?", `
-    <p class="muted" style="margin-top:0">This restores the dashboard, assignments, employees and logs back to the
-    original uploaded sheet — for <strong>everyone</strong> viewing this app, since data is shared live via Firebase.
-    Anything anyone has added or edited will be lost.</p>
+  const isDefaultOffice = currentOfficeId === DEFAULT_OFFICE_ID;
+  const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "this office";
+  openModal("Reset this office's data?", `
+    <p class="muted" style="margin-top:0">This resets the dashboard, assignments, employees and logs for
+    <strong>${escapeHtml(officeName)}</strong> ${isDefaultOffice ? "back to the original uploaded sheet" : "to a blank slate"} —
+    for everyone viewing this office, since data is shared live via Firebase. Other offices are not affected.
+    Anything anyone has added or edited for this office will be lost.</p>
     <div class="field"><label>Type the confirmation password to continue</label>
       <input type="password" id="resetConfirmPw" placeholder="Confirmation password" autocomplete="off">
     </div>
     <p id="resetPwError" style="display:none; color:var(--red); font-weight:600; font-size:12.5px; margin-top:-6px;">Incorrect password.</p>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelReset">Cancel</button>
-      <button class="btn btn-danger" id="confirmReset">Yes, reset data for everyone</button>
+      <button class="btn btn-danger" id="confirmReset">Yes, reset this office's data</button>
     </div>
   `, () => {
     const pwInp = document.getElementById("resetConfirmPw");
@@ -320,10 +416,10 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
         pwInp.focus();
         return;
       }
-      DB = seedFromSource();
+      DB = isDefaultOffice ? seedFromSource() : emptyOfficeDB();
       saveDB();
       closeModal();
-      toast("Data reset to original sheet");
+      toast("Data reset for this office");
       goto(currentPage);
     };
     document.getElementById("confirmReset").onclick = attempt;
@@ -349,7 +445,7 @@ function renderDashboard() {
     { label: "Scrap", value: s.scrap, icon: "⚫", cls: "icon-grey", foot: "Decommissioned" },
   ];
 
-  const recentAssignments = [...DB.assignments].sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 6);
+  const recentAssignments = sortAssignmentsNewestFirst(DB.assignments).slice(0, 6);
   const lowStockRows = s.rows.filter(r => r.low);
 
   content.innerHTML = `
@@ -379,7 +475,7 @@ function renderDashboard() {
             <tbody>
               ${recentAssignments.length ? recentAssignments.map(a => `
                 <tr>
-                  <td>${fmtDate(a.date)}</td>
+                  <td>${fmtAssignDateCell(a)}</td>
                   <td>${escapeHtml(a.assetName)}</td>
                   <td>${escapeHtml(a.employeeName)}</td>
                   <td>${escapeHtml(a.department || "—")}</td>
@@ -460,7 +556,7 @@ function renderAssignment() {
 }
 
 function getFilteredAssignments() {
-  let rows = [...DB.assignments].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  let rows = sortAssignmentsNewestFirst(DB.assignments);
   if (assignFilter.q) {
     rows = rows.filter(a => [a.employeeName, a.assetName, a.assignedBy, a.remarks].join(" ").toLowerCase().includes(assignFilter.q));
   }
@@ -478,7 +574,7 @@ function paintAssignTable() {
   tbody.innerHTML = rows.length ? rows.map(a => `
     <tr>
       ${admin ? `<td class="ck-col"><input type="checkbox" class="select-ck row-ck" data-uid="${a.uid}" ${assignSelected.has(a.uid) ? "checked" : ""}></td>` : ""}
-      <td>${fmtDate(a.date)}</td>
+      <td>${fmtAssignDateCell(a)}</td>
       <td>${escapeHtml(a.assetName)}</td>
       <td>${escapeHtml(a.employeeName)}</td>
       <td>${escapeHtml(a.department || "—")}</td>
@@ -651,7 +747,7 @@ function openAssignForm(uidVal) {
         const selectedAssets = [...document.querySelectorAll(".f_asset_multi:checked")].map(cb => cb.value);
         if (!selectedAssets.length) { toast("Select at least one asset", "err"); return; }
         selectedAssets.forEach(assetName => {
-          DB.assignments.push({ uid: uid(), id: DB.assignments.length + 1, ...common, assetName });
+          DB.assignments.push({ uid: uid(), id: DB.assignments.length + 1, createdAt: nowISO(), ...common, assetName });
         });
         toast(selectedAssets.length > 1
           ? `${selectedAssets.length} assignments added for ${empName}`
@@ -719,7 +815,9 @@ function renderInventory() {
 }
 
 function getFilteredInventory() {
-  let rows = [...DB.inventory];
+  // Newest added first — DB.inventory is appended to (push) as assets are
+  // added, so reversing gives most-recently-added items at the top.
+  let rows = [...DB.inventory].reverse();
   if (invFilter.q) rows = rows.filter(r => Object.values(r).join(" ").toLowerCase().includes(invFilter.q));
   return rows;
 }
@@ -1168,7 +1266,7 @@ function getAssignmentsForEmployee(emp) {
       if (idKey && aId) return aId === idKey;
       return aName === nameKey;
     })
-    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    .sort((a, b) => assignSortKey(b).localeCompare(assignSortKey(a)));
 }
 
 // "Currently assigned" = anything not yet marked Returned (covers
@@ -1256,7 +1354,7 @@ function openEmpHistoryModal(empUid) {
         <tbody>
           ${records.length ? records.map(a => `
             <tr>
-              <td>${fmtDate(a.date)}</td>
+              <td>${fmtAssignDateCell(a)}</td>
               <td>${escapeHtml(a.assetName)}</td>
               <td>${statusBadge(a.status)}</td>
               <td>${escapeHtml(a.assignedBy || "—")}</td>
@@ -1702,6 +1800,7 @@ function hideLoadingScreen() {
 function hideAllGateScreens() {
   document.getElementById("firebaseSetupScreen")?.classList.remove("show");
   document.getElementById("signInGateScreen")?.classList.remove("show");
+  document.getElementById("officeSelectScreen")?.classList.remove("show");
   const shell = document.querySelector(".app-shell");
   if (shell) shell.style.display = "";
 }
@@ -1709,6 +1808,7 @@ function showFirebaseSetupScreen(isError) {
   const shell = document.querySelector(".app-shell");
   if (shell) shell.style.display = "none";
   document.getElementById("signInGateScreen")?.classList.remove("show");
+  document.getElementById("officeSelectScreen")?.classList.remove("show");
   const el = document.getElementById("firebaseSetupScreen");
   if (el) {
     el.classList.add("show");
@@ -1720,6 +1820,7 @@ function showSignInGate(errorMsg) {
   const shell = document.querySelector(".app-shell");
   if (shell) shell.style.display = "none";
   document.getElementById("firebaseSetupScreen")?.classList.remove("show");
+  document.getElementById("officeSelectScreen")?.classList.remove("show");
   const el = document.getElementById("signInGateScreen");
   if (el) el.classList.add("show");
   const note = document.getElementById("gateErrorNote");
@@ -1728,6 +1829,163 @@ function showSignInGate(errorMsg) {
     else { note.style.display = "none"; }
   }
 }
+
+/* ---------------- Office select screen ---------------- */
+function renderOfficeCards() {
+  const grid = document.getElementById("officeGrid");
+  if (!grid) return;
+  if (!OFFICES.length) {
+    grid.innerHTML = `<div class="office-empty-note">No offices yet — add one to get started.</div>`;
+    return;
+  }
+  grid.innerHTML = OFFICES.map(o => `
+    <div class="office-card" data-id="${escapeHtml(o.id)}">
+      <div class="office-card-actions">
+        <button class="office-card-edit" data-id="${escapeHtml(o.id)}" title="Rename office">✎</button>
+        ${OFFICES.length > 1 ? `<button class="office-card-del" data-id="${escapeHtml(o.id)}" title="Delete office">✕</button>` : ""}
+      </div>
+      <div class="office-card-icon">🏢</div>
+      <div class="office-card-name">${escapeHtml(o.name)}</div>
+      <div class="office-card-city">${escapeHtml(o.city || "—")}</div>
+    </div>
+  `).join("");
+}
+async function openOffice(officeId) {
+  currentOfficeId = officeId;
+  localStorage.setItem(LAST_OFFICE_KEY, officeId);
+  hideAllGateScreens();
+  showLoadingScreen();
+  try {
+    await loadInitialData();
+    attachRealtimeListener();
+    dataBootstrapped = true;
+  } catch (err) {
+    console.error(err);
+    hideLoadingScreen();
+    showFirebaseSetupScreen(true);
+    return;
+  }
+  hideLoadingScreen();
+  paintOfficeUI();
+  goto(currentPage);
+}
+async function showOfficeSelectScreen() {
+  detachRealtimeListener();
+  DB = null;
+  dataBootstrapped = false;
+  currentOfficeId = null;
+  localStorage.removeItem(LAST_OFFICE_KEY);
+  const shell = document.querySelector(".app-shell");
+  if (shell) shell.style.display = "none";
+  document.getElementById("firebaseSetupScreen")?.classList.remove("show");
+  document.getElementById("signInGateScreen")?.classList.remove("show");
+  showLoadingScreen();
+  try {
+    await loadOfficesList();
+  } catch (err) {
+    console.error(err);
+    hideLoadingScreen();
+    showFirebaseSetupScreen(true);
+    return;
+  }
+  hideLoadingScreen();
+  renderOfficeCards();
+  document.getElementById("officeSelectScreen")?.classList.add("show");
+}
+function paintOfficeUI() {
+  const badge = document.getElementById("officeBadge");
+  if (!badge) return;
+  const o = OFFICES.find(o => o.id === currentOfficeId);
+  badge.textContent = o ? `${o.name}${o.city ? " · " + o.city : ""}` : "—";
+}
+document.getElementById("officeGrid").addEventListener("click", (e) => {
+  const editBtn = e.target.closest(".office-card-edit");
+  if (editBtn) {
+    e.stopPropagation();
+    const office = OFFICES.find(o => o.id === editBtn.dataset.id);
+    if (!office) return;
+    openModal("Rename Office", `
+      <div class="field"><label>Office Name</label><input type="text" id="f_editOfficeName" value="${escapeHtml(office.name)}"></div>
+      <div class="field"><label>City</label><input type="text" id="f_editOfficeCity" value="${escapeHtml(office.city || "")}"></div>
+      <div class="form-actions">
+        <button class="btn btn-secondary" id="cancelEditOffice">Cancel</button>
+        <button class="btn btn-primary" id="confirmEditOffice">Save</button>
+      </div>
+    `, () => {
+      const nameInp = document.getElementById("f_editOfficeName");
+      const cityInp = document.getElementById("f_editOfficeCity");
+      nameInp.focus();
+      nameInp.select();
+      const attempt = async () => {
+        const name = nameInp.value.trim();
+        const city = cityInp.value.trim();
+        if (!name) { toast("Enter an office name", "err"); return; }
+        await renameOffice(office.id, name, city);
+        closeModal();
+        toast("Office updated");
+        renderOfficeCards();
+        if (office.id === currentOfficeId) paintOfficeUI();
+      };
+      document.getElementById("cancelEditOffice").onclick = closeModal;
+      document.getElementById("confirmEditOffice").onclick = attempt;
+      [nameInp, cityInp].forEach(inp => inp.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); }));
+    });
+    return;
+  }
+  const delBtn = e.target.closest(".office-card-del");
+  if (delBtn) {
+    e.stopPropagation();
+    const office = OFFICES.find(o => o.id === delBtn.dataset.id);
+    openModal(`Delete "${office ? office.name : "this office"}"?`, `
+      <p class="muted" style="margin-top:0">This permanently deletes <strong>all data</strong> for this office
+      (employees, assignments, stock, everything). This can't be undone.</p>
+      <div class="form-actions">
+        <button class="btn btn-secondary" id="cancelDelOffice">Cancel</button>
+        <button class="btn btn-danger" id="confirmDelOffice">Delete Office</button>
+      </div>
+    `, () => {
+      document.getElementById("cancelDelOffice").onclick = closeModal;
+      document.getElementById("confirmDelOffice").onclick = async () => {
+        await deleteOffice(delBtn.dataset.id);
+        closeModal();
+        toast("Office deleted");
+        renderOfficeCards();
+      };
+    });
+    return;
+  }
+  const card = e.target.closest(".office-card");
+  if (card) openOffice(card.dataset.id);
+});
+document.getElementById("addOfficeBtn").addEventListener("click", () => {
+  openModal("Add New Office", `
+    <div class="field"><label>Office Name</label><input type="text" id="f_officeName" placeholder="e.g. Andheri Branch"></div>
+    <div class="field"><label>City</label><input type="text" id="f_officeCity" placeholder="e.g. Mumbai"></div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelOffice">Cancel</button>
+      <button class="btn btn-primary" id="confirmOffice">Add Office</button>
+    </div>
+  `, () => {
+    const nameInp = document.getElementById("f_officeName");
+    const cityInp = document.getElementById("f_officeCity");
+    nameInp.focus();
+    const attempt = async () => {
+      const name = nameInp.value.trim();
+      const city = cityInp.value.trim();
+      if (!name) { toast("Enter an office name", "err"); return; }
+      const id = await createOffice(name, city);
+      closeModal();
+      toast(`"${name}" added`);
+      renderOfficeCards();
+    };
+    document.getElementById("cancelOffice").onclick = closeModal;
+    document.getElementById("confirmOffice").onclick = attempt;
+    [nameInp, cityInp].forEach(inp => inp.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); }));
+  });
+});
+document.getElementById("switchOfficeBtn").addEventListener("click", () => {
+  showOfficeSelectScreen();
+});
 
 function attemptGateSignIn() {
   if (!fauth) return;
@@ -1772,8 +2030,33 @@ async function init() {
       detachRealtimeListener();
       DB = null;
       dataBootstrapped = false;
+      currentOfficeId = null;
       hideLoadingScreen();
       showSignInGate();
+      return;
+    }
+
+    // Signed in but no office chosen yet this session — try to resume the
+    // last office used on this device (so refreshing stays put); only fall
+    // back to the picker if there's no saved office or it no longer exists.
+    if (!currentOfficeId) {
+      showLoadingScreen();
+      try {
+        await loadOfficesList();
+      } catch (err) {
+        console.error(err);
+        hideLoadingScreen();
+        showFirebaseSetupScreen(true);
+        return;
+      }
+      const savedOfficeId = localStorage.getItem(LAST_OFFICE_KEY);
+      if (savedOfficeId && OFFICES.some(o => o.id === savedOfficeId)) {
+        await openOffice(savedOfficeId);
+        return;
+      }
+      hideLoadingScreen();
+      renderOfficeCards();
+      document.getElementById("officeSelectScreen")?.classList.add("show");
       return;
     }
 
@@ -1792,6 +2075,7 @@ async function init() {
       }
     }
     hideLoadingScreen();
+    paintOfficeUI();
     goto(currentPage);
   });
 }

@@ -52,6 +52,13 @@
       </nav>
 
       <div class="sidebar-footer">
+        <div class="office-box" id="officeBox">
+          <div class="role-row">
+            <span class="role-label">Office</span>
+            <span class="office-badge" id="officeBadge">—</span>
+          </div>
+          <button class="btn-ghost" id="switchOfficeBtn">🏢 Switch Office</button>
+        </div>
         <div class="role-box">
           <div class="role-row">
             <span class="role-label">Signed in as</span>
@@ -145,6 +152,23 @@
       <p id="gateErrorNote" class="signin-error" style="display:none;"></p>
       <button class="signin-btn" id="gateSignInBtn">Sign In</button>
 
+      <div class="signin-footer">Speelfinance · Asset Management</div>
+    </div>
+  </div>
+
+  <!-- Shown after sign-in — pick which office/location's data to open. Every office is
+       stored completely separately in Firestore, so nothing syncs between offices. -->
+  <div class="signin-screen" id="officeSelectScreen">
+    <div class="signin-orb signin-orb-a"></div>
+    <div class="signin-orb signin-orb-b"></div>
+    <div class="office-select-card">
+      <div class="signin-logo-ring"><img src="assets/speelfinance-icon.png" alt="Speelfinance"></div>
+      <h1>Select an Office</h1>
+      <p class="signin-sub">Choose which office's asset data you want to open. Each office keeps its own separate, independent data.</p>
+      <div class="office-grid" id="officeGrid">
+        <!-- office cards injected here by js/app.js -->
+      </div>
+      <button class="btn-ghost" id="addOfficeBtn" style="margin-top:18px; width:100%;">+ Add New Office</button>
       <div class="signin-footer">Speelfinance · Asset Management</div>
     </div>
   </div>

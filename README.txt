@@ -150,6 +150,27 @@ You can change this yourself by opening js/app.js, finding the line
 `const RESET_CONFIRM_PASSWORD = "reset123";` near the Reset Data button
 handler, and editing the text between the quotes.
 
+MULTIPLE OFFICES / LOCATIONS
+-----------------
+This app supports multiple offices (e.g. different branches/cities), each
+with its own completely separate, independent data — nothing syncs between
+offices.
+
+- After signing in, you'll see an "Select an Office" screen. Click an office
+  to open its dashboard, or click "+ Add New Office" to create a new one
+  (enter an Office Name and City — a brand-new office starts empty).
+- Use "Switch Office" at the bottom of the sidebar at any time to go back to
+  this screen and open a different office without signing out.
+- Every office's data lives in its own Firestore document, so edits, resets,
+  and imports in one office never affect any other office.
+- To remove an office entirely (and permanently delete all its data), hover
+  its card on the "Select an Office" screen and click the ✕ button. You can't
+  delete the last remaining office.
+- The original data from this download becomes the first office automatically
+  (named "Mount Road" / "Mumbai" by default) — you can rename this later by
+  deleting it and re-adding your preferred name once you've moved any data
+  you want to keep, or just leave it as-is and add new offices alongside it.
+
 TROUBLESHOOTING
 -----------------
 - "Connect this app to Firebase" screen -> js/firebase-config.js still has
