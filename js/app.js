@@ -342,6 +342,101 @@ function computeDashboard() {
   };
 }
 
+/* ---------- Chart color palette (mirrors css/style.css :root vars) ---------- */
+const CHART_COLORS = {
+  primary: "#4c5ef8", primaryDark: "#3843d6",
+  teal: "#0fb9a7", amber: "#e2a13b", red: "#e2513b",
+  blue: "#3b8ee2", purple: "#8a5cf6", grey: "#7c8393",
+};
+
+/* ---------- Assignment activity trend (assignments logged per month) ---------- */
+function computeAssignmentTrend(months = 6) {
+  const now = new Date();
+  const buckets = [];
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    buckets.push({
+      key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`,
+      label: d.toLocaleDateString("en-IN", { month: "short" }),
+      count: 0,
+    });
+  }
+  const byKey = Object.fromEntries(buckets.map(b => [b.key, b]));
+  (DB.assignments || []).forEach(a => {
+    if (!a.date) return;
+    const b = byKey[a.date.slice(0, 7)];
+    if (b) b.count++;
+  });
+  return buckets;
+}
+
+/* ---------- Assets currently assigned, grouped by department ---------- */
+function computeDeptBreakdown(topN = 6) {
+  const counts = {};
+  (DB.assignments || []).forEach(a => {
+    if (a.status !== "Assigned") return;
+    const d = a.department || "Unassigned";
+    counts[d] = (counts[d] || 0) + 1;
+  });
+  return Object.entries(counts)
+    .map(([department, count]) => ({ department, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, topN);
+}
+
+/* ---------- SVG donut chart: overall asset status distribution ---------- */
+function buildDonutSVG(segments, size = 168, strokeWidth = 24) {
+  const r = (size - strokeWidth) / 2;
+  const c = 2 * Math.PI * r;
+  const total = segments.reduce((s, x) => s + x.value, 0);
+  const cx = size / 2, cy = size / 2;
+  let offset = 0;
+  const arcs = total > 0 ? segments.filter(s => s.value > 0).map(seg => {
+    const len = (seg.value / total) * c;
+    const circle = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${seg.color}" stroke-width="${strokeWidth}" stroke-dasharray="${len} ${c - len}" stroke-dashoffset="${-offset}" transform="rotate(-90 ${cx} ${cy})"/>`;
+    offset += len;
+    return circle;
+  }).join("") : "";
+  return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" style="flex-shrink:0">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--surface-2)" stroke-width="${strokeWidth}"/>
+    ${arcs}
+    <text x="${cx}" y="${cy - 3}" text-anchor="middle" font-size="23" font-weight="800" fill="var(--text)">${total}</text>
+    <text x="${cx}" y="${cy + 16}" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">Total Units</text>
+  </svg>`;
+}
+
+/* ---------- SVG line/area chart: assignment activity trend ---------- */
+function buildTrendSVG(buckets, w = 520, h = 176) {
+  const max = Math.max(1, ...buckets.map(b => b.count));
+  const padL = 18, padR = 18, padT = 20, padB = 26;
+  const innerW = w - padL - padR, innerH = h - padT - padB;
+  const stepX = buckets.length > 1 ? innerW / (buckets.length - 1) : 0;
+  const pts = buckets.map((b, i) => ({
+    x: padL + i * stepX,
+    y: padT + innerH - (b.count / max) * innerH,
+    b,
+  }));
+  const linePath = pts.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+  const areaPath = `${linePath} L ${pts[pts.length - 1].x.toFixed(1)} ${(padT + innerH).toFixed(1)} L ${pts[0].x.toFixed(1)} ${(padT + innerH).toFixed(1)} Z`;
+  const dots = pts.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3.6" fill="${CHART_COLORS.primary}" stroke="#fff" stroke-width="1.6"/>`).join("");
+  const valueLabels = pts.map(p => `<text x="${p.x.toFixed(1)}" y="${Math.max(11, p.y - 10).toFixed(1)}" text-anchor="middle" font-size="10.8" font-weight="700" fill="var(--text)">${p.b.count}</text>`).join("");
+  const monthLabels = pts.map(p => `<text x="${p.x.toFixed(1)}" y="${h - 7}" text-anchor="middle" font-size="10.8" fill="var(--text-muted)">${p.b.label}</text>`).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="xMidYMid meet">
+    <defs>
+      <linearGradient id="trendFillGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${CHART_COLORS.primary}" stop-opacity="0.22"/>
+        <stop offset="100%" stop-color="${CHART_COLORS.primary}" stop-opacity="0.02"/>
+      </linearGradient>
+    </defs>
+    <line x1="${padL}" y1="${(padT + innerH).toFixed(1)}" x2="${w - padR}" y2="${(padT + innerH).toFixed(1)}" stroke="var(--border)" stroke-width="1"/>
+    <path d="${areaPath}" fill="url(#trendFillGrad)" stroke="none"/>
+    <path d="${linePath}" fill="none" stroke="${CHART_COLORS.primary}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    ${dots}
+    ${valueLabels}
+    ${monthLabels}
+  </svg>`;
+}
+
 function statusBadge(status) {
   const map = {
     "Assigned": "badge-blue", "Available": "badge-green", "Returned": "badge-green",
@@ -452,6 +547,31 @@ function renderDashboard() {
   const lowStockRows = s.rows.filter(r => r.low);
   const isFreshOffice = s.categories === 0;
 
+  /* ---------- Extra insight metrics ---------- */
+  const utilPct = s.total > 0 ? Math.round((s.assigned / s.total) * 100) : 0;
+  const employeeCount = (DB.employees || []).length;
+  const avgPerEmployee = employeeCount > 0 ? (s.assigned / employeeCount).toFixed(1) : "0.0";
+  const thisMonthKey = new Date().toISOString().slice(0, 7);
+  const assignedThisMonth = (DB.assignments || []).filter(a => (a.date || "").slice(0, 7) === thisMonthKey).length;
+
+  /* ---------- Chart data ---------- */
+  const statusSegments = [
+    { label: "Available", value: s.available, color: CHART_COLORS.teal },
+    { label: "Assigned", value: s.assigned, color: CHART_COLORS.blue },
+    { label: "Under Repair", value: s.underRepair, color: CHART_COLORS.amber },
+    { label: "Faulty", value: s.faulty, color: CHART_COLORS.red },
+    { label: "Lost", value: s.lost, color: CHART_COLORS.grey },
+    { label: "Scrap", value: s.scrap, color: "#4a4f5e" },
+  ];
+  const statusTotal = statusSegments.reduce((sum, x) => sum + x.value, 0);
+
+  const topCategoryRows = [...s.rows].sort((a, b) => b.total - a.total).slice(0, 6);
+  const maxCategoryTotal = Math.max(1, ...topCategoryRows.map(r => r.total));
+
+  const trendBuckets = computeAssignmentTrend(6);
+  const deptRows = computeDeptBreakdown(6);
+  const maxDeptCount = Math.max(1, ...deptRows.map(r => r.count));
+
   content.innerHTML = `
     ${viewerNotice()}
     ${isFreshOffice ? `
@@ -479,6 +599,112 @@ function renderDashboard() {
           <div class="stat-foot">${c.foot}</div>
         </div>
       `).join("")}
+    </div>
+
+    <div class="insight-strip">
+      <div class="insight-card">
+        <div class="radial" style="--pct:${utilPct}"><span class="radial-label">${utilPct}%</span></div>
+        <div class="insight-body">
+          <div class="insight-title">Utilization Rate</div>
+          <div class="insight-value">${s.assigned}<span style="font-size:13px;font-weight:600;color:var(--text-muted)"> / ${s.total} units</span></div>
+          <div class="insight-foot">Share of total stock currently assigned</div>
+        </div>
+      </div>
+      <div class="insight-card">
+        <div class="insight-icon icon-purple">👥</div>
+        <div class="insight-body">
+          <div class="insight-title">Avg. Assets / Employee</div>
+          <div class="insight-value">${avgPerEmployee}</div>
+          <div class="insight-foot">${employeeCount} employee${employeeCount === 1 ? "" : "s"} on record</div>
+        </div>
+      </div>
+      <div class="insight-card">
+        <div class="insight-icon icon-indigo">🗓️</div>
+        <div class="insight-body">
+          <div class="insight-title">Assignments This Month</div>
+          <div class="insight-value">${assignedThisMonth}</div>
+          <div class="insight-foot">New assignment log entries this calendar month</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-grid">
+      <div class="card chart-card">
+        <div class="card-header">
+          <div><h2>Asset Status Overview</h2><div class="sub">Live distribution across all categories</div></div>
+        </div>
+        ${statusTotal > 0 ? `
+          <div class="donut-wrap">
+            ${buildDonutSVG(statusSegments)}
+            <div class="donut-legend">
+              ${statusSegments.map(seg => `
+                <div class="donut-legend-row">
+                  <span class="donut-dot" style="background:${seg.color}"></span>
+                  <span class="donut-legend-label">${seg.label}</span>
+                  <span class="donut-legend-value">${seg.value} · ${statusTotal ? Math.round(seg.value / statusTotal * 100) : 0}%</span>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        ` : `<p class="chart-empty">No stock logged yet — add categories and a refill entry to see this chart.</p>`}
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-header">
+          <div><h2>Stock by Category</h2><div class="sub">Top categories · composition breakdown</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
+        </div>
+        ${topCategoryRows.length ? `
+          <div class="chart-bar-legend">
+            <span><span class="dot" style="background:${CHART_COLORS.teal}"></span>Available</span>
+            <span><span class="dot" style="background:${CHART_COLORS.blue}"></span>Assigned</span>
+            <span><span class="dot" style="background:${CHART_COLORS.amber}"></span>Under Repair</span>
+            <span><span class="dot" style="background:${CHART_COLORS.red}"></span>Faulty/Lost/Scrap</span>
+          </div>
+          ${topCategoryRows.map(r => {
+            const barWidthPct = Math.max(4, Math.round(r.total / maxCategoryTotal * 100));
+            const seg = (n) => r.total > 0 ? (n / r.total * 100) : 0;
+            const issues = r.faulty + r.lost + r.scrap;
+            return `
+              <div class="chart-bar-row">
+                <div class="chart-bar-label"><span>${escapeHtml(r.category)}</span><span class="muted-num">${r.total} units</span></div>
+                <div class="chart-bar-track">
+                  <div class="chart-bar-fill" style="width:${barWidthPct}%">
+                    <span style="width:${seg(r.available)}%;background:${CHART_COLORS.teal}"></span>
+                    <span style="width:${seg(r.assigned)}%;background:${CHART_COLORS.blue}"></span>
+                    <span style="width:${seg(r.underRepair)}%;background:${CHART_COLORS.amber}"></span>
+                    <span style="width:${seg(issues)}%;background:${CHART_COLORS.red}"></span>
+                  </div>
+                </div>
+              </div>
+            `;
+          }).join("")}
+        ` : `<p class="chart-empty">No categories yet.</p>`}
+      </div>
+    </div>
+
+    <div class="chart-grid">
+      <div class="card chart-card">
+        <div class="card-header">
+          <div><h2>Assignment Activity</h2><div class="sub">New assignments logged per month, last 6 months</div></div>
+        </div>
+        ${trendBuckets.some(b => b.count > 0)
+          ? buildTrendSVG(trendBuckets)
+          : `<p class="chart-empty">No assignment history yet for this period.</p>`}
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-header">
+          <div><h2>Assets by Department</h2><div class="sub">Currently assigned, top departments</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">View all →</button>
+        </div>
+        ${deptRows.length ? deptRows.map(r => `
+          <div class="dept-bar-row">
+            <div class="dept-bar-top"><span>${escapeHtml(r.department)}</span><span class="muted-num">${r.count}</span></div>
+            <div class="dept-bar-track"><div class="dept-bar-fill" style="width:${Math.max(4, Math.round(r.count / maxDeptCount * 100))}%"></div></div>
+          </div>
+        `).join("") : `<p class="chart-empty">No active assignments yet.</p>`}
+      </div>
     </div>
 
     <div class="grid-2">
