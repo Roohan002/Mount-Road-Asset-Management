@@ -43,6 +43,22 @@ function docRef() {
 function officesDocRef() {
   return fdb.collection(FIRESTORE_COLLECTION).doc(OFFICES_DOC_ID);
 }
+function logsCollRef() {
+  return docRef().collection("logs");
+}
+
+/* ---------------- Activity log (per-office audit trail) ---------------- */
+// Records who did what, and when, scoped to whichever office is currently open —
+// so if something looks wrong, you can trace it back to a person and a time.
+function logAction(action, details) {
+  if (!fdb || !currentOfficeId || !fauth || !fauth.currentUser) return;
+  logsCollRef().add({
+    ts: new Date().toISOString(),
+    email: fauth.currentUser.email || "unknown",
+    action,
+    details: details || "",
+  }).catch(err => console.error("Activity log write failed:", err));
+}
 
 /* ---------------- Office directory (list of offices) ---------------- */
 function slugify(str) {
@@ -72,13 +88,21 @@ function emptyOfficeDB() {
   // Blank starting data for a brand-new office — keeps the generic dropdown
   // option lists (status/condition/floor/department) but no actual records.
   const lists = JSON.parse(JSON.stringify(SEED_DATA.lists || {}));
-  return { employees: [], categories: [], lists, assignments: [], refills: [], inventory: [], stockManual: {}, auditLog: [] };
+  return { employees: [], categories: [], lists, assignments: [], refills: [], inventory: [], stockManual: {} };
 }
 async function createOffice(name, city) {
   const id = uniqueOfficeId(slugify(name));
   OFFICES.push({ id, name: name.trim(), city: (city || "").trim() });
   await saveOfficesList();
   await fdb.collection(FIRESTORE_COLLECTION).doc(id).set(emptyOfficeDB());
+  if (fauth && fauth.currentUser) {
+    fdb.collection(FIRESTORE_COLLECTION).doc(id).collection("logs").add({
+      ts: new Date().toISOString(),
+      email: fauth.currentUser.email || "unknown",
+      action: "Created office",
+      details: `"${name.trim()}"${city ? " — " + city.trim() : ""}`,
+    }).catch(err => console.error("Activity log write failed:", err));
+  }
   return id;
 }
 async function deleteOffice(id) {
@@ -94,60 +118,51 @@ async function renameOffice(id, name, city) {
   await saveOfficesList();
 }
 
-/* ---------------- Role management (Firebase Auth) ---------------- */
-// Viewer = not signed in (read-only, live data). Admin = signed in with an
-// email/password account you create yourself in the Firebase console under
-// Authentication > Users. Actual write protection is enforced server-side by
-// your Firestore Security Rules (see README.txt) — not just this UI.
+/* ---------------- Role management (Admin vs Viewer) ---------------- */
+// Signed in = can view (read-only) by default. Whether someone can also
+// EDIT depends on their role, stored server-side in Firestore at
+// roles/{their email} with a field role: "admin" or "viewer". This is
+// looked up fresh after every sign-in. Actual write protection is enforced
+// server-side by Firestore Security Rules (see firestore.rules) — not just
+// this UI, so a Viewer genuinely cannot write even by inspecting the page.
+let currentUserRole = null; // "admin" | "viewer" | null (not signed in / not yet known)
+
+async function fetchUserRole() {
+  if (!fauth || !fauth.currentUser) { currentUserRole = null; return; }
+  try {
+    const snap = await fdb.collection("roles").doc(fauth.currentUser.email).get();
+    currentUserRole = (snap.exists && snap.data().role === "admin") ? "admin" : "viewer";
+  } catch (err) {
+    console.error("Couldn't look up role, defaulting to Viewer:", err);
+    currentUserRole = "viewer";
+  }
+}
+
 function isAdmin() {
-  return !!(fauth && fauth.currentUser);
+  return !!(fauth && fauth.currentUser) && currentUserRole === "admin";
 }
 function paintRoleUI() {
   const badge = document.getElementById("roleBadge");
   const btn = document.getElementById("roleSwitchBtn");
+  const emailLbl = document.getElementById("roleEmailLabel");
   if (!badge || !btn) return;
+  const signedIn = !!(fauth && fauth.currentUser);
   const admin = isAdmin();
-  badge.textContent = admin ? (fauth.currentUser.email || "Admin") : "Viewer";
+  badge.textContent = !signedIn ? "Signed out" : (admin ? "Admin" : "Viewer");
   badge.className = "role-badge " + (admin ? "admin" : "viewer");
-  btn.textContent = admin ? "Sign Out" : "Admin Sign In";
+  btn.textContent = "Sign Out";
+  btn.style.display = signedIn ? "" : "none";
+  if (emailLbl) emailLbl.textContent = signedIn ? (fauth.currentUser.email || "") : "";
 }
 document.getElementById("roleSwitchBtn").addEventListener("click", () => {
-  if (!fauth) { toast("Still connecting to Firebase — try again in a moment", "info"); return; }
-  if (isAdmin()) {
-    fauth.signOut();
-    toast("Signed out — Viewer mode");
-    return;
-  }
-  openModal("Admin Sign In", `
-    <p class="muted" style="margin-top:0">Sign in with an admin account (created in your Firebase console under
-    Authentication → Users → Add user) to add, edit, delete or import data.</p>
-    <div class="field"><label>Email</label><input type="email" id="f_email" placeholder="admin@example.com" autocomplete="username"></div>
-    <div class="field"><label>Password</label><input type="password" id="f_pw" placeholder="Password" autocomplete="current-password"></div>
-    <div class="form-actions">
-      <button class="btn btn-secondary" id="cancelPw">Cancel</button>
-      <button class="btn btn-primary" id="confirmPw">Sign In</button>
-    </div>
-  `, () => {
-    const emailInp = document.getElementById("f_email");
-    const pwInp = document.getElementById("f_pw");
-    emailInp.focus();
-    const attempt = () => {
-      const email = emailInp.value.trim();
-      const pw = pwInp.value;
-      if (!email || !pw) { toast("Enter email and password", "err"); return; }
-      fauth.signInWithEmailAndPassword(email, pw)
-        .then(() => { closeModal(); toast("Signed in as Admin"); })
-        .catch(err => toast(err.message.replace(/^Firebase:\s*/, ""), "err"));
-    };
-    document.getElementById("cancelPw").onclick = closeModal;
-    document.getElementById("confirmPw").onclick = attempt;
-    [emailInp, pwInp].forEach(inp => inp.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); }));
-  });
+  if (!fauth || !fauth.currentUser) return;
+  fauth.signOut();
+  toast("Signed out");
 });
 
 function viewerNotice() {
   if (isAdmin()) return "";
-  return `<div class="viewer-note">👁️ You're viewing live shared data in <strong>read-only</strong> mode — sign in as Admin from the sidebar to make changes.</div>`;
+  return `<div class="viewer-note">👁️ You're signed in as a <strong>Viewer</strong> — read-only. Ask an Admin to grant you edit access from Settings → Team Access.</div>`;
 }
 
 /* ---------------- Persistence (Cloud Firestore) ---------------- */
@@ -161,7 +176,6 @@ function seedFromSource() {
     refills: d.refills.map(r => ({ ...r, uid: uid() })),
     inventory: [],
     stockManual: d.stockManual,
-    auditLog: [],
   };
 }
 
@@ -176,7 +190,6 @@ async function loadInitialData() {
     await docRef().set(DB);
   }
   if (!DB.inventory) DB.inventory = [];
-  if (!DB.auditLog) DB.auditLog = [];
 }
 
 function saveDB() {
@@ -193,7 +206,6 @@ function attachRealtimeListener() {
     if (!snap.exists) return;
     DB = snap.data();
     if (!DB.inventory) DB.inventory = [];
-    if (!DB.auditLog) DB.auditLog = [];
     goto(currentPage); // keep every open browser (signed-in users) in sync live
   }, err => console.error("Firestore listener error:", err));
 }
@@ -203,23 +215,6 @@ function detachRealtimeListener() {
 
 function uid() {
   return "id_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-}
-
-/* ---------------- Audit Log — master trail of who added/edited/deleted what ---------------- */
-// Every mutating action across the app calls this right before saveDB(), so there's
-// a single, consistent record of who did what and when — even across multiple admins.
-const AUDIT_LOG_MAX = 3000; // keep the doc size sane; trims oldest entries beyond this
-function logAudit(action, entity, summary) {
-  if (!DB.auditLog) DB.auditLog = [];
-  DB.auditLog.push({
-    uid: uid(),
-    ts: nowISO(),
-    user: (fauth && fauth.currentUser && fauth.currentUser.email) || "Unknown",
-    action,   // "Added" | "Edited" | "Deleted" | "Bulk Deleted" | "Imported" | "Reset"
-    entity,   // "Employee" | "Category" | "Assignment" | "Refill" | "Inventory" | "Stock Setting" | "Dropdown List" | "System"
-    summary,  // short human-readable description of what changed
-  });
-  if (DB.auditLog.length > AUDIT_LOG_MAX) DB.auditLog = DB.auditLog.slice(DB.auditLog.length - AUDIT_LOG_MAX);
 }
 
 function escapeHtml(str) {
@@ -296,7 +291,7 @@ document.getElementById("modalOverlay").addEventListener("click", (e) => {
 
 function requireAdminOrWarn() {
   if (isAdmin()) return true;
-  toast("Switch to Admin mode to make changes", "err");
+  toast("Only Admins can do this — you're signed in as a Viewer", "err");
   return false;
 }
 
@@ -362,101 +357,6 @@ function computeDashboard() {
   };
 }
 
-/* ---------- Chart color palette (mirrors css/style.css :root vars) ---------- */
-const CHART_COLORS = {
-  primary: "#4c5ef8", primaryDark: "#3843d6",
-  teal: "#0fb9a7", amber: "#e2a13b", red: "#e2513b",
-  blue: "#3b8ee2", purple: "#8a5cf6", grey: "#7c8393",
-};
-
-/* ---------- Assignment activity trend (assignments logged per month) ---------- */
-function computeAssignmentTrend(months = 6) {
-  const now = new Date();
-  const buckets = [];
-  for (let i = months - 1; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    buckets.push({
-      key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`,
-      label: d.toLocaleDateString("en-IN", { month: "short" }),
-      count: 0,
-    });
-  }
-  const byKey = Object.fromEntries(buckets.map(b => [b.key, b]));
-  (DB.assignments || []).forEach(a => {
-    if (!a.date) return;
-    const b = byKey[a.date.slice(0, 7)];
-    if (b) b.count++;
-  });
-  return buckets;
-}
-
-/* ---------- Assets currently assigned, grouped by department ---------- */
-function computeDeptBreakdown(topN = 6) {
-  const counts = {};
-  (DB.assignments || []).forEach(a => {
-    if (a.status !== "Assigned") return;
-    const d = a.department || "Unassigned";
-    counts[d] = (counts[d] || 0) + 1;
-  });
-  return Object.entries(counts)
-    .map(([department, count]) => ({ department, count }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, topN);
-}
-
-/* ---------- SVG donut chart: overall asset status distribution ---------- */
-function buildDonutSVG(segments, size = 168, strokeWidth = 24) {
-  const r = (size - strokeWidth) / 2;
-  const c = 2 * Math.PI * r;
-  const total = segments.reduce((s, x) => s + x.value, 0);
-  const cx = size / 2, cy = size / 2;
-  let offset = 0;
-  const arcs = total > 0 ? segments.filter(s => s.value > 0).map(seg => {
-    const len = (seg.value / total) * c;
-    const circle = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${seg.color}" stroke-width="${strokeWidth}" stroke-dasharray="${len} ${c - len}" stroke-dashoffset="${-offset}" transform="rotate(-90 ${cx} ${cy})"/>`;
-    offset += len;
-    return circle;
-  }).join("") : "";
-  return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" style="flex-shrink:0">
-    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--surface-2)" stroke-width="${strokeWidth}"/>
-    ${arcs}
-    <text x="${cx}" y="${cy - 3}" text-anchor="middle" font-size="23" font-weight="800" fill="var(--text)">${total}</text>
-    <text x="${cx}" y="${cy + 16}" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">Total Units</text>
-  </svg>`;
-}
-
-/* ---------- SVG line/area chart: assignment activity trend ---------- */
-function buildTrendSVG(buckets, w = 520, h = 176) {
-  const max = Math.max(1, ...buckets.map(b => b.count));
-  const padL = 18, padR = 18, padT = 20, padB = 26;
-  const innerW = w - padL - padR, innerH = h - padT - padB;
-  const stepX = buckets.length > 1 ? innerW / (buckets.length - 1) : 0;
-  const pts = buckets.map((b, i) => ({
-    x: padL + i * stepX,
-    y: padT + innerH - (b.count / max) * innerH,
-    b,
-  }));
-  const linePath = pts.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
-  const areaPath = `${linePath} L ${pts[pts.length - 1].x.toFixed(1)} ${(padT + innerH).toFixed(1)} L ${pts[0].x.toFixed(1)} ${(padT + innerH).toFixed(1)} Z`;
-  const dots = pts.map(p => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3.6" fill="${CHART_COLORS.primary}" stroke="#fff" stroke-width="1.6"/>`).join("");
-  const valueLabels = pts.map(p => `<text x="${p.x.toFixed(1)}" y="${Math.max(11, p.y - 10).toFixed(1)}" text-anchor="middle" font-size="10.8" font-weight="700" fill="var(--text)">${p.b.count}</text>`).join("");
-  const monthLabels = pts.map(p => `<text x="${p.x.toFixed(1)}" y="${h - 7}" text-anchor="middle" font-size="10.8" fill="var(--text-muted)">${p.b.label}</text>`).join("");
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="xMidYMid meet">
-    <defs>
-      <linearGradient id="trendFillGrad" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="${CHART_COLORS.primary}" stop-opacity="0.22"/>
-        <stop offset="100%" stop-color="${CHART_COLORS.primary}" stop-opacity="0.02"/>
-      </linearGradient>
-    </defs>
-    <line x1="${padL}" y1="${(padT + innerH).toFixed(1)}" x2="${w - padR}" y2="${(padT + innerH).toFixed(1)}" stroke="var(--border)" stroke-width="1"/>
-    <path d="${areaPath}" fill="url(#trendFillGrad)" stroke="none"/>
-    <path d="${linePath}" fill="none" stroke="${CHART_COLORS.primary}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-    ${dots}
-    ${valueLabels}
-    ${monthLabels}
-  </svg>`;
-}
-
 function statusBadge(status) {
   const map = {
     "Assigned": "badge-blue", "Available": "badge-green", "Returned": "badge-green",
@@ -480,7 +380,7 @@ const PAGES = {
   stock: { title: "Stock Summary", render: renderStock },
   refill: { title: "Stock Refill Log", render: renderRefill },
   categories: { title: "Asset Categories", render: renderCategories },
-  auditLog: { title: "Audit Log", render: renderAuditLog },
+  activityLog: { title: "Activity Log", render: renderActivityLog },
   settings: { title: "Settings", render: renderSettings },
 };
 
@@ -532,11 +432,9 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
         pwInp.focus();
         return;
       }
-      const priorLog = DB.auditLog || [];
       DB = isDefaultOffice ? seedFromSource() : emptyOfficeDB();
-      DB.auditLog = priorLog; // audit history survives a reset — that's the whole point
-      logAudit("Reset", "System", `Reset ${escapeHtml(officeName)}'s data ${isDefaultOffice ? "to the original uploaded sheet" : "to a blank slate"}`);
       saveDB();
+      logAction("Reset office data", `Reset all data for "${officeName}"`);
       closeModal();
       toast("Data reset for this office");
       goto(currentPage);
@@ -571,31 +469,6 @@ function renderDashboard() {
   const lowStockRows = s.rows.filter(r => r.low);
   const isFreshOffice = s.categories === 0;
 
-  /* ---------- Extra insight metrics ---------- */
-  const utilPct = s.total > 0 ? Math.round((s.assigned / s.total) * 100) : 0;
-  const employeeCount = (DB.employees || []).length;
-  const avgPerEmployee = employeeCount > 0 ? (s.assigned / employeeCount).toFixed(1) : "0.0";
-  const thisMonthKey = new Date().toISOString().slice(0, 7);
-  const assignedThisMonth = (DB.assignments || []).filter(a => (a.date || "").slice(0, 7) === thisMonthKey).length;
-
-  /* ---------- Chart data ---------- */
-  const statusSegments = [
-    { label: "Available", value: s.available, color: CHART_COLORS.teal },
-    { label: "Assigned", value: s.assigned, color: CHART_COLORS.blue },
-    { label: "Under Repair", value: s.underRepair, color: CHART_COLORS.amber },
-    { label: "Faulty", value: s.faulty, color: CHART_COLORS.red },
-    { label: "Lost", value: s.lost, color: CHART_COLORS.grey },
-    { label: "Scrap", value: s.scrap, color: "#4a4f5e" },
-  ];
-  const statusTotal = statusSegments.reduce((sum, x) => sum + x.value, 0);
-
-  const topCategoryRows = [...s.rows].sort((a, b) => b.total - a.total).slice(0, 6);
-  const maxCategoryTotal = Math.max(1, ...topCategoryRows.map(r => r.total));
-
-  const trendBuckets = computeAssignmentTrend(6);
-  const deptRows = computeDeptBreakdown(6);
-  const maxDeptCount = Math.max(1, ...deptRows.map(r => r.count));
-
   content.innerHTML = `
     ${viewerNotice()}
     ${isFreshOffice ? `
@@ -623,112 +496,6 @@ function renderDashboard() {
           <div class="stat-foot">${c.foot}</div>
         </div>
       `).join("")}
-    </div>
-
-    <div class="insight-strip">
-      <div class="insight-card">
-        <div class="radial" style="--pct:${utilPct}"><span class="radial-label">${utilPct}%</span></div>
-        <div class="insight-body">
-          <div class="insight-title">Utilization Rate</div>
-          <div class="insight-value">${s.assigned}<span style="font-size:13px;font-weight:600;color:var(--text-muted)"> / ${s.total} units</span></div>
-          <div class="insight-foot">Share of total stock currently assigned</div>
-        </div>
-      </div>
-      <div class="insight-card">
-        <div class="insight-icon icon-purple">👥</div>
-        <div class="insight-body">
-          <div class="insight-title">Avg. Assets / Employee</div>
-          <div class="insight-value">${avgPerEmployee}</div>
-          <div class="insight-foot">${employeeCount} employee${employeeCount === 1 ? "" : "s"} on record</div>
-        </div>
-      </div>
-      <div class="insight-card">
-        <div class="insight-icon icon-indigo">🗓️</div>
-        <div class="insight-body">
-          <div class="insight-title">Assignments This Month</div>
-          <div class="insight-value">${assignedThisMonth}</div>
-          <div class="insight-foot">New assignment log entries this calendar month</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="chart-grid">
-      <div class="card chart-card">
-        <div class="card-header">
-          <div><h2>Asset Status Overview</h2><div class="sub">Live distribution across all categories</div></div>
-        </div>
-        ${statusTotal > 0 ? `
-          <div class="donut-wrap">
-            ${buildDonutSVG(statusSegments)}
-            <div class="donut-legend">
-              ${statusSegments.map(seg => `
-                <div class="donut-legend-row">
-                  <span class="donut-dot" style="background:${seg.color}"></span>
-                  <span class="donut-legend-label">${seg.label}</span>
-                  <span class="donut-legend-value">${seg.value} · ${statusTotal ? Math.round(seg.value / statusTotal * 100) : 0}%</span>
-                </div>
-              `).join("")}
-            </div>
-          </div>
-        ` : `<p class="chart-empty">No stock logged yet — add categories and a refill entry to see this chart.</p>`}
-      </div>
-
-      <div class="card chart-card">
-        <div class="card-header">
-          <div><h2>Stock by Category</h2><div class="sub">Top categories · composition breakdown</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
-        </div>
-        ${topCategoryRows.length ? `
-          <div class="chart-bar-legend">
-            <span><span class="dot" style="background:${CHART_COLORS.teal}"></span>Available</span>
-            <span><span class="dot" style="background:${CHART_COLORS.blue}"></span>Assigned</span>
-            <span><span class="dot" style="background:${CHART_COLORS.amber}"></span>Under Repair</span>
-            <span><span class="dot" style="background:${CHART_COLORS.red}"></span>Faulty/Lost/Scrap</span>
-          </div>
-          ${topCategoryRows.map(r => {
-            const barWidthPct = Math.max(4, Math.round(r.total / maxCategoryTotal * 100));
-            const seg = (n) => r.total > 0 ? (n / r.total * 100) : 0;
-            const issues = r.faulty + r.lost + r.scrap;
-            return `
-              <div class="chart-bar-row">
-                <div class="chart-bar-label"><span>${escapeHtml(r.category)}</span><span class="muted-num">${r.total} units</span></div>
-                <div class="chart-bar-track">
-                  <div class="chart-bar-fill" style="width:${barWidthPct}%">
-                    <span style="width:${seg(r.available)}%;background:${CHART_COLORS.teal}"></span>
-                    <span style="width:${seg(r.assigned)}%;background:${CHART_COLORS.blue}"></span>
-                    <span style="width:${seg(r.underRepair)}%;background:${CHART_COLORS.amber}"></span>
-                    <span style="width:${seg(issues)}%;background:${CHART_COLORS.red}"></span>
-                  </div>
-                </div>
-              </div>
-            `;
-          }).join("")}
-        ` : `<p class="chart-empty">No categories yet.</p>`}
-      </div>
-    </div>
-
-    <div class="chart-grid">
-      <div class="card chart-card">
-        <div class="card-header">
-          <div><h2>Assignment Activity</h2><div class="sub">New assignments logged per month, last 6 months</div></div>
-        </div>
-        ${trendBuckets.some(b => b.count > 0)
-          ? buildTrendSVG(trendBuckets)
-          : `<p class="chart-empty">No assignment history yet for this period.</p>`}
-      </div>
-
-      <div class="card chart-card">
-        <div class="card-header">
-          <div><h2>Assets by Department</h2><div class="sub">Currently assigned, top departments</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">View all →</button>
-        </div>
-        ${deptRows.length ? deptRows.map(r => `
-          <div class="dept-bar-row">
-            <div class="dept-bar-top"><span>${escapeHtml(r.department)}</span><span class="muted-num">${r.count}</span></div>
-            <div class="dept-bar-track"><div class="dept-bar-fill" style="width:${Math.max(4, Math.round(r.count / maxDeptCount * 100))}%"></div></div>
-          </div>
-        `).join("") : `<p class="chart-empty">No active assignments yet.</p>`}
-      </div>
     </div>
 
     <div class="grid-2">
@@ -904,11 +671,10 @@ function wireAssignBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || assignSelected.size === 0) return;
     confirmBulkDelete(assignSelected.size, "assignments", () => {
-      const removed = DB.assignments.filter(a => assignSelected.has(a.uid));
+      const n = assignSelected.size;
       DB.assignments = DB.assignments.filter(a => !assignSelected.has(a.uid));
       assignSelected = new Set();
-      logAudit("Bulk Deleted", "Assignment", `Deleted ${removed.length} assignment(s): ${removed.slice(0, 5).map(a => `${a.assetName} → ${a.employeeName}`).join(", ")}${removed.length > 5 ? ", …" : ""}`);
-      saveDB(); toast("Selected assignments deleted"); paintAssignTable();
+      saveDB(); logAction("Bulk deleted assignments", `Deleted ${n} selected assignment record(s)`); toast("Selected assignments deleted"); paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
     });
   };
@@ -919,10 +685,10 @@ function wireAssignBulk(rows) {
       if (!requireAdminOrWarn()) return;
       confirmBulkDelete(rows.length, "assignments (matching your current search/filters)", () => {
         const idsToDelete = new Set(rows.map(r => r.uid));
+        const n = idsToDelete.size;
         DB.assignments = DB.assignments.filter(a => !idsToDelete.has(a.uid));
         assignSelected = new Set();
-        logAudit("Bulk Deleted", "Assignment", `Deleted ${rows.length} assignment(s) matching filters`);
-        saveDB(); toast("All matching assignments deleted"); paintAssignTable();
+        saveDB(); logAction("Bulk deleted assignments", `Deleted ${n} assignment record(s) matching current filters`); toast("All matching assignments deleted"); paintAssignTable();
         if (currentPage === "dashboard") renderDashboard();
       });
     };
@@ -1044,7 +810,7 @@ function openAssignForm(uidVal) {
       if (editing) {
         const rec = { ...common, assetName: document.getElementById("f_asset").value };
         Object.assign(editing, rec);
-        logAudit("Edited", "Assignment", `Edited assignment: ${rec.assetName} → ${rec.employeeName} (status: ${rec.status})`);
+        logAction("Edited assignment", `${rec.assetName} → ${empName}`);
         toast("Assignment updated");
       } else {
         const selectedAssets = [...document.querySelectorAll(".f_asset_multi:checked")].map(cb => cb.value);
@@ -1052,7 +818,7 @@ function openAssignForm(uidVal) {
         selectedAssets.forEach(assetName => {
           DB.assignments.push({ uid: uid(), id: DB.assignments.length + 1, createdAt: nowISO(), ...common, assetName });
         });
-        logAudit("Added", "Assignment", `Added ${selectedAssets.length} assignment(s) for ${empName}: ${selectedAssets.join(", ")}`);
+        logAction("Added assignment(s)", `${selectedAssets.join(", ")} → ${empName}`);
         toast(selectedAssets.length > 1
           ? `${selectedAssets.length} assignments added for ${empName}`
           : "Assignment added");
@@ -1079,8 +845,7 @@ function deleteAssignment(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.assignments = DB.assignments.filter(a => a.uid !== uidVal);
       assignSelected.delete(uidVal);
-      logAudit("Deleted", "Assignment", `Deleted assignment: ${rec ? `${rec.assetName} → ${rec.employeeName}` : uidVal}`);
-      saveDB(); closeModal(); toast("Assignment deleted"); paintAssignTable();
+      saveDB(); logAction("Deleted assignment", rec ? `${rec.assetName} — ${rec.employeeName}` : uidVal); closeModal(); toast("Assignment deleted"); paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
     };
   });
@@ -1182,11 +947,10 @@ function wireInvBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || invSelected.size === 0) return;
     confirmBulkDelete(invSelected.size, "assets", () => {
-      const removed = DB.inventory.filter(r => invSelected.has(r.uid));
+      const n = invSelected.size;
       DB.inventory = DB.inventory.filter(r => !invSelected.has(r.uid));
       invSelected = new Set();
-      logAudit("Bulk Deleted", "Inventory", `Deleted ${removed.length} asset(s): ${removed.slice(0, 5).map(r => r.assetId).join(", ")}${removed.length > 5 ? ", …" : ""}`);
-      saveDB(); toast("Selected assets deleted"); paintInvTable();
+      saveDB(); logAction("Bulk deleted inventory assets", `Deleted ${n} selected asset(s)`); toast("Selected assets deleted"); paintInvTable();
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
@@ -1194,10 +958,10 @@ function wireInvBulk(rows) {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "assets (matching current search)", () => {
       const idsToDelete = new Set(rows.map(r => r.uid));
+      const n = idsToDelete.size;
       DB.inventory = DB.inventory.filter(r => !idsToDelete.has(r.uid));
       invSelected = new Set();
-      logAudit("Bulk Deleted", "Inventory", `Deleted ${rows.length} asset(s) matching search`);
-      saveDB(); toast("All matching assets deleted"); paintInvTable();
+      saveDB(); logAction("Bulk deleted inventory assets", `Deleted ${n} asset(s) matching current filters`); toast("All matching assets deleted"); paintInvTable();
     });
   };
 }
@@ -1277,8 +1041,8 @@ function openInvForm(uidVal) {
         condition: document.getElementById("f_cond").value,
         remarks: document.getElementById("f_remarks").value.trim(),
       };
-      if (editing) { Object.assign(editing, rec); logAudit("Edited", "Inventory", `Edited asset: ${rec.assetId} (${rec.assetName})`); toast("Asset updated"); }
-      else { DB.inventory.push({ uid: uid(), ...rec }); logAudit("Added", "Inventory", `Added asset: ${rec.assetId} (${rec.assetName})`); toast("Asset added"); }
+      if (editing) { Object.assign(editing, rec); logAction("Edited inventory asset", `${rec.assetId} — ${rec.assetName}`); toast("Asset updated"); }
+      else { DB.inventory.push({ uid: uid(), ...rec }); logAction("Added inventory asset", `${rec.assetId} — ${rec.assetName}`); toast("Asset added"); }
       saveDB(); closeModal(); paintInvTable();
     };
   });
@@ -1297,8 +1061,7 @@ function deleteInv(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.inventory = DB.inventory.filter(r => r.uid !== uidVal);
       invSelected.delete(uidVal);
-      logAudit("Deleted", "Inventory", `Deleted asset: ${rec ? `${rec.assetId} (${rec.assetName})` : uidVal}`);
-      saveDB(); closeModal(); toast("Asset deleted"); paintInvTable();
+      saveDB(); logAction("Deleted inventory asset", rec ? `${rec.assetId} — ${rec.assetName}` : uidVal); closeModal(); toast("Asset deleted"); paintInvTable();
     };
   });
 }
@@ -1404,11 +1167,10 @@ function wireEmpBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || empSelected.size === 0) return;
     confirmBulkDelete(empSelected.size, "employees", () => {
-      const removed = DB.employees.filter(e => empSelected.has(e.uid));
+      const n = empSelected.size;
       DB.employees = DB.employees.filter(e => !empSelected.has(e.uid));
       empSelected = new Set();
-      logAudit("Bulk Deleted", "Employee", `Deleted ${removed.length} employee(s): ${removed.slice(0, 5).map(e => e.name).join(", ")}${removed.length > 5 ? ", …" : ""}`);
-      saveDB(); toast("Selected employees deleted"); paintEmpTable();
+      saveDB(); logAction("Bulk deleted employees", `Deleted ${n} selected employee(s)`); toast("Selected employees deleted"); paintEmpTable();
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
@@ -1416,10 +1178,10 @@ function wireEmpBulk(rows) {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "employees (matching current search)", () => {
       const idsToDelete = new Set(rows.map(r => r.uid));
+      const n = idsToDelete.size;
       DB.employees = DB.employees.filter(e => !idsToDelete.has(e.uid));
       empSelected = new Set();
-      logAudit("Bulk Deleted", "Employee", `Deleted ${rows.length} employee(s) matching search`);
-      saveDB(); toast("All matching employees deleted"); paintEmpTable();
+      saveDB(); logAction("Bulk deleted employees", `Deleted ${n} employee(s) matching current filters`); toast("All matching employees deleted"); paintEmpTable();
     });
   };
 }
@@ -1456,8 +1218,8 @@ function openEmpForm(uidVal) {
         phone: document.getElementById("f_phone").value.trim(),
         email: document.getElementById("f_email").value.trim(),
       };
-      if (editing) { Object.assign(editing, rec); logAudit("Edited", "Employee", `Edited employee: ${rec.name}${rec.id ? ` (${rec.id})` : ""}`); toast("Employee updated"); }
-      else { DB.employees.push({ uid: uid(), ...rec }); logAudit("Added", "Employee", `Added employee: ${rec.name}${rec.id ? ` (${rec.id})` : ""}`); toast("Employee added"); }
+      if (editing) { Object.assign(editing, rec); logAction("Edited employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee updated"); }
+      else { DB.employees.push({ uid: uid(), ...rec }); logAction("Added employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee added"); }
       saveDB(); closeModal(); paintEmpTable();
     };
   });
@@ -1476,8 +1238,7 @@ function deleteEmp(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.employees = DB.employees.filter(e => e.uid !== uidVal);
       empSelected.delete(uidVal);
-      logAudit("Deleted", "Employee", `Removed employee: ${rec ? rec.name : uidVal}`);
-      saveDB(); closeModal(); toast("Employee removed"); paintEmpTable();
+      saveDB(); logAction("Removed employee", rec ? rec.name : uidVal); closeModal(); toast("Employee removed"); paintEmpTable();
     };
   });
 }
@@ -1552,8 +1313,8 @@ function importEmployeeRows(rawRows) {
     }
   });
 
-  logAudit("Imported", "Employee", `Imported employees from file: ${added} added, ${updated} updated${skipped ? `, ${skipped} skipped` : ""}`);
   saveDB();
+  logAction("Imported employees", `${added} added, ${updated} updated, ${skipped} skipped (from uploaded file)`);
   openModal("Import complete", `
     <p style="margin-top:0">✅ <strong>${added}</strong> new employee${added === 1 ? "" : "s"} added.</p>
     ${updated ? `<p>♻️ <strong>${updated}</strong> existing employee${updated === 1 ? "" : "s"} updated (matched by ID or name).</p>` : ""}
@@ -1733,12 +1494,9 @@ function renderStock() {
       inp.onchange = () => {
         const cat = inp.dataset.cat, field = inp.dataset.field;
         if (!DB.stockManual[cat]) DB.stockManual[cat] = { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
-        const oldVal = DB.stockManual[cat][field];
-        const newVal = Number(inp.value) || 0;
-        DB.stockManual[cat][field] = newVal;
-        const FIELD_LABEL = { underRepair: "Under Repair", faulty: "Faulty", lost: "Lost", scrap: "Scrap", threshold: "Threshold" };
-        logAudit("Edited", "Stock Setting", `Set ${FIELD_LABEL[field] || field} for "${cat}" from ${oldVal} to ${newVal}`);
+        DB.stockManual[cat][field] = Number(inp.value) || 0;
         saveDB();
+        logAction("Edited stock summary", `${cat} — ${field} set to ${DB.stockManual[cat][field]}`);
         renderStock();
       };
     });
@@ -1821,22 +1579,20 @@ function wireRefillBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || refillSelected.size === 0) return;
     confirmBulkDelete(refillSelected.size, "refill entries", () => {
-      const removed = DB.refills.filter(r => refillSelected.has(r.uid));
+      const n = refillSelected.size;
       DB.refills = DB.refills.filter(r => !refillSelected.has(r.uid));
       refillSelected = new Set();
-      logAudit("Bulk Deleted", "Refill", `Deleted ${removed.length} refill entr${removed.length === 1 ? "y" : "ies"}: ${removed.slice(0, 5).map(r => `${r.category} +${r.quantity}`).join(", ")}${removed.length > 5 ? ", …" : ""}`);
-      saveDB(); toast("Selected entries deleted"); paintRefillTable();
+      saveDB(); logAction("Bulk deleted refill entries", `Deleted ${n} selected entr${n === 1 ? "y" : "ies"}`); toast("Selected entries deleted"); paintRefillTable();
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "refill entries", () => {
-      const count = DB.refills.length;
+      const n = DB.refills.length;
       DB.refills = [];
       refillSelected = new Set();
-      logAudit("Bulk Deleted", "Refill", `Deleted all ${count} refill entries`);
-      saveDB(); toast("All refill entries deleted"); paintRefillTable();
+      saveDB(); logAction("Bulk deleted refill entries", `Deleted all ${n} refill log entries`); toast("All refill entries deleted"); paintRefillTable();
     });
   };
 }
@@ -1863,17 +1619,16 @@ function openRefillForm() {
     document.getElementById("saveBtn").onclick = () => {
       const qty = Number(document.getElementById("f_qty").value);
       if (!qty || qty <= 0) { toast("Enter a valid quantity", "err"); return; }
-      const cat = document.getElementById("f_cat").value;
+      const category = document.getElementById("f_cat").value;
       DB.refills.push({
         uid: uid(), id: DB.refills.length + 1,
         date: document.getElementById("f_date").value,
-        category: cat,
+        category,
         quantity: qty,
         addedBy: document.getElementById("f_by").value.trim(),
         source: document.getElementById("f_source").value.trim(),
       });
-      logAudit("Added", "Refill", `Logged refill: +${qty} ${cat}`);
-      saveDB(); closeModal(); toast("Refill logged"); paintRefillTable();
+      saveDB(); logAction("Logged stock refill", `+${qty} ${category}`); closeModal(); toast("Refill logged"); paintRefillTable();
     };
   });
 }
@@ -1891,8 +1646,7 @@ function deleteRefill(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.refills = DB.refills.filter(r => r.uid !== uidVal);
       refillSelected.delete(uidVal);
-      logAudit("Deleted", "Refill", `Deleted refill entry: ${rec ? `+${rec.quantity} ${rec.category}` : uidVal}`);
-      saveDB(); closeModal(); toast("Refill entry deleted"); paintRefillTable();
+      saveDB(); logAction("Deleted refill entry", rec ? `-${rec.quantity} ${rec.category}` : uidVal); closeModal(); toast("Refill entry deleted"); paintRefillTable();
     };
   });
 }
@@ -1971,22 +1725,20 @@ function wireCatBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || catSelected.size === 0) return;
     confirmBulkDelete(catSelected.size, "categories", () => {
-      const removed = DB.categories.filter(c => catSelected.has(c.uid));
+      const n = catSelected.size;
       DB.categories = DB.categories.filter(c => !catSelected.has(c.uid));
       catSelected = new Set();
-      logAudit("Bulk Deleted", "Category", `Deleted ${removed.length} categor${removed.length === 1 ? "y" : "ies"}: ${removed.map(c => c.name).join(", ")}`);
-      saveDB(); toast("Selected categories deleted"); paintCatTable();
+      saveDB(); logAction("Bulk deleted categories", `Deleted ${n} selected categor${n === 1 ? "y" : "ies"}`); toast("Selected categories deleted"); paintCatTable();
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "categories", () => {
-      const count = DB.categories.length;
+      const n = DB.categories.length;
       DB.categories = [];
       catSelected = new Set();
-      logAudit("Bulk Deleted", "Category", `Deleted all ${count} categories`);
-      saveDB(); toast("All categories deleted"); paintCatTable();
+      saveDB(); logAction("Bulk deleted categories", `Deleted all ${n} categories`); toast("All categories deleted"); paintCatTable();
     });
   };
 }
@@ -2014,15 +1766,13 @@ function openCatForm(uidVal) {
           DB.assignments.forEach(a => { if (a.assetName === oldName) a.assetName = name; });
           DB.refills.forEach(r => { if (r.category === oldName) r.category = name; });
           if (DB.stockManual[oldName]) { DB.stockManual[name] = DB.stockManual[oldName]; delete DB.stockManual[oldName]; }
-          logAudit("Edited", "Category", `Renamed category: "${oldName}" → "${name}"`);
-        } else {
-          logAudit("Edited", "Category", `Edited category: ${name}`);
         }
+        logAction("Edited category", oldName !== name ? `Renamed "${oldName}" → "${name}"` : name);
         toast("Category updated");
       } else {
         DB.categories.push({ uid: uid(), name, notes: document.getElementById("f_notes").value.trim() });
         DB.stockManual[name] = { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
-        logAudit("Added", "Category", `Added category: ${name}`);
+        logAction("Added category", name);
         toast("Category added");
       }
       saveDB(); closeModal(); paintCatTable();
@@ -2043,135 +1793,87 @@ function deleteCat(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.categories = DB.categories.filter(c => c.uid !== uidVal);
       catSelected.delete(uidVal);
-      logAudit("Deleted", "Category", `Deleted category: ${rec ? rec.name : uidVal}`);
-      saveDB(); closeModal(); toast("Category deleted"); paintCatTable();
+      saveDB(); logAction("Deleted category", rec ? rec.name : uidVal); closeModal(); toast("Category deleted"); paintCatTable();
     };
   });
 }
 
 /* =========================================================
-   AUDIT LOG — master trail of who added/edited/deleted what
+   ACTIVITY LOG — per-office audit trail (who did what, when)
    ========================================================= */
-let auditFilter = { q: "", user: "", action: "", entity: "", from: "", to: "" };
+let activityLogCache = [];
+let activityLogFilter = { q: "", user: "" };
 
-function renderAuditLog() {
+function renderActivityLog() {
   const content = document.getElementById("content");
-
-  if (!isAdmin()) {
-    content.innerHTML = `
-      <div class="card" style="text-align:center; padding:60px 24px;">
-        <div style="font-size:34px; margin-bottom:10px;">🔒</div>
-        <h2 style="margin:0 0 6px;">Admin access required</h2>
-        <p class="muted" style="margin:0;">Sign in as Admin from the sidebar to view who added, edited or deleted what.</p>
-      </div>
-    `;
-    return;
-  }
-
-  const log = DB.auditLog || [];
-  const users = [...new Set(log.map(l => l.user))].sort();
-  const entities = [...new Set(log.map(l => l.entity))].sort();
-
+  const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "this office";
   content.innerHTML = `
     <div class="card">
       <div class="card-header">
-        <div><h2>Audit Log</h2><div class="sub">${log.length} recorded action${log.length === 1 ? "" : "s"} — every add, edit and delete across this office, with who and when</div></div>
-        <button class="btn btn-secondary btn-sm" id="exportAuditBtn">⬇ Export CSV</button>
+        <div><h2>Activity Log</h2><div class="sub">Every add, edit, delete and import in <strong>${escapeHtml(officeName)}</strong> — most recent first. Other offices keep their own separate log.</div></div>
+        <button class="btn btn-secondary btn-sm" id="logRefreshBtn">↻ Refresh</button>
       </div>
       <div class="toolbar">
-        <div class="search-box"><input type="text" id="auditSearch" placeholder="Search details..." value="${escapeHtml(auditFilter.q)}" /></div>
-        <select class="filter-select" id="auditUserFilter">
-          <option value="">All users</option>
-          ${users.map(u => `<option value="${escapeHtml(u)}" ${auditFilter.user === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
-        </select>
-        <select class="filter-select" id="auditActionFilter">
-          <option value="">All actions</option>
-          ${["Added", "Edited", "Deleted", "Bulk Deleted", "Imported", "Reset"].map(a => `<option value="${a}" ${auditFilter.action === a ? "selected" : ""}>${a}</option>`).join("")}
-        </select>
-        <select class="filter-select" id="auditEntityFilter">
-          <option value="">All types</option>
-          ${entities.map(e => `<option value="${escapeHtml(e)}" ${auditFilter.entity === e ? "selected" : ""}>${escapeHtml(e)}</option>`).join("")}
-        </select>
-        <input type="date" class="filter-select" id="auditFromDate" title="From date" value="${auditFilter.from}">
-        <input type="date" class="filter-select" id="auditToDate" title="To date" value="${auditFilter.to}">
-        <button class="btn btn-secondary btn-sm" id="auditClearFiltersBtn" style="display:none">Clear filters</button>
+        <div class="search-box"><input type="text" id="logSearch" placeholder="Search action or details..." /></div>
+        <select class="filter-select" id="logUserFilter"><option value="">All users</option></select>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Date &amp; Time</th><th>User</th><th>Action</th><th>Type</th><th>Details</th></tr></thead>
-        <tbody id="auditTbody"></tbody>
+        <thead><tr><th>When</th><th>User</th><th>Action</th><th>Details</th></tr></thead>
+        <tbody id="logTbody"><tr class="empty-row"><td colspan="4">Loading…</td></tr></tbody>
       </table></div>
     </div>
   `;
-
-  document.getElementById("auditSearch").oninput = (e) => { auditFilter.q = e.target.value.toLowerCase(); paintAuditTable(); };
-  document.getElementById("auditUserFilter").onchange = (e) => { auditFilter.user = e.target.value; paintAuditTable(); };
-  document.getElementById("auditActionFilter").onchange = (e) => { auditFilter.action = e.target.value; paintAuditTable(); };
-  document.getElementById("auditEntityFilter").onchange = (e) => { auditFilter.entity = e.target.value; paintAuditTable(); };
-  document.getElementById("auditFromDate").onchange = (e) => { auditFilter.from = e.target.value; paintAuditTable(); };
-  document.getElementById("auditToDate").onchange = (e) => { auditFilter.to = e.target.value; paintAuditTable(); };
-  document.getElementById("auditClearFiltersBtn").onclick = () => {
-    auditFilter = { q: "", user: "", action: "", entity: "", from: "", to: "" };
-    renderAuditLog();
-  };
-  document.getElementById("exportAuditBtn").onclick = exportAuditLogCSV;
-
-  paintAuditTable();
+  document.getElementById("logSearch").oninput = (e) => { activityLogFilter.q = e.target.value.toLowerCase(); paintLogTable(); };
+  document.getElementById("logUserFilter").onchange = (e) => { activityLogFilter.user = e.target.value; paintLogTable(); };
+  document.getElementById("logRefreshBtn").onclick = loadActivityLog;
+  loadActivityLog();
 }
 
-function getFilteredAuditLog() {
-  let rows = [...(DB.auditLog || [])];
-  if (auditFilter.q) rows = rows.filter(l => (l.summary || "").toLowerCase().includes(auditFilter.q));
-  if (auditFilter.user) rows = rows.filter(l => l.user === auditFilter.user);
-  if (auditFilter.action) rows = rows.filter(l => l.action === auditFilter.action);
-  if (auditFilter.entity) rows = rows.filter(l => l.entity === auditFilter.entity);
-  if (auditFilter.from) rows = rows.filter(l => (l.ts || "").slice(0, 10) >= auditFilter.from);
-  if (auditFilter.to) rows = rows.filter(l => (l.ts || "").slice(0, 10) <= auditFilter.to);
-  return rows.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+async function loadActivityLog() {
+  if (!fdb || !currentOfficeId) return;
+  const tbody = document.getElementById("logTbody");
+  if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="4">Loading…</td></tr>`;
+  try {
+    const snap = await logsCollRef().orderBy("ts", "desc").limit(500).get();
+    activityLogCache = [];
+    snap.forEach(doc => activityLogCache.push(doc.data()));
+
+    const userSel = document.getElementById("logUserFilter");
+    if (userSel) {
+      const users = [...new Set(activityLogCache.map(l => l.email).filter(Boolean))].sort();
+      userSel.innerHTML = `<option value="">All users</option>${users.map(u => `<option value="${escapeHtml(u)}">${escapeHtml(u)}</option>`).join("")}`;
+      userSel.value = activityLogFilter.user;
+    }
+    paintLogTable();
+  } catch (err) {
+    console.error(err);
+    if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="4">Couldn't load the activity log — check your Firestore Rules cover the "logs" subcollection.</td></tr>`;
+  }
 }
 
-function auditActionBadge(action) {
-  const map = {
-    "Added": "badge-green", "Edited": "badge-blue", "Deleted": "badge-red",
-    "Bulk Deleted": "badge-red", "Imported": "badge-purple", "Reset": "badge-amber",
-  };
-  return `<span class="badge ${map[action] || "badge-grey"}">${escapeHtml(action)}</span>`;
-}
-
-function paintAuditTable() {
-  const tbody = document.getElementById("auditTbody");
+function paintLogTable() {
+  const tbody = document.getElementById("logTbody");
   if (!tbody) return;
-  const rows = getFilteredAuditLog();
-  const anyFilterActive = !!(auditFilter.q || auditFilter.user || auditFilter.action || auditFilter.entity || auditFilter.from || auditFilter.to);
-  const clearBtn = document.getElementById("auditClearFiltersBtn");
-  if (clearBtn) clearBtn.style.display = anyFilterActive ? "" : "none";
-
+  let rows = [...activityLogCache];
+  if (activityLogFilter.user) rows = rows.filter(l => l.email === activityLogFilter.user);
+  if (activityLogFilter.q) {
+    rows = rows.filter(l => `${l.action || ""} ${l.details || ""}`.toLowerCase().includes(activityLogFilter.q));
+  }
   tbody.innerHTML = rows.length ? rows.map(l => `
     <tr>
-      <td>${fmtDate(l.ts)} <span class="muted" style="font-size:11px;">${fmtTimeOnly(l.ts)}</span></td>
-      <td>${escapeHtml(l.user)}</td>
-      <td>${auditActionBadge(l.action)}</td>
-      <td>${escapeHtml(l.entity)}</td>
-      <td>${escapeHtml(l.summary)}</td>
+      <td style="white-space:nowrap;">${fmtDateTime(l.ts)}</td>
+      <td>${escapeHtml(l.email || "—")}</td>
+      <td><strong>${escapeHtml(l.action || "—")}</strong></td>
+      <td>${escapeHtml(l.details || "—")}</td>
     </tr>
-  `).join("") : `<tr class="empty-row"><td colspan="5">No actions recorded yet${anyFilterActive ? " for these filters" : ""}</td></tr>`;
+  `).join("") : `<tr class="empty-row"><td colspan="4">No activity recorded yet for this office.</td></tr>`;
 }
 
-function exportAuditLogCSV() {
-  const rows = getFilteredAuditLog();
-  if (!rows.length) { toast("Nothing to export", "err"); return; }
-  const esc = (v) => `"${String(v ?? "").replaceAll('"', '""')}"`;
-  const lines = [["Date/Time", "User", "Action", "Type", "Details"].map(esc).join(",")];
-  rows.forEach(l => lines.push([l.ts, l.user, l.action, l.entity, l.summary].map(esc).join(",")));
-  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `audit-log-${todayISO()}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-  toast("Audit log exported");
+function fmtDateTime(iso) {
+  if (!iso) return "—";
+  const dt = new Date(iso);
+  if (isNaN(dt)) return iso;
+  return dt.toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
 /* =========================================================
@@ -2194,10 +1896,22 @@ function renderSettings() {
       <div class="card-header"><div><h2>Dropdown Lists</h2><div class="sub">These values populate the selectors throughout the app${admin ? "" : " (Admin only to edit)"}</div></div></div>
       <div class="grid-2" id="listsGrid" style="grid-template-columns:1fr 1fr"></div>
     </div>
+
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-header">
+        <div><h2>Team Access</h2><div class="sub">Who can sign in, and whether they can edit or just view — applies across every office</div></div>
+        ${admin ? `<button class="btn btn-primary btn-sm" id="addRoleBtn">+ Add Person</button>` : ""}
+      </div>
+      ${admin ? `<div class="table-wrap"><table>
+        <thead><tr><th>Email</th><th>Role</th><th></th></tr></thead>
+        <tbody id="rolesTbody"><tr class="empty-row"><td colspan="3">Loading…</td></tr></tbody>
+      </table></div>` : `<p class="muted" style="margin-top:0">Only Admins can view or manage the team access list.</p>`}
+    </div>
+
     <div class="card">
-      <div class="card-header"><div><h2>Access</h2><div class="sub">Who can make changes</div></div></div>
-      <p class="muted" style="margin-top:0"><strong>Viewer</strong> mode: browse everything, no edits. <strong>Admin</strong> mode: add / edit / delete / bulk-delete / import data. Switch modes from the sidebar (admin requires the password).</p>
-      <p class="muted">Everything is stored in your Cloud Firestore database and synced live to everyone viewing this app. Use <strong>Reset Data</strong> in the sidebar to restore the original sheet contents for everyone at any time.</p>
+      <div class="card-header"><div><h2>Access</h2><div class="sub">How roles work</div></div></div>
+      <p class="muted" style="margin-top:0"><strong>Viewer</strong>: signs in, can browse and search everything, no edits. <strong>Admin</strong>: everything a Viewer can do, plus add / edit / delete / bulk-delete / import / reset. Manage who has which role above, in Team Access.</p>
+      <p class="muted">Everything is stored in your Cloud Firestore database and synced live to everyone in the same office. Use <strong>Reset Data</strong> in the sidebar to restore the original sheet contents for everyone at any time.</p>
     </div>
   `;
 
@@ -2226,11 +1940,105 @@ function renderSettings() {
         if (!DB.lists[key]) DB.lists[key] = [];
         if (DB.lists[key].includes(val)) { toast("Already exists", "err"); return; }
         DB.lists[key].push(val);
-        logAudit("Added", "Dropdown List", `Added "${val}" to ${key} list`);
-        saveDB(); input.value = ""; paintChips(key); toast("Added");
+        saveDB(); logAction("Added list option", `${key}: "${val}"`); input.value = ""; paintChips(key); toast("Added");
       };
     });
+
+    document.getElementById("addRoleBtn").onclick = () => openRoleForm();
+    loadRolesList();
   }
+}
+
+/* ---------------- Team Access (Admin/Viewer role management) ---------------- */
+async function loadRolesList() {
+  const tbody = document.getElementById("rolesTbody");
+  if (!tbody) return;
+  try {
+    const snap = await fdb.collection("roles").get();
+    const rows = [];
+    snap.forEach(doc => rows.push({ email: doc.id, ...doc.data() }));
+    rows.sort((a, b) => (a.email || "").localeCompare(b.email || ""));
+    tbody.innerHTML = rows.length ? rows.map(r => `
+      <tr>
+        <td>${escapeHtml(r.email)}${fauth.currentUser && fauth.currentUser.email === r.email ? ` <span class="muted" style="font-size:11.5px;">(you)</span>` : ""}</td>
+        <td><span class="badge ${r.role === "admin" ? "badge-blue" : "badge-grey"}">${r.role === "admin" ? "Admin" : "Viewer"}</span></td>
+        <td>
+          <div class="row-actions">
+            <button class="btn btn-secondary btn-sm btn-icon" title="Change role" onclick="openRoleForm('${escapeHtml(r.email)}','${r.role}')">✏️</button>
+            <button class="btn btn-danger btn-sm btn-icon" title="Remove access" onclick="removeRole('${escapeHtml(r.email)}')">🗑️</button>
+          </div>
+        </td>
+      </tr>
+    `).join("") : `<tr class="empty-row"><td colspan="3">Nobody's been granted access yet — add someone above (must match a Firebase Authentication login exactly).</td></tr>`;
+  } catch (err) {
+    console.error(err);
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="3">Couldn't load the team list.</td></tr>`;
+  }
+}
+
+function openRoleForm(existingEmail, existingRole) {
+  if (!requireAdminOrWarn()) return;
+  const editing = !!existingEmail;
+  openModal(editing ? "Change Role" : "Add Person", `
+    ${editing ? "" : `<p class="muted" style="margin-top:0">The email must exactly match a login already created in Firebase → Authentication → Users.</p>`}
+    <div class="field"><label>Email</label><input type="email" id="f_roleEmail" value="${escapeHtml(existingEmail || "")}" ${editing ? "disabled" : ""} placeholder="person@company.com"></div>
+    <div class="field"><label>Role</label>
+      <select id="f_role">
+        <option value="viewer" ${existingRole === "viewer" ? "selected" : ""}>Viewer — view only</option>
+        <option value="admin" ${existingRole === "admin" ? "selected" : ""}>Admin — can edit everything</option>
+      </select>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelRole">Cancel</button>
+      <button class="btn btn-primary" id="saveRole">${editing ? "Save" : "Grant Access"}</button>
+    </div>
+  `, () => {
+    const emailInp = document.getElementById("f_roleEmail");
+    document.getElementById("cancelRole").onclick = closeModal;
+    document.getElementById("saveRole").onclick = async () => {
+      const email = emailInp.value.trim().toLowerCase();
+      const role = document.getElementById("f_role").value;
+      if (!email) { toast("Enter an email", "err"); return; }
+      try {
+        await fdb.collection("roles").doc(email).set({ role, updatedAt: new Date().toISOString() }, { merge: true });
+        logAction(editing ? "Changed role" : "Granted access", `${email} → ${role === "admin" ? "Admin" : "Viewer"}`);
+        closeModal();
+        toast(editing ? "Role updated" : "Access granted");
+        loadRolesList();
+      } catch (err) {
+        console.error(err);
+        toast("Couldn't save — check your Firestore Rules", "err");
+      }
+    };
+  });
+}
+
+function removeRole(email) {
+  if (!requireAdminOrWarn()) return;
+  if (fauth.currentUser && fauth.currentUser.email === email) {
+    toast("You can't remove your own access from here", "err");
+    return;
+  }
+  openModal("Remove access?", `
+    <p class="muted" style="margin-top:0"><strong>${escapeHtml(email)}</strong> will no longer be able to sign in and view or edit any office's data.</p>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelRoleDel">Cancel</button>
+      <button class="btn btn-danger" id="confirmRoleDel">Remove</button>
+    </div>`, () => {
+    document.getElementById("cancelRoleDel").onclick = closeModal;
+    document.getElementById("confirmRoleDel").onclick = async () => {
+      try {
+        await fdb.collection("roles").doc(email).delete();
+        logAction("Removed access", email);
+        closeModal();
+        toast("Access removed");
+        loadRolesList();
+      } catch (err) {
+        console.error(err);
+        toast("Couldn't remove — check your Firestore Rules", "err");
+      }
+    };
+  });
 }
 
 function paintChips(key) {
@@ -2247,8 +2055,8 @@ function removeListItem(key, encodedVal) {
   if (!requireAdminOrWarn()) return;
   const val = decodeURIComponent(encodedVal);
   DB.lists[key] = (DB.lists[key] || []).filter(v => v !== val);
-  logAudit("Deleted", "Dropdown List", `Removed "${val}" from ${key} list`);
   saveDB();
+  logAction("Removed list option", `${key}: "${val}"`);
   paintChips(key);
   toast("Removed");
 }
@@ -2301,21 +2109,24 @@ function showSignInGate(errorMsg) {
 function renderOfficeCards() {
   const grid = document.getElementById("officeGrid");
   if (!grid) return;
+  const admin = isAdmin();
   if (!OFFICES.length) {
-    grid.innerHTML = `<div class="office-empty-note">No offices yet — add one to get started.</div>`;
+    grid.innerHTML = `<div class="office-empty-note">No offices yet${admin ? " — add one to get started." : ". Ask an Admin to create one."}</div>`;
     return;
   }
   grid.innerHTML = OFFICES.map(o => `
     <div class="office-card" data-id="${escapeHtml(o.id)}">
-      <div class="office-card-actions">
+      ${admin ? `<div class="office-card-actions">
         <button class="office-card-edit" data-id="${escapeHtml(o.id)}" title="Rename office">✎</button>
         ${OFFICES.length > 1 ? `<button class="office-card-del" data-id="${escapeHtml(o.id)}" title="Delete office">✕</button>` : ""}
-      </div>
+      </div>` : ""}
       <div class="office-card-icon">🏢</div>
       <div class="office-card-name">${escapeHtml(o.name)}</div>
       <div class="office-card-city">${escapeHtml(o.city || "—")}</div>
     </div>
   `).join("");
+  const addBtn = document.getElementById("addOfficeBtn");
+  if (addBtn) addBtn.style.display = admin ? "" : "none";
 }
 async function openOffice(officeId) {
   currentOfficeId = officeId;
@@ -2334,6 +2145,7 @@ async function openOffice(officeId) {
   }
   hideLoadingScreen();
   paintOfficeUI();
+  logAction("Opened office", `Signed in and opened this office's data`);
   goto(currentPage);
 }
 async function showOfficeSelectScreen() {
@@ -2369,6 +2181,7 @@ document.getElementById("officeGrid").addEventListener("click", (e) => {
   const editBtn = e.target.closest(".office-card-edit");
   if (editBtn) {
     e.stopPropagation();
+    if (!requireAdminOrWarn()) return;
     const office = OFFICES.find(o => o.id === editBtn.dataset.id);
     if (!office) return;
     openModal("Rename Office", `
@@ -2402,6 +2215,7 @@ document.getElementById("officeGrid").addEventListener("click", (e) => {
   const delBtn = e.target.closest(".office-card-del");
   if (delBtn) {
     e.stopPropagation();
+    if (!requireAdminOrWarn()) return;
     const office = OFFICES.find(o => o.id === delBtn.dataset.id);
     openModal(`Delete "${office ? office.name : "this office"}"?`, `
       <p class="muted" style="margin-top:0">This permanently deletes <strong>all data</strong> for this office
@@ -2425,6 +2239,7 @@ document.getElementById("officeGrid").addEventListener("click", (e) => {
   if (card) openOffice(card.dataset.id);
 });
 document.getElementById("addOfficeBtn").addEventListener("click", () => {
+  if (!requireAdminOrWarn()) return;
   openModal("Add New Office", `
     <div class="field"><label>Office Name</label><input type="text" id="f_officeName" placeholder="e.g. Andheri Branch"></div>
     <div class="field"><label>City</label><input type="text" id="f_officeCity" placeholder="e.g. Mumbai"></div>
@@ -2491,9 +2306,9 @@ async function init() {
   // listener is the source of truth for every state change: signed out -> gate,
   // signed in -> load data once, then keep the app in sync.
   fauth.onAuthStateChanged(async (user) => {
-    paintRoleUI();
-
     if (!user) {
+      currentUserRole = null;
+      paintRoleUI();
       detachRealtimeListener();
       DB = null;
       dataBootstrapped = false;
@@ -2502,6 +2317,9 @@ async function init() {
       showSignInGate();
       return;
     }
+
+    await fetchUserRole();
+    paintRoleUI();
 
     // Signed in but no office chosen yet this session — try to resume the
     // last office used on this device (so refreshing stays put); only fall

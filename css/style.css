@@ -304,6 +304,7 @@ tbody tr:hover{ background: var(--surface-2); }
 }
 .role-badge.admin{ background: linear-gradient(135deg, var(--teal), #0a9a8b); color:#fff; }
 .role-badge.viewer{ background: rgba(255,255,255,.1); color:#c7cbe3; }
+.role-email{ font-size:10.8px; color:#7c82a0; margin-bottom:8px; word-break:break-all; }
 
 /* ---------- Office box (sidebar) ---------- */
 .office-box{ margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid rgba(255,255,255,.08); }
@@ -336,8 +337,6 @@ input:disabled, select:disabled, textarea:disabled{ background:var(--grey-light)
   .stat-grid{ grid-template-columns: repeat(2,1fr); }
   .grid-2{ grid-template-columns: 1fr; }
   .field-row{ grid-template-columns: 1fr; }
-  .chart-grid{ grid-template-columns: 1fr; }
-  .insight-strip{ grid-template-columns: 1fr 1fr; }
 }
 
 @media (max-width: 760px){
@@ -346,70 +345,7 @@ input:disabled, select:disabled, textarea:disabled{ background:var(--grey-light)
   .hamburger{ display:block; }
   .content{ padding: 18px 14px 50px; }
   .stat-grid{ grid-template-columns: 1fr 1fr; }
-  .insight-strip{ grid-template-columns: 1fr; }
-  .donut-wrap{ flex-direction:column; }
 }
-
-/* ---------- Dashboard insights (KPI strip) ---------- */
-.insight-strip{
-  display:grid; grid-template-columns: repeat(3, 1fr); gap:16px; margin-bottom:22px;
-}
-.insight-card{
-  background: var(--surface); border:1px solid var(--border); border-radius: var(--radius);
-  padding:18px 20px; box-shadow: var(--shadow-sm); display:flex; align-items:center; gap:16px;
-}
-.radial{
-  --pct: 0;
-  width:64px; height:64px; border-radius:50%; flex-shrink:0;
-  background: conic-gradient(var(--primary) calc(var(--pct)*1%), var(--surface-2) 0);
-  display:flex; align-items:center; justify-content:center; position:relative;
-}
-.radial::before{
-  content:""; position:absolute; inset:7px; background:var(--surface); border-radius:50%;
-}
-.radial-label{ position:relative; font-size:13px; font-weight:800; color:var(--text); }
-.insight-body{ min-width:0; }
-.insight-title{ font-size:12.5px; color:var(--text-muted); font-weight:600; margin-bottom:3px; }
-.insight-value{ font-size:22px; font-weight:800; letter-spacing:-.02em; line-height:1.15; }
-.insight-foot{ font-size:11.5px; color:var(--text-faint); margin-top:3px; }
-.insight-icon{
-  width:44px; height:44px; border-radius:12px; flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:19px;
-}
-
-/* ---------- Charts ---------- */
-.chart-grid{
-  display:grid; grid-template-columns: 1fr 1fr; gap:18px; margin-bottom:18px;
-}
-.chart-card .card-header{ margin-bottom:14px; }
-.donut-wrap{ display:flex; align-items:center; gap:26px; flex-wrap:wrap; justify-content:center; }
-.donut-legend{ display:flex; flex-direction:column; gap:9px; flex:1; min-width:160px; }
-.donut-legend-row{ display:flex; align-items:center; gap:9px; font-size:12.8px; }
-.donut-dot{ width:9px; height:9px; border-radius:50%; flex-shrink:0; }
-.donut-legend-label{ color:var(--text); font-weight:600; flex:1; }
-.donut-legend-value{ color:var(--text-muted); font-weight:700; font-size:12px; }
-
-.chart-bar-legend{ display:flex; gap:14px; flex-wrap:wrap; margin-bottom:14px; font-size:11.8px; color:var(--text-muted); }
-.chart-bar-legend span{ display:inline-flex; align-items:center; gap:6px; font-weight:600; }
-.chart-bar-legend .dot{ width:8px; height:8px; border-radius:2px; display:inline-block; }
-
-.chart-bar-row{ margin-bottom:14px; }
-.chart-bar-row:last-child{ margin-bottom:0; }
-.chart-bar-label{
-  display:flex; justify-content:space-between; font-size:12.6px; font-weight:600; color:var(--text); margin-bottom:5px;
-}
-.chart-bar-label .muted-num{ color:var(--text-muted); font-weight:700; }
-.chart-bar-track{ height:11px; background:var(--surface-2); border-radius:99px; overflow:hidden; }
-.chart-bar-fill{ height:100%; display:flex; border-radius:99px; overflow:hidden; }
-.chart-bar-fill span{ height:100%; display:block; }
-
-.dept-bar-row{ margin-bottom:13px; }
-.dept-bar-row:last-child{ margin-bottom:0; }
-.dept-bar-top{ display:flex; justify-content:space-between; font-size:12.6px; font-weight:600; color:var(--text); margin-bottom:5px; }
-.dept-bar-top .muted-num{ color:var(--text-muted); font-weight:700; }
-.dept-bar-track{ height:10px; background:var(--surface-2); border-radius:99px; overflow:hidden; }
-.dept-bar-fill{ height:100%; border-radius:99px; background: linear-gradient(90deg, var(--primary), #6a5cf6); }
-
-.chart-empty{ color:var(--text-faint); font-size:13px; text-align:center; padding: 30px 10px; }
 
 /* ---------- Loading & Firebase setup screens ---------- */
 .loading-screen{

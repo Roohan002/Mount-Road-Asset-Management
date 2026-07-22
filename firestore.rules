@@ -2,11 +2,42 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Nobody can view OR change the data unless they're signed in through
+    // Looks up the signed-in user's role from /roles/{their email}.
+    // Anyone without a matching roles doc is treated as a Viewer (read-only).
+    function myRole() {
+      return get(/databases/$(database)/documents/roles/$(request.auth.token.email)).data.role;
+    }
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isAdmin() {
+      return isSignedIn() && myRole() == 'admin';
+    }
+
+    // Nobody can view OR change anything unless they're signed in through
     // Firebase Authentication (i.e. an account you created yourself under
     // Authentication > Users). There is no public read access.
-    match /assetTracker/{docId} {
-      allow read, write: if request.auth != null;
+    //
+    // Every office's data lives in its own document at assetTracker/{officeId},
+    // completely separate from every other office (including its own "logs"
+    // subcollection). Only Admins can write; both Admins and Viewers can read.
+    match /assetTracker/{officeId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+
+      match /logs/{logId} {
+        allow read: if isSignedIn();
+        allow write: if isAdmin();
+      }
+    }
+
+    // Role assignments, one document per email (e.g. roles/someone@company.com
+    // with a field role: "admin" or "viewer"). Anyone signed in can read the
+    // list (so the app can check its own role); only an existing Admin can
+    // grant, change, or revoke someone else's role.
+    match /roles/{email} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
   }
 }

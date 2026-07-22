@@ -1,7 +1,14 @@
 SPEELFINANCE — ASSET MANAGEMENT WEB APP
 =============================================
 Backed by Firebase — data is stored online and private: nobody can view or
-edit anything unless they sign in with an account you create for them.
+edit anything unless they sign in with an account you create for them, and
+only Admins (not Viewers) can make changes — see "ADMIN vs VIEWER" below.
+
+IF YOUR APP IS ALREADY LIVE: this update adds real Admin/Viewer roles.
+You MUST (1) re-publish firestore.rules (Part 1, step 5) and (2) do the
+one-time "ONE-TIME SETUP STEP" under "ADMIN vs VIEWER" below to grant
+yourself Admin again — otherwise everyone, including you, will only be
+able to view, not edit, until that's done.
 
 ------------------------------------------------------------
 PART 1 — CONNECT THE APP TO YOUR OWN FIREBASE PROJECT
@@ -92,23 +99,61 @@ LOGIN REQUIRED — NOBODY CAN VIEW WITHOUT SIGNING IN
 This app shows nothing at all until you sign in. Opening the link (or
 index.html) always presents a "Sign in required" screen first. Only people
 you've added under Authentication > Users in the Firebase console (Part 1,
-step 4c) can sign in, and once signed in they can both view AND edit
-everything (there's no separate "view only, can't edit" account type — see
-note below if you want that).
+step 4c) can sign in at all — but signing in only gets you as far as
+Viewer access (read-only) unless you've also been given the Admin role
+(see the next section).
 
 Click "Sign Out" at the bottom of the sidebar to leave; you'll be dropped
-straight back to the sign-in screen. You can add or remove people's access
-any time from Authentication > Users — no code changes needed, and removing
-someone there instantly cuts off their access.
+straight back to the sign-in screen. Removing someone from Authentication >
+Users instantly cuts off their access completely (they can no longer even
+sign in) — no code changes needed.
 
 Security note: this is enforced by your Firestore Rules (Part 1, step 5) on
 Google's servers, not just by this webpage — so it's real access control,
 not just a UI toggle. Someone without a login cannot see your data even if
-they inspect the page's code.
+they inspect the page's code, and a Viewer genuinely cannot write data even
+if they inspect the page's code.
 
-Want separate "can view but can't edit" accounts instead of everyone who
-can sign in also being able to edit? That needs a bit more setup (assigning
-roles per account) — just ask and I can add it.
+ADMIN vs VIEWER — WHO CAN EDIT
+---------------------------------
+There are two roles:
+  - Viewer: can sign in, browse, and search every page. No add / edit /
+    delete / import / reset buttons.
+  - Admin: everything a Viewer can do, plus full edit access.
+
+Roles are managed from inside the app, under Settings > Team Access
+(Admin only). Add a person's email (it must exactly match a login you
+already created under Authentication > Users) and choose their role.
+Change or remove someone's access there any time — it takes effect
+immediately, even on devices where they're already signed in.
+
+*** ONE-TIME SETUP STEP — DO THIS OR NOBODY CAN EDIT ANYTHING ***
+Team Access itself requires being an Admin to use — which creates a
+chicken-and-egg problem for the very first person. To grant yourself
+Admin the first time, do this once directly in the Firebase console:
+
+  1. Firebase console > Build > Firestore Database > Data tab.
+  2. Click "Start collection". Collection ID: roles
+  3. Document ID: type your exact login email (e.g. you@company.com).
+  4. Add a field: name "role", type "string", value "admin". Save.
+  5. Reload index.html and sign in — you're now an Admin, and can grant
+     Admin or Viewer access to everyone else from Settings > Team Access
+     instead of repeating this console step.
+
+If you update firestore.rules on an app that was already live and skip
+this step, every existing user (including you) drops to Viewer-only
+until you complete it once.
+
+ACTIVITY LOG — TRACE WHO DID WHAT
+------------------------------------
+Since multiple people can sign in, every add, edit, delete, import, and
+reset is recorded to the "Activity Log" page in the sidebar — showing the
+timestamp, the signed-in email that did it, the action, and what changed.
+Search and filter by user to trace down a specific mistake.
+
+Each office keeps its own completely separate activity log, matching how
+each office's data is separate — actions in "Andheri Branch" never show up
+in "Main Office"'s log, and vice versa.
 
 BULK DELETE
 -----------
