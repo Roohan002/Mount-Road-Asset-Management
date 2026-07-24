@@ -79,9 +79,49 @@ host works the same way — Netlify, Vercel, GitHub Pages, etc. — just
 upload the whole folder including js/firebase-config.js.)
 
 ------------------------------------------------------------
+WHAT'S NEW — DASHBOARD INSIGHTS
+------------------------------------------------------------
+The Dashboard has been rebuilt with more analytics, all computed live from
+data you already have (no new setup, no new Firestore fields required):
+
+- Performance Ratios strip: Utilization % (Assigned / Total Stock),
+  Workforce Coverage % (employees currently holding an asset), New
+  Assignments This Week, and Turnover Rate % (Returned / all assignments).
+- Fleet Allocation pie -> every unit of stock, split by Assigned /
+  Available / Under Repair / Faulty / Lost / Scrap, with percentages.
+- Assignment Status donut -> Assigned / Returned / Overdue, with percentages.
+- Stock by Category  -> bar breakdown of total logged stock per category.
+- Department Leaderboard -> which departments currently hold the most assets.
+- Top Asset Holders   -> people currently holding the most assets, for quick
+  audit checks.
+- Low Stock Alerts    -> now a full-width chip grid so it's easy to scan at
+  a glance across every category that's run low.
+
+Everything on the dashboard is still clickable through to the page it
+summarizes, and all of it respects Viewer/Admin permissions and the
+per-office data separation described below.
+
+------------------------------------------------------------
+SECURITY FIX — REAL DATA REMOVED FROM js/data.js
+------------------------------------------------------------
+Previously, js/data.js shipped real employee names, asset categories, and
+assignment history in plain text as part of the public website — visible
+to anyone who opened the browser's DevTools, even without signing in.
+
+That data has been removed. js/data.js now only contains generic,
+non-sensitive dropdown option lists (status, condition, floor, department
+names) needed for the app's forms to work. Your actual data isn't
+affected — it already lives in Firestore, protected by firestore.rules,
+which is what the app reads from after sign-in.
+
+If you ever need to re-seed a brand-new Firebase project with the
+original historical data, see the separate admin-tools/ folder (not part
+of this website — run it locally with the Firebase Admin SDK). Its own
+README explains when you'd actually need it (most people won't).
+
 WHAT'S INSIDE (mirrors your original Excel workbook)
 ------------------------------------------------------------
-- Dashboard          -> same live counters as your "Dashboard" sheet
+- Dashboard          -> same live counters as your "Dashboard" sheet, plus the insights above
 - Asset Assignment   -> same table/fields as "Asset Assignment" sheet
 - Master Inventory   -> individual asset register (Asset ID, brand, serial, warranty, etc.)
 - Employees          -> same list as "Employees" sheet

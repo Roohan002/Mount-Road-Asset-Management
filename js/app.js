@@ -445,10 +445,124 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
 });
 
 /* =========================================================
-   DASHBOARD
+   DASHBOARD — INSIGHTS ENGINE
+   Everything below computeDashboard() derives extra, read-only
+   analytics purely from data already in DB — no new storage,
+   no schema changes. Safe to recompute on every render.
    ========================================================= */
+const DASH_PALETTE = ["var(--primary)", "var(--teal)", "var(--amber)", "var(--purple)", "var(--blue)", "var(--red)", "var(--grey)", "#2fbf8f"];
+
+function computeDashboardInsights() {
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  const s = computeDashboard();
+
+  /* Fleet allocation — where every unit of stock currently sits */
+  const fleetSegments = [
+    { label: "Assigned", value: s.assigned, color: "var(--blue)" },
+    { label: "Available", value: s.available, color: "var(--teal)" },
+    { label: "Under Repair", value: s.underRepair, color: "var(--amber)" },
+    { label: "Faulty", value: s.faulty, color: "var(--red)" },
+    { label: "Lost", value: s.lost, color: "var(--grey)" },
+    { label: "Scrap", value: s.scrap, color: "var(--purple)" },
+  ].filter(seg => seg.value > 0);
+
+  /* Assignment status split (Assigned / Returned / Overdue / custom) */
+  const statusColors = { Assigned: "var(--blue)", Returned: "var(--teal)", Overdue: "var(--red)" };
+  const statusCounts = {};
+  DB.assignments.forEach(a => { const k = a.status || "Unknown"; statusCounts[k] = (statusCounts[k] || 0) + 1; });
+  const statusSegments = Object.entries(statusCounts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([label, value], i) => ({ label, value, color: statusColors[label] || DASH_PALETTE[i % DASH_PALETTE.length] }));
+
+  /* Stock split by category (Total Stock, from Stock Summary logic) */
+  const stockRows = computeStockSummary();
+  const categorySegments = [...stockRows]
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 8)
+    .map((r, i) => ({ label: r.category, value: r.total, color: DASH_PALETTE[i % DASH_PALETTE.length] }));
+
+  /* Department leaderboard — currently-held (not Returned) assets per dept */
+  const deptCounts = {};
+  DB.assignments.forEach(a => {
+    if ((a.status || "").toLowerCase() === "returned") return;
+    const d = a.department || "Unassigned";
+    deptCounts[d] = (deptCounts[d] || 0) + 1;
+  });
+  const deptLeaderboard = Object.entries(deptCounts).sort((a, b) => b[1] - a[1]).slice(0, 6)
+    .map(([label, value]) => ({ label, value }));
+
+  /* Top asset holders — people currently holding the most assets */
+  const holderMap = {};
+  DB.assignments.forEach(a => {
+    if ((a.status || "").toLowerCase() === "returned") return;
+    const key = a.employeeName || "Unknown";
+    if (!holderMap[key]) holderMap[key] = { name: key, dept: a.department || "—", count: 0 };
+    holderMap[key].count++;
+  });
+  const topHolders = Object.values(holderMap).sort((a, b) => b.count - a.count).slice(0, 5);
+
+  /* Headcount + activity context */
+  const employeesCount = DB.employees.length;
+  const departmentsCount = new Set(DB.employees.map(e => e.department).filter(Boolean)).size;
+  const weekAgo = new Date(now); weekAgo.setDate(weekAgo.getDate() - 7);
+  const newThisWeek = DB.assignments.filter(a => a.date && new Date(a.date) >= weekAgo).length;
+
+  // Coverage: what share of the workforce is currently holding at least one asset
+  const holdersCount = Object.keys(holderMap).length;
+  const coverageRate = employeesCount > 0 ? Math.round((holdersCount / employeesCount) * 100) : 0;
+
+  // Turnover: what share of everything ever assigned has already been returned
+  const returnedCount = DB.assignments.filter(a => (a.status || "").toLowerCase() === "returned").length;
+  const turnoverRate = DB.assignments.length > 0 ? Math.round((returnedCount / DB.assignments.length) * 100) : 0;
+
+  const utilizationRate = s.total > 0 ? Math.round((s.assigned / s.total) * 100) : 0;
+
+  return {
+    fleetSegments, statusSegments, categorySegments, deptLeaderboard, topHolders,
+    employeesCount, departmentsCount, newThisWeek, coverageRate, turnoverRate, utilizationRate,
+  };
+}
+
+/* ---- Tiny inline chart builders (no external libraries) ---- */
+function insightBarList(items, opts = {}) {
+  if (!items.length) return `<p class="muted" style="margin:4px 0 0;">${opts.empty || "Nothing to show yet."}</p>`;
+  const max = Math.max(1, ...items.map(i => i.value));
+  return `<div class="ibar-list">${items.map((i, idx) => `
+    <div class="ibar-row">
+      <div class="ibar-label" title="${escapeHtml(i.label)}">${escapeHtml(i.label)}</div>
+      <div class="ibar-track"><div class="ibar-fill" style="width:${Math.max(4, (i.value / max) * 100)}%; background:${i.color || DASH_PALETTE[idx % DASH_PALETTE.length]}"></div></div>
+      <div class="ibar-value">${i.value}</div>
+    </div>`).join("")}</div>`;
+}
+
+function donutChart(segments, opts = {}) {
+  const total = segments.reduce((s, x) => s + x.value, 0);
+  if (!total) return `<p class="muted" style="margin:4px 0 0;">${opts.empty || "No data yet."}</p>`;
+  let acc = 0;
+  const stops = segments.map(seg => {
+    const start = (acc / total) * 360; acc += seg.value; const end = (acc / total) * 360;
+    return `${seg.color} ${start}deg ${end}deg`;
+  }).join(", ");
+  return `
+    <div class="donut-wrap">
+      <div class="donut" style="background: conic-gradient(${stops});">
+        <div class="donut-hole"><div class="donut-total">${total}</div><div class="donut-sub">${escapeHtml(opts.centerLabel || "Total")}</div></div>
+      </div>
+      <div class="donut-legend">
+        ${segments.map(seg => `
+          <div class="legend-item">
+            <span class="legend-dot" style="background:${seg.color}"></span>
+            <span class="legend-label">${escapeHtml(seg.label)}</span>
+            <span class="legend-pct">${Math.round((seg.value / total) * 100)}%</span>
+            <strong>${seg.value}</strong>
+          </div>`).join("")}
+      </div>
+    </div>`;
+}
+
 function renderDashboard() {
   const s = computeDashboard();
+  const ins = computeDashboardInsights();
   const content = document.getElementById("content");
   const admin = isAdmin();
 
@@ -463,6 +577,14 @@ function renderDashboard() {
     { label: "Faulty", value: s.faulty, icon: "🔴", cls: "icon-red", foot: "Needs attention", goto: "stock" },
     { label: "Lost", value: s.lost, icon: "✖", cls: "icon-grey", foot: "Unaccounted", goto: "stock" },
     { label: "Scrap", value: s.scrap, icon: "⚫", cls: "icon-grey", foot: "Decommissioned", goto: "stock" },
+  ];
+
+  // Second, smaller strip of derived metrics — ratios the raw counts above don't show on their own.
+  const miniCards = [
+    { label: "Utilization", value: `${ins.utilizationRate}%`, icon: "📈", cls: "icon-indigo", accent: "var(--primary)", foot: "Assigned ÷ total stock", goto: "stock" },
+    { label: "Workforce Coverage", value: `${ins.coverageRate}%`, icon: "🧑‍💼", cls: "icon-purple", accent: "var(--purple)", foot: `${ins.employeesCount} employees, ${ins.departmentsCount} depts`, goto: "employees" },
+    { label: "New This Week", value: ins.newThisWeek, icon: "🆕", cls: "icon-teal", accent: "var(--teal)", foot: "Assignments logged", goto: "assignment" },
+    { label: "Turnover Rate", value: `${ins.turnoverRate}%`, icon: "🔁", cls: "icon-amber", accent: "var(--amber)", foot: "Returned ÷ all assignments", goto: "assignment" },
   ];
 
   const recentAssignments = sortAssignmentsNewestFirst(DB.assignments).slice(0, 6);
@@ -482,6 +604,7 @@ function renderDashboard() {
         </div>
       </div>
     ` : ""}
+
     <div class="stat-grid">
       ${cards.map(c => `
         <div class="stat-card" role="button" tabindex="0" title="View in ${c.goto === "assignment" ? "Asset Assignment" : c.goto === "categories" ? "Asset Categories" : "Stock Summary"}"
@@ -498,6 +621,58 @@ function renderDashboard() {
       `).join("")}
     </div>
 
+    <div class="section-eyebrow">Performance Ratios</div>
+    <div class="mini-stat-grid">
+      ${miniCards.map(c => `
+        <div class="mini-stat-card" role="button" tabindex="0" style="--accent:${c.accent}" onclick="goto('${c.goto}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
+          <div class="mini-stat-icon ${c.cls}">${c.icon}</div>
+          <div>
+            <div class="mini-stat-value">${c.value}</div>
+            <div class="mini-stat-label">${c.label}</div>
+            <div class="mini-stat-foot">${c.foot}</div>
+          </div>
+        </div>
+      `).join("")}
+    </div>
+
+    <div class="section-eyebrow">Fleet Breakdown</div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div><h2>Fleet Allocation</h2><div class="sub">Every unit of stock, by where it currently sits</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
+        </div>
+        ${donutChart(ins.fleetSegments, { centerLabel: "Total Stock", empty: "Log a refill to see your fleet split here." })}
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div><h2>Assignment Status</h2><div class="sub">Across all logged assignments</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">View all →</button>
+        </div>
+        ${donutChart(ins.statusSegments, { centerLabel: "Assignments", empty: "No assignments logged yet." })}
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div><h2>Stock by Category</h2><div class="sub">Total units logged, largest first</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
+        </div>
+        ${insightBarList(ins.categorySegments, { empty: "Log a refill to see category totals here." })}
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div><h2>Department Leaderboard</h2><div class="sub">Assets currently held, by department</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">Assignments →</button>
+        </div>
+        ${insightBarList(ins.deptLeaderboard, { color: "var(--purple)", empty: "No active assignments to break down yet." })}
+      </div>
+    </div>
+
+    <div class="section-eyebrow">Activity &amp; Alerts</div>
     <div class="grid-2">
       <div class="card">
         <div class="card-header">
@@ -523,19 +698,44 @@ function renderDashboard() {
 
       <div class="card">
         <div class="card-header">
-          <div><h2>Low Stock Alerts</h2><div class="sub">Available ≤ threshold</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
+          <div><h2>Top Asset Holders</h2><div class="sub">Most assets currently held, per person</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="goto('empHistory')">Employee history →</button>
         </div>
-        ${lowStockRows.length ? lowStockRows.map(r => `
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border);cursor:pointer" title="View in Stock Summary" onclick="goto('stock')">
-            <div>
-              <div style="font-weight:600">${escapeHtml(r.category)}</div>
-              <div class="muted" style="font-size:12px">Available: ${r.available} · Threshold: ${r.threshold}</div>
-            </div>
-            ${statusBadge("⚠ Low Stock")}
+        ${ins.topHolders.length ? `
+          <div class="holder-list">
+            ${ins.topHolders.map((h, i) => `
+              <div class="holder-row">
+                <div class="holder-rank">${i + 1}</div>
+                <div class="holder-info">
+                  <div class="holder-name">${escapeHtml(h.name)}</div>
+                  <div class="muted" style="font-size:12px;">${escapeHtml(h.dept)}</div>
+                </div>
+                <div class="holder-count">${h.count} asset${h.count === 1 ? "" : "s"}</div>
+              </div>
+            `).join("")}
           </div>
-        `).join("") : `<p class="muted">All categories are healthily stocked. ✅</p>`}
+        ` : `<p class="muted">No one is currently holding an asset.</p>`}
       </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div><h2>Low Stock Alerts</h2><div class="sub">Available ≤ threshold, across every tracked category</div></div>
+        <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
+      </div>
+      ${lowStockRows.length ? `
+        <div class="alert-grid">
+          ${lowStockRows.map(r => `
+            <div class="alert-chip" title="View in Stock Summary" onclick="goto('stock')">
+              <div class="alert-chip-top">
+                <span class="alert-chip-name">${escapeHtml(r.category)}</span>
+                ${statusBadge("⚠ Low Stock")}
+              </div>
+              <div class="alert-chip-meta">Available <strong>${r.available}</strong> · Threshold <strong>${r.threshold}</strong></div>
+            </div>
+          `).join("")}
+        </div>
+      ` : `<p class="muted">All categories are healthily stocked. ✅</p>`}
     </div>
 
     <p class="footer-note"><span class="live-dot" style="display:inline-block;vertical-align:middle;margin-right:6px;"></span>Speelfinance · Asset Management Tracker — live, synced in real time</p>
