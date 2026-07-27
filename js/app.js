@@ -47,6 +47,61 @@ function logsCollRef() {
   return docRef().collection("logs");
 }
 
+/* ---------------- Per-record collections (concurrency-safe) ---------------- */
+// Employees, Assignments, Inventory, Refill Log entries and Categories each
+// live as their OWN Firestore document inside the office, instead of one
+// shared blob. Two admins editing DIFFERENT records at the same time can
+// no longer overwrite each other's work — only two edits to the exact same
+// record at the exact same instant fall back to last-write-wins, same as
+// any normal database. Dropdown Lists and Stock Summary's manual fields
+// (repair/faulty/lost/scrap/threshold) still live together in the small
+// office "meta" document — they change far less often, by fewer people,
+// so the collision risk there is much lower.
+function employeesColl() { return docRef().collection("employees"); }
+function assignmentsColl() { return docRef().collection("assignments"); }
+function inventoryColl() { return docRef().collection("inventory"); }
+function refillsColl() { return docRef().collection("refills"); }
+function categoriesColl() { return docRef().collection("categories"); }
+function collFor(kind) {
+  return { employees: employeesColl, assignments: assignmentsColl, inventory: inventoryColl, refills: refillsColl, categories: categoriesColl }[kind]();
+}
+
+function saveRecord(kind, record) {
+  if (!fdb || !record || !record.uid) return;
+  collFor(kind).doc(record.uid).set(record).catch(err => {
+    console.error(err);
+    toast("Couldn't save to the cloud — check your connection or admin access", "err");
+  });
+}
+function deleteRecord(kind, uidVal) {
+  if (!fdb || !uidVal) return;
+  collFor(kind).doc(uidVal).delete().catch(err => {
+    console.error(err);
+    toast("Couldn't delete — check your connection or admin access", "err");
+  });
+}
+// Bulk save/delete in one go, chunked under Firestore's 500-writes-per-batch cap.
+async function batchWrite(ops) {
+  for (let i = 0; i < ops.length; i += 400) {
+    const batch = fdb.batch();
+    ops.slice(i, i + 400).forEach(op => {
+      const ref = collFor(op.kind).doc(op.type === "delete" ? op.uid : op.record.uid);
+      if (op.type === "delete") batch.delete(ref);
+      else batch.set(ref, op.record);
+    });
+    await batch.commit();
+  }
+}
+// The small office document — just settings that change rarely and are edited
+// by whoever's in Settings at the time (Dropdown Lists + Stock Summary manual counts).
+function saveMeta() {
+  if (!fdb) return;
+  docRef().set({ lists: DB.lists, stockManual: DB.stockManual }, { merge: true }).catch(err => {
+    console.error(err);
+    toast("Couldn't save to the cloud — check your connection or admin access", "err");
+  });
+}
+
 /* ---------------- Activity log (per-office audit trail) ---------------- */
 // Records who did what, and when, scoped to whichever office is currently open —
 // so if something looks wrong, you can trace it back to a person and a time.
@@ -90,11 +145,34 @@ function emptyOfficeDB() {
   const lists = JSON.parse(JSON.stringify(SEED_DATA.lists || {}));
   return { employees: [], categories: [], lists, assignments: [], refills: [], inventory: [], stockManual: {} };
 }
+async function resetOfficeData(toOriginalSheet) {
+  const deleteOps = [];
+  ["employees", "categories", "assignments", "refills", "inventory"].forEach(kind => {
+    (DB[kind] || []).forEach(r => deleteOps.push({ kind, type: "delete", uid: r.uid }));
+  });
+  if (deleteOps.length) await batchWrite(deleteOps);
+
+  if (toOriginalSheet) {
+    const seed = seedFromSource();
+    await docRef().set({ lists: seed.lists, stockManual: seed.stockManual });
+    await batchWrite([
+      ...seed.employees.map(r => ({ kind: "employees", type: "set", record: r })),
+      ...seed.categories.map(r => ({ kind: "categories", type: "set", record: r })),
+      ...seed.assignments.map(r => ({ kind: "assignments", type: "set", record: r })),
+      ...seed.refills.map(r => ({ kind: "refills", type: "set", record: r })),
+    ]);
+  } else {
+    const empty = emptyOfficeDB();
+    await docRef().set({ lists: empty.lists, stockManual: empty.stockManual });
+  }
+  await loadInitialData();
+}
 async function createOffice(name, city) {
   const id = uniqueOfficeId(slugify(name));
   OFFICES.push({ id, name: name.trim(), city: (city || "").trim() });
   await saveOfficesList();
-  await fdb.collection(FIRESTORE_COLLECTION).doc(id).set(emptyOfficeDB());
+  const empty = emptyOfficeDB();
+  await fdb.collection(FIRESTORE_COLLECTION).doc(id).set({ lists: empty.lists, stockManual: empty.stockManual });
   if (fauth && fauth.currentUser) {
     fdb.collection(FIRESTORE_COLLECTION).doc(id).collection("logs").add({
       ts: new Date().toISOString(),
@@ -108,7 +186,22 @@ async function createOffice(name, city) {
 async function deleteOffice(id) {
   OFFICES = OFFICES.filter(o => o.id !== id);
   await saveOfficesList();
-  await fdb.collection(FIRESTORE_COLLECTION).doc(id).delete().catch(() => {});
+  // Firestore doesn't cascade-delete subcollections when a document is deleted,
+  // so clear each one out first or the records would be orphaned but still stored.
+  const ref = fdb.collection(FIRESTORE_COLLECTION).doc(id);
+  for (const sub of ["employees", "categories", "assignments", "refills", "inventory", "logs"]) {
+    try {
+      const snap = await ref.collection(sub).get();
+      const ids = [];
+      snap.forEach(d => ids.push(d.id));
+      for (let i = 0; i < ids.length; i += 400) {
+        const batch = fdb.batch();
+        ids.slice(i, i + 400).forEach(docId => batch.delete(ref.collection(sub).doc(docId)));
+        await batch.commit();
+      }
+    } catch (err) { console.error(`Couldn't clear ${sub} while deleting office:`, err); }
+  }
+  await ref.delete().catch(() => {});
 }
 async function renameOffice(id, name, city) {
   const o = OFFICES.find(o => o.id === id);
@@ -119,27 +212,66 @@ async function renameOffice(id, name, city) {
 }
 
 /* ---------------- Role management (Admin vs Viewer) ---------------- */
-// Signed in = can view (read-only) by default. Whether someone can also
-// EDIT depends on their role, stored server-side in Firestore at
-// roles/{their email} with a field role: "admin" or "viewer". This is
-// looked up fresh after every sign-in. Actual write protection is enforced
-// server-side by Firestore Security Rules (see firestore.rules) — not just
-// this UI, so a Viewer genuinely cannot write even by inspecting the page.
-let currentUserRole = null; // "admin" | "viewer" | null (not signed in / not yet known)
+// Signed in = can view (read-only) by default. Two levels of edit access:
+//   - Super Admin: roles/{their email} = {role:"admin"} — can edit every
+//     office, plus manage the office directory and grant per-office access.
+//   - Office Admin: assetTracker/{officeId}/access/{their email} = {role:"admin"}
+//     — can edit ONLY that specific office.
+// Both are looked up fresh after sign-in / after opening an office. Actual
+// write protection is enforced server-side by Firestore Security Rules (see
+// firestore.rules) — not just this UI, so a Viewer genuinely cannot write
+// even by inspecting the page.
+let isSuperAdminUser = false;   // global, from roles/{email}
+let currentOfficeRole = null;   // "admin" | "viewer" | null — from this office's access/{email}
+let officeRoleMap = {};         // officeId -> "admin"|"viewer", for badges on the office picker
 
-async function fetchUserRole() {
-  if (!fauth || !fauth.currentUser) { currentUserRole = null; return; }
+async function fetchGlobalRole() {
+  if (!fauth || !fauth.currentUser) { isSuperAdminUser = false; return; }
   try {
     const snap = await fdb.collection("roles").doc(fauth.currentUser.email).get();
-    currentUserRole = (snap.exists && snap.data().role === "admin") ? "admin" : "viewer";
+    isSuperAdminUser = !!(snap.exists && snap.data().role === "admin");
   } catch (err) {
-    console.error("Couldn't look up role, defaulting to Viewer:", err);
-    currentUserRole = "viewer";
+    console.error("Couldn't look up global role, defaulting to non-admin:", err);
+    isSuperAdminUser = false;
+  }
+}
+
+async function fetchOfficeRole() {
+  currentOfficeRole = null;
+  if (!fauth || !fauth.currentUser || !currentOfficeId) return;
+  if (isSuperAdminUser) { currentOfficeRole = "admin"; return; }
+  try {
+    const snap = await docRef().collection("access").doc(fauth.currentUser.email).get();
+    currentOfficeRole = snap.exists ? (snap.data().role === "admin" ? "admin" : "viewer") : "viewer";
+  } catch (err) {
+    console.error("Couldn't look up office role, defaulting to Viewer:", err);
+    currentOfficeRole = "viewer";
+  }
+}
+
+// Every office is still visible to everyone signed in (view access stays simple and
+// open, so nobody loses the ability to browse an office they could see before).
+// This just figures out which offices each person can EDIT, so the office picker
+// can badge each one "Admin" or "Viewer" and the app can enforce it once opened.
+async function fetchAccessibleOffices() {
+  officeRoleMap = {};
+  if (isSuperAdminUser || !fauth || !fauth.currentUser) return;
+  try {
+    const snap = await fdb.collectionGroup("access").where("email", "==", fauth.currentUser.email).get();
+    snap.forEach(doc => {
+      const officeId = doc.ref.parent.parent.id;
+      officeRoleMap[officeId] = doc.data().role === "admin" ? "admin" : "viewer";
+    });
+  } catch (err) {
+    console.error("Couldn't look up accessible offices:", err);
   }
 }
 
 function isAdmin() {
-  return !!(fauth && fauth.currentUser) && currentUserRole === "admin";
+  return !!(fauth && fauth.currentUser) && (isSuperAdminUser || currentOfficeRole === "admin");
+}
+function isSuperAdmin() {
+  return !!(fauth && fauth.currentUser) && isSuperAdminUser;
 }
 function paintRoleUI() {
   const badge = document.getElementById("roleBadge");
@@ -148,7 +280,7 @@ function paintRoleUI() {
   if (!badge || !btn) return;
   const signedIn = !!(fauth && fauth.currentUser);
   const admin = isAdmin();
-  badge.textContent = !signedIn ? "Signed out" : (admin ? "Admin" : "Viewer");
+  badge.textContent = !signedIn ? "Signed out" : (isSuperAdminUser ? "Super Admin" : (admin ? "Admin" : "Viewer"));
   badge.className = "role-badge " + (admin ? "admin" : "viewer");
   btn.textContent = "Sign Out";
   btn.style.display = signedIn ? "" : "none";
@@ -162,7 +294,7 @@ document.getElementById("roleSwitchBtn").addEventListener("click", () => {
 
 function viewerNotice() {
   if (isAdmin()) return "";
-  return `<div class="viewer-note">👁️ You're signed in as a <strong>Viewer</strong> — read-only. Ask an Admin to grant you edit access from Settings → Team Access.</div>`;
+  return `<div class="viewer-note">👁️ You're signed in as a <strong>Viewer</strong> for this office — read-only. Ask an Admin to grant you edit access.</div>`;
 }
 
 /* ---------------- Persistence (Cloud Firestore) ---------------- */
@@ -180,37 +312,107 @@ function seedFromSource() {
 }
 
 async function loadInitialData() {
-  const snap = await docRef().get();
-  if (snap.exists) {
-    DB = snap.data();
-  } else {
-    // First time this Firestore project is used — seed it with the original sheet data.
-    // (Safe to write here because loadInitialData is only ever called after sign-in.)
-    DB = seedFromSource();
-    await docRef().set(DB);
+  const metaSnap = await docRef().get();
+  const meta = metaSnap.exists ? metaSnap.data() : null;
+
+  // One-time migration: older offices stored everything as one big blob
+  // (employees/assignments/etc as arrays directly on this document — the
+  // exact pattern that made concurrent edits unsafe). If we find that shape,
+  // split it into individual per-record documents once, then remove the old
+  // array fields so this path is never taken again for this office.
+  if (meta && Array.isArray(meta.employees)) {
+    if (isAdmin()) {
+      await migrateLegacyBlobToRecords(meta);
+      return loadInitialData();
+    }
+    // Not an admin for this office — can't write the conversion. Load the
+    // legacy shape directly (read access is open to anyone signed in) so
+    // Viewers still see the office fine. An Admin opening it later will
+    // complete the one-time conversion automatically.
+    DB = {
+      lists: meta.lists || JSON.parse(JSON.stringify(SEED_DATA.lists || {})),
+      stockManual: meta.stockManual || {},
+      employees: meta.employees || [], categories: meta.categories || [],
+      assignments: meta.assignments || [], refills: meta.refills || [], inventory: meta.inventory || [],
+    };
+    return;
   }
-  if (!DB.inventory) DB.inventory = [];
+
+  if (!meta) {
+    if (currentOfficeId === DEFAULT_OFFICE_ID) {
+      // Original single-office data, from before Firestore was even used —
+      // seed with the original uploaded sheet contents, one document per record.
+      const seed = seedFromSource();
+      await docRef().set({ lists: seed.lists, stockManual: seed.stockManual });
+      await batchWrite([
+        ...seed.employees.map(r => ({ kind: "employees", type: "set", record: r })),
+        ...seed.categories.map(r => ({ kind: "categories", type: "set", record: r })),
+        ...seed.assignments.map(r => ({ kind: "assignments", type: "set", record: r })),
+        ...seed.refills.map(r => ({ kind: "refills", type: "set", record: r })),
+      ]);
+    } else {
+      const empty = emptyOfficeDB();
+      await docRef().set({ lists: empty.lists, stockManual: empty.stockManual });
+    }
+    return loadInitialData();
+  }
+
+  DB = {
+    lists: meta.lists || JSON.parse(JSON.stringify(SEED_DATA.lists || {})),
+    stockManual: meta.stockManual || {},
+    employees: [], categories: [], assignments: [], refills: [], inventory: [],
+  };
+  const [empSnap, catSnap, asgSnap, refSnap, invSnap] = await Promise.all([
+    employeesColl().get(), categoriesColl().get(), assignmentsColl().get(), refillsColl().get(), inventoryColl().get(),
+  ]);
+  empSnap.forEach(d => DB.employees.push(d.data()));
+  catSnap.forEach(d => DB.categories.push(d.data()));
+  asgSnap.forEach(d => DB.assignments.push(d.data()));
+  refSnap.forEach(d => DB.refills.push(d.data()));
+  invSnap.forEach(d => DB.inventory.push(d.data()));
 }
 
-function saveDB() {
-  if (!fdb) return;
-  docRef().set(DB).catch(err => {
-    console.error(err);
-    toast("Couldn't save to the cloud — check your connection or admin sign-in", "err");
-  });
+async function migrateLegacyBlobToRecords(meta) {
+  const ops = [];
+  (meta.employees || []).forEach(r => ops.push({ kind: "employees", type: "set", record: { ...r, uid: r.uid || uid() } }));
+  (meta.categories || []).forEach(r => ops.push({ kind: "categories", type: "set", record: { ...r, uid: r.uid || uid() } }));
+  (meta.assignments || []).forEach(r => ops.push({ kind: "assignments", type: "set", record: { ...r, uid: r.uid || uid() } }));
+  (meta.refills || []).forEach(r => ops.push({ kind: "refills", type: "set", record: { ...r, uid: r.uid || uid() } }));
+  (meta.inventory || []).forEach(r => ops.push({ kind: "inventory", type: "set", record: { ...r, uid: r.uid || uid() } }));
+  if (ops.length) await batchWrite(ops);
+  await docRef().set({
+    lists: meta.lists || {},
+    stockManual: meta.stockManual || {},
+    employees: firebase.firestore.FieldValue.delete(),
+    categories: firebase.firestore.FieldValue.delete(),
+    assignments: firebase.firestore.FieldValue.delete(),
+    refills: firebase.firestore.FieldValue.delete(),
+    inventory: firebase.firestore.FieldValue.delete(),
+  }, { merge: true });
 }
 
-let unsubscribeSnapshot = null;
+let unsubscribeFns = [];
 function attachRealtimeListener() {
-  unsubscribeSnapshot = docRef().onSnapshot(snap => {
+  const colls = { employees: employeesColl, categories: categoriesColl, assignments: assignmentsColl, refills: refillsColl, inventory: inventoryColl };
+  Object.entries(colls).forEach(([key, fn]) => {
+    unsubscribeFns.push(fn().onSnapshot(snap => {
+      const list = [];
+      snap.forEach(d => list.push(d.data()));
+      DB[key] = list;
+      goto(currentPage); // keep every open browser (signed-in users) in sync live
+    }, err => console.error(`Firestore listener error (${key}):`, err)));
+  });
+  unsubscribeFns.push(docRef().onSnapshot(snap => {
     if (!snap.exists) return;
-    DB = snap.data();
-    if (!DB.inventory) DB.inventory = [];
-    goto(currentPage); // keep every open browser (signed-in users) in sync live
-  }, err => console.error("Firestore listener error:", err));
+    const data = snap.data();
+    if (data.lists) DB.lists = data.lists;
+    if (data.stockManual) DB.stockManual = data.stockManual;
+    goto(currentPage);
+  }, err => console.error("Firestore listener error (meta):", err)));
 }
 function detachRealtimeListener() {
-  if (unsubscribeSnapshot) { unsubscribeSnapshot(); unsubscribeSnapshot = null; }
+  unsubscribeFns.forEach(fn => fn());
+  unsubscribeFns = [];
 }
 
 function uid() {
@@ -292,6 +494,11 @@ document.getElementById("modalOverlay").addEventListener("click", (e) => {
 function requireAdminOrWarn() {
   if (isAdmin()) return true;
   toast("Only Admins can do this — you're signed in as a Viewer", "err");
+  return false;
+}
+function requireSuperAdminOrWarn() {
+  if (isSuperAdmin()) return true;
+  toast("Only Super Admins can do this", "err");
   return false;
 }
 
@@ -381,6 +588,7 @@ const PAGES = {
   refill: { title: "Stock Refill Log", render: renderRefill },
   categories: { title: "Asset Categories", render: renderCategories },
   activityLog: { title: "Activity Log", render: renderActivityLog },
+  reports: { title: "Reports", render: renderReports },
   settings: { title: "Settings", render: renderSettings },
 };
 
@@ -426,18 +634,24 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
     const pwInp = document.getElementById("resetConfirmPw");
     pwInp.focus();
     document.getElementById("cancelReset").onclick = closeModal;
-    const attempt = () => {
+    const attempt = async () => {
       if (pwInp.value !== RESET_CONFIRM_PASSWORD) {
         document.getElementById("resetPwError").style.display = "block";
         pwInp.focus();
         return;
       }
-      DB = isDefaultOffice ? seedFromSource() : emptyOfficeDB();
-      saveDB();
-      logAction("Reset office data", `Reset all data for "${officeName}"`);
-      closeModal();
-      toast("Data reset for this office");
-      goto(currentPage);
+      document.getElementById("confirmReset").disabled = true;
+      try {
+        await resetOfficeData(isDefaultOffice);
+        logAction("Reset office data", `Reset all data for "${officeName}"`);
+        closeModal();
+        toast("Data reset for this office");
+        goto(currentPage);
+      } catch (err) {
+        console.error(err);
+        toast("Reset failed — check your connection and try again", "err");
+        document.getElementById("confirmReset").disabled = false;
+      }
     };
     document.getElementById("confirmReset").onclick = attempt;
     pwInp.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); });
@@ -445,124 +659,10 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
 });
 
 /* =========================================================
-   DASHBOARD — INSIGHTS ENGINE
-   Everything below computeDashboard() derives extra, read-only
-   analytics purely from data already in DB — no new storage,
-   no schema changes. Safe to recompute on every render.
+   DASHBOARD
    ========================================================= */
-const DASH_PALETTE = ["var(--primary)", "var(--teal)", "var(--amber)", "var(--purple)", "var(--blue)", "var(--red)", "var(--grey)", "#2fbf8f"];
-
-function computeDashboardInsights() {
-  const now = new Date(); now.setHours(0, 0, 0, 0);
-  const s = computeDashboard();
-
-  /* Fleet allocation — where every unit of stock currently sits */
-  const fleetSegments = [
-    { label: "Assigned", value: s.assigned, color: "var(--blue)" },
-    { label: "Available", value: s.available, color: "var(--teal)" },
-    { label: "Under Repair", value: s.underRepair, color: "var(--amber)" },
-    { label: "Faulty", value: s.faulty, color: "var(--red)" },
-    { label: "Lost", value: s.lost, color: "var(--grey)" },
-    { label: "Scrap", value: s.scrap, color: "var(--purple)" },
-  ].filter(seg => seg.value > 0);
-
-  /* Assignment status split (Assigned / Returned / Overdue / custom) */
-  const statusColors = { Assigned: "var(--blue)", Returned: "var(--teal)", Overdue: "var(--red)" };
-  const statusCounts = {};
-  DB.assignments.forEach(a => { const k = a.status || "Unknown"; statusCounts[k] = (statusCounts[k] || 0) + 1; });
-  const statusSegments = Object.entries(statusCounts)
-    .sort((a, b) => b[1] - a[1])
-    .map(([label, value], i) => ({ label, value, color: statusColors[label] || DASH_PALETTE[i % DASH_PALETTE.length] }));
-
-  /* Stock split by category (Total Stock, from Stock Summary logic) */
-  const stockRows = computeStockSummary();
-  const categorySegments = [...stockRows]
-    .sort((a, b) => b.total - a.total)
-    .slice(0, 8)
-    .map((r, i) => ({ label: r.category, value: r.total, color: DASH_PALETTE[i % DASH_PALETTE.length] }));
-
-  /* Department leaderboard — currently-held (not Returned) assets per dept */
-  const deptCounts = {};
-  DB.assignments.forEach(a => {
-    if ((a.status || "").toLowerCase() === "returned") return;
-    const d = a.department || "Unassigned";
-    deptCounts[d] = (deptCounts[d] || 0) + 1;
-  });
-  const deptLeaderboard = Object.entries(deptCounts).sort((a, b) => b[1] - a[1]).slice(0, 6)
-    .map(([label, value]) => ({ label, value }));
-
-  /* Top asset holders — people currently holding the most assets */
-  const holderMap = {};
-  DB.assignments.forEach(a => {
-    if ((a.status || "").toLowerCase() === "returned") return;
-    const key = a.employeeName || "Unknown";
-    if (!holderMap[key]) holderMap[key] = { name: key, dept: a.department || "—", count: 0 };
-    holderMap[key].count++;
-  });
-  const topHolders = Object.values(holderMap).sort((a, b) => b.count - a.count).slice(0, 5);
-
-  /* Headcount + activity context */
-  const employeesCount = DB.employees.length;
-  const departmentsCount = new Set(DB.employees.map(e => e.department).filter(Boolean)).size;
-  const weekAgo = new Date(now); weekAgo.setDate(weekAgo.getDate() - 7);
-  const newThisWeek = DB.assignments.filter(a => a.date && new Date(a.date) >= weekAgo).length;
-
-  // Coverage: what share of the workforce is currently holding at least one asset
-  const holdersCount = Object.keys(holderMap).length;
-  const coverageRate = employeesCount > 0 ? Math.round((holdersCount / employeesCount) * 100) : 0;
-
-  // Turnover: what share of everything ever assigned has already been returned
-  const returnedCount = DB.assignments.filter(a => (a.status || "").toLowerCase() === "returned").length;
-  const turnoverRate = DB.assignments.length > 0 ? Math.round((returnedCount / DB.assignments.length) * 100) : 0;
-
-  const utilizationRate = s.total > 0 ? Math.round((s.assigned / s.total) * 100) : 0;
-
-  return {
-    fleetSegments, statusSegments, categorySegments, deptLeaderboard, topHolders,
-    employeesCount, departmentsCount, newThisWeek, coverageRate, turnoverRate, utilizationRate,
-  };
-}
-
-/* ---- Tiny inline chart builders (no external libraries) ---- */
-function insightBarList(items, opts = {}) {
-  if (!items.length) return `<p class="muted" style="margin:4px 0 0;">${opts.empty || "Nothing to show yet."}</p>`;
-  const max = Math.max(1, ...items.map(i => i.value));
-  return `<div class="ibar-list">${items.map((i, idx) => `
-    <div class="ibar-row">
-      <div class="ibar-label" title="${escapeHtml(i.label)}">${escapeHtml(i.label)}</div>
-      <div class="ibar-track"><div class="ibar-fill" style="width:${Math.max(4, (i.value / max) * 100)}%; background:${i.color || DASH_PALETTE[idx % DASH_PALETTE.length]}"></div></div>
-      <div class="ibar-value">${i.value}</div>
-    </div>`).join("")}</div>`;
-}
-
-function donutChart(segments, opts = {}) {
-  const total = segments.reduce((s, x) => s + x.value, 0);
-  if (!total) return `<p class="muted" style="margin:4px 0 0;">${opts.empty || "No data yet."}</p>`;
-  let acc = 0;
-  const stops = segments.map(seg => {
-    const start = (acc / total) * 360; acc += seg.value; const end = (acc / total) * 360;
-    return `${seg.color} ${start}deg ${end}deg`;
-  }).join(", ");
-  return `
-    <div class="donut-wrap">
-      <div class="donut" style="background: conic-gradient(${stops});">
-        <div class="donut-hole"><div class="donut-total">${total}</div><div class="donut-sub">${escapeHtml(opts.centerLabel || "Total")}</div></div>
-      </div>
-      <div class="donut-legend">
-        ${segments.map(seg => `
-          <div class="legend-item">
-            <span class="legend-dot" style="background:${seg.color}"></span>
-            <span class="legend-label">${escapeHtml(seg.label)}</span>
-            <span class="legend-pct">${Math.round((seg.value / total) * 100)}%</span>
-            <strong>${seg.value}</strong>
-          </div>`).join("")}
-      </div>
-    </div>`;
-}
-
 function renderDashboard() {
   const s = computeDashboard();
-  const ins = computeDashboardInsights();
   const content = document.getElementById("content");
   const admin = isAdmin();
 
@@ -577,14 +677,6 @@ function renderDashboard() {
     { label: "Faulty", value: s.faulty, icon: "🔴", cls: "icon-red", foot: "Needs attention", goto: "stock" },
     { label: "Lost", value: s.lost, icon: "✖", cls: "icon-grey", foot: "Unaccounted", goto: "stock" },
     { label: "Scrap", value: s.scrap, icon: "⚫", cls: "icon-grey", foot: "Decommissioned", goto: "stock" },
-  ];
-
-  // Second, smaller strip of derived metrics — ratios the raw counts above don't show on their own.
-  const miniCards = [
-    { label: "Utilization", value: `${ins.utilizationRate}%`, icon: "📈", cls: "icon-indigo", accent: "var(--primary)", foot: "Assigned ÷ total stock", goto: "stock" },
-    { label: "Workforce Coverage", value: `${ins.coverageRate}%`, icon: "🧑‍💼", cls: "icon-purple", accent: "var(--purple)", foot: `${ins.employeesCount} employees, ${ins.departmentsCount} depts`, goto: "employees" },
-    { label: "New This Week", value: ins.newThisWeek, icon: "🆕", cls: "icon-teal", accent: "var(--teal)", foot: "Assignments logged", goto: "assignment" },
-    { label: "Turnover Rate", value: `${ins.turnoverRate}%`, icon: "🔁", cls: "icon-amber", accent: "var(--amber)", foot: "Returned ÷ all assignments", goto: "assignment" },
   ];
 
   const recentAssignments = sortAssignmentsNewestFirst(DB.assignments).slice(0, 6);
@@ -604,7 +696,6 @@ function renderDashboard() {
         </div>
       </div>
     ` : ""}
-
     <div class="stat-grid">
       ${cards.map(c => `
         <div class="stat-card" role="button" tabindex="0" title="View in ${c.goto === "assignment" ? "Asset Assignment" : c.goto === "categories" ? "Asset Categories" : "Stock Summary"}"
@@ -621,58 +712,6 @@ function renderDashboard() {
       `).join("")}
     </div>
 
-    <div class="section-eyebrow">Performance Ratios</div>
-    <div class="mini-stat-grid">
-      ${miniCards.map(c => `
-        <div class="mini-stat-card" role="button" tabindex="0" style="--accent:${c.accent}" onclick="goto('${c.goto}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
-          <div class="mini-stat-icon ${c.cls}">${c.icon}</div>
-          <div>
-            <div class="mini-stat-value">${c.value}</div>
-            <div class="mini-stat-label">${c.label}</div>
-            <div class="mini-stat-foot">${c.foot}</div>
-          </div>
-        </div>
-      `).join("")}
-    </div>
-
-    <div class="section-eyebrow">Fleet Breakdown</div>
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-header">
-          <div><h2>Fleet Allocation</h2><div class="sub">Every unit of stock, by where it currently sits</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
-        </div>
-        ${donutChart(ins.fleetSegments, { centerLabel: "Total Stock", empty: "Log a refill to see your fleet split here." })}
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div><h2>Assignment Status</h2><div class="sub">Across all logged assignments</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">View all →</button>
-        </div>
-        ${donutChart(ins.statusSegments, { centerLabel: "Assignments", empty: "No assignments logged yet." })}
-      </div>
-    </div>
-
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-header">
-          <div><h2>Stock by Category</h2><div class="sub">Total units logged, largest first</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
-        </div>
-        ${insightBarList(ins.categorySegments, { empty: "Log a refill to see category totals here." })}
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div><h2>Department Leaderboard</h2><div class="sub">Assets currently held, by department</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">Assignments →</button>
-        </div>
-        ${insightBarList(ins.deptLeaderboard, { color: "var(--purple)", empty: "No active assignments to break down yet." })}
-      </div>
-    </div>
-
-    <div class="section-eyebrow">Activity &amp; Alerts</div>
     <div class="grid-2">
       <div class="card">
         <div class="card-header">
@@ -698,44 +737,19 @@ function renderDashboard() {
 
       <div class="card">
         <div class="card-header">
-          <div><h2>Top Asset Holders</h2><div class="sub">Most assets currently held, per person</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('empHistory')">Employee history →</button>
+          <div><h2>Low Stock Alerts</h2><div class="sub">Available ≤ threshold</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
         </div>
-        ${ins.topHolders.length ? `
-          <div class="holder-list">
-            ${ins.topHolders.map((h, i) => `
-              <div class="holder-row">
-                <div class="holder-rank">${i + 1}</div>
-                <div class="holder-info">
-                  <div class="holder-name">${escapeHtml(h.name)}</div>
-                  <div class="muted" style="font-size:12px;">${escapeHtml(h.dept)}</div>
-                </div>
-                <div class="holder-count">${h.count} asset${h.count === 1 ? "" : "s"}</div>
-              </div>
-            `).join("")}
-          </div>
-        ` : `<p class="muted">No one is currently holding an asset.</p>`}
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-header">
-        <div><h2>Low Stock Alerts</h2><div class="sub">Available ≤ threshold, across every tracked category</div></div>
-        <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
-      </div>
-      ${lowStockRows.length ? `
-        <div class="alert-grid">
-          ${lowStockRows.map(r => `
-            <div class="alert-chip" title="View in Stock Summary" onclick="goto('stock')">
-              <div class="alert-chip-top">
-                <span class="alert-chip-name">${escapeHtml(r.category)}</span>
-                ${statusBadge("⚠ Low Stock")}
-              </div>
-              <div class="alert-chip-meta">Available <strong>${r.available}</strong> · Threshold <strong>${r.threshold}</strong></div>
+        ${lowStockRows.length ? lowStockRows.map(r => `
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border);cursor:pointer" title="View in Stock Summary" onclick="goto('stock')">
+            <div>
+              <div style="font-weight:600">${escapeHtml(r.category)}</div>
+              <div class="muted" style="font-size:12px">Available: ${r.available} · Threshold: ${r.threshold}</div>
             </div>
-          `).join("")}
-        </div>
-      ` : `<p class="muted">All categories are healthily stocked. ✅</p>`}
+            ${statusBadge("⚠ Low Stock")}
+          </div>
+        `).join("") : `<p class="muted">All categories are healthily stocked. ✅</p>`}
+      </div>
     </div>
 
     <p class="footer-note"><span class="live-dot" style="display:inline-block;vertical-align:middle;margin-right:6px;"></span>Speelfinance · Asset Management Tracker — live, synced in real time</p>
@@ -871,10 +885,12 @@ function wireAssignBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || assignSelected.size === 0) return;
     confirmBulkDelete(assignSelected.size, "assignments", () => {
-      const n = assignSelected.size;
+      const idsToDelete = [...assignSelected];
+      const n = idsToDelete.length;
       DB.assignments = DB.assignments.filter(a => !assignSelected.has(a.uid));
       assignSelected = new Set();
-      saveDB(); logAction("Bulk deleted assignments", `Deleted ${n} selected assignment record(s)`); toast("Selected assignments deleted"); paintAssignTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "assignments", type: "delete", uid: u })));
+      logAction("Bulk deleted assignments", `Deleted ${n} selected assignment record(s)`); toast("Selected assignments deleted"); paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
     });
   };
@@ -884,11 +900,13 @@ function wireAssignBulk(rows) {
     delAll.onclick = () => {
       if (!requireAdminOrWarn()) return;
       confirmBulkDelete(rows.length, "assignments (matching your current search/filters)", () => {
-        const idsToDelete = new Set(rows.map(r => r.uid));
-        const n = idsToDelete.size;
-        DB.assignments = DB.assignments.filter(a => !idsToDelete.has(a.uid));
+        const idsToDelete = rows.map(r => r.uid);
+        const idSet = new Set(idsToDelete);
+        const n = idsToDelete.length;
+        DB.assignments = DB.assignments.filter(a => !idSet.has(a.uid));
         assignSelected = new Set();
-        saveDB(); logAction("Bulk deleted assignments", `Deleted ${n} assignment record(s) matching current filters`); toast("All matching assignments deleted"); paintAssignTable();
+        batchWrite(idsToDelete.map(u => ({ kind: "assignments", type: "delete", uid: u })));
+        logAction("Bulk deleted assignments", `Deleted ${n} assignment record(s) matching current filters`); toast("All matching assignments deleted"); paintAssignTable();
         if (currentPage === "dashboard") renderDashboard();
       });
     };
@@ -1007,23 +1025,27 @@ function openAssignForm(uidVal) {
         remarks: document.getElementById("f_remarks").value.trim(),
       };
 
+      let newRecords = [];
       if (editing) {
         const rec = { ...common, assetName: document.getElementById("f_asset").value };
         Object.assign(editing, rec);
+        saveRecord("assignments", editing);
         logAction("Edited assignment", `${rec.assetName} → ${empName}`);
         toast("Assignment updated");
       } else {
         const selectedAssets = [...document.querySelectorAll(".f_asset_multi:checked")].map(cb => cb.value);
         if (!selectedAssets.length) { toast("Select at least one asset", "err"); return; }
         selectedAssets.forEach(assetName => {
-          DB.assignments.push({ uid: uid(), id: DB.assignments.length + 1, createdAt: nowISO(), ...common, assetName });
+          const newRec = { uid: uid(), id: DB.assignments.length + 1, createdAt: nowISO(), ...common, assetName };
+          DB.assignments.push(newRec);
+          newRecords.push(newRec);
         });
+        newRecords.forEach(r => saveRecord("assignments", r));
         logAction("Added assignment(s)", `${selectedAssets.join(", ")} → ${empName}`);
         toast(selectedAssets.length > 1
           ? `${selectedAssets.length} assignments added for ${empName}`
           : "Assignment added");
       }
-      saveDB();
       closeModal();
       paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
@@ -1045,7 +1067,7 @@ function deleteAssignment(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.assignments = DB.assignments.filter(a => a.uid !== uidVal);
       assignSelected.delete(uidVal);
-      saveDB(); logAction("Deleted assignment", rec ? `${rec.assetName} — ${rec.employeeName}` : uidVal); closeModal(); toast("Assignment deleted"); paintAssignTable();
+      deleteRecord("assignments", uidVal); logAction("Deleted assignment", rec ? `${rec.assetName} — ${rec.employeeName}` : uidVal); closeModal(); toast("Assignment deleted"); paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
     };
   });
@@ -1147,21 +1169,25 @@ function wireInvBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || invSelected.size === 0) return;
     confirmBulkDelete(invSelected.size, "assets", () => {
-      const n = invSelected.size;
+      const idsToDelete = [...invSelected];
+      const n = idsToDelete.length;
       DB.inventory = DB.inventory.filter(r => !invSelected.has(r.uid));
       invSelected = new Set();
-      saveDB(); logAction("Bulk deleted inventory assets", `Deleted ${n} selected asset(s)`); toast("Selected assets deleted"); paintInvTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "inventory", type: "delete", uid: u })));
+      logAction("Bulk deleted inventory assets", `Deleted ${n} selected asset(s)`); toast("Selected assets deleted"); paintInvTable();
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "assets (matching current search)", () => {
-      const idsToDelete = new Set(rows.map(r => r.uid));
-      const n = idsToDelete.size;
-      DB.inventory = DB.inventory.filter(r => !idsToDelete.has(r.uid));
+      const idsToDelete = rows.map(r => r.uid);
+      const idSet = new Set(idsToDelete);
+      const n = idsToDelete.length;
+      DB.inventory = DB.inventory.filter(r => !idSet.has(r.uid));
       invSelected = new Set();
-      saveDB(); logAction("Bulk deleted inventory assets", `Deleted ${n} asset(s) matching current filters`); toast("All matching assets deleted"); paintInvTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "inventory", type: "delete", uid: u })));
+      logAction("Bulk deleted inventory assets", `Deleted ${n} asset(s) matching current filters`); toast("All matching assets deleted"); paintInvTable();
     });
   };
 }
@@ -1241,9 +1267,9 @@ function openInvForm(uidVal) {
         condition: document.getElementById("f_cond").value,
         remarks: document.getElementById("f_remarks").value.trim(),
       };
-      if (editing) { Object.assign(editing, rec); logAction("Edited inventory asset", `${rec.assetId} — ${rec.assetName}`); toast("Asset updated"); }
-      else { DB.inventory.push({ uid: uid(), ...rec }); logAction("Added inventory asset", `${rec.assetId} — ${rec.assetName}`); toast("Asset added"); }
-      saveDB(); closeModal(); paintInvTable();
+      if (editing) { Object.assign(editing, rec); saveRecord("inventory", editing); logAction("Edited inventory asset", `${rec.assetId} — ${rec.assetName}`); toast("Asset updated"); }
+      else { const newRec = { uid: uid(), ...rec }; DB.inventory.push(newRec); saveRecord("inventory", newRec); logAction("Added inventory asset", `${rec.assetId} — ${rec.assetName}`); toast("Asset added"); }
+      closeModal(); paintInvTable();
     };
   });
 }
@@ -1261,7 +1287,7 @@ function deleteInv(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.inventory = DB.inventory.filter(r => r.uid !== uidVal);
       invSelected.delete(uidVal);
-      saveDB(); logAction("Deleted inventory asset", rec ? `${rec.assetId} — ${rec.assetName}` : uidVal); closeModal(); toast("Asset deleted"); paintInvTable();
+      deleteRecord("inventory", uidVal); logAction("Deleted inventory asset", rec ? `${rec.assetId} — ${rec.assetName}` : uidVal); closeModal(); toast("Asset deleted"); paintInvTable();
     };
   });
 }
@@ -1367,21 +1393,25 @@ function wireEmpBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || empSelected.size === 0) return;
     confirmBulkDelete(empSelected.size, "employees", () => {
-      const n = empSelected.size;
+      const idsToDelete = [...empSelected];
+      const n = idsToDelete.length;
       DB.employees = DB.employees.filter(e => !empSelected.has(e.uid));
       empSelected = new Set();
-      saveDB(); logAction("Bulk deleted employees", `Deleted ${n} selected employee(s)`); toast("Selected employees deleted"); paintEmpTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "employees", type: "delete", uid: u })));
+      logAction("Bulk deleted employees", `Deleted ${n} selected employee(s)`); toast("Selected employees deleted"); paintEmpTable();
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "employees (matching current search)", () => {
-      const idsToDelete = new Set(rows.map(r => r.uid));
-      const n = idsToDelete.size;
-      DB.employees = DB.employees.filter(e => !idsToDelete.has(e.uid));
+      const idsToDelete = rows.map(r => r.uid);
+      const idSet = new Set(idsToDelete);
+      const n = idsToDelete.length;
+      DB.employees = DB.employees.filter(e => !idSet.has(e.uid));
       empSelected = new Set();
-      saveDB(); logAction("Bulk deleted employees", `Deleted ${n} employee(s) matching current filters`); toast("All matching employees deleted"); paintEmpTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "employees", type: "delete", uid: u })));
+      logAction("Bulk deleted employees", `Deleted ${n} employee(s) matching current filters`); toast("All matching employees deleted"); paintEmpTable();
     });
   };
 }
@@ -1418,9 +1448,9 @@ function openEmpForm(uidVal) {
         phone: document.getElementById("f_phone").value.trim(),
         email: document.getElementById("f_email").value.trim(),
       };
-      if (editing) { Object.assign(editing, rec); logAction("Edited employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee updated"); }
-      else { DB.employees.push({ uid: uid(), ...rec }); logAction("Added employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee added"); }
-      saveDB(); closeModal(); paintEmpTable();
+      if (editing) { Object.assign(editing, rec); saveRecord("employees", editing); logAction("Edited employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee updated"); }
+      else { const newRec = { uid: uid(), ...rec }; DB.employees.push(newRec); saveRecord("employees", newRec); logAction("Added employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee added"); }
+      closeModal(); paintEmpTable();
     };
   });
 }
@@ -1438,7 +1468,7 @@ function deleteEmp(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.employees = DB.employees.filter(e => e.uid !== uidVal);
       empSelected.delete(uidVal);
-      saveDB(); logAction("Removed employee", rec ? rec.name : uidVal); closeModal(); toast("Employee removed"); paintEmpTable();
+      deleteRecord("employees", uidVal); logAction("Removed employee", rec ? rec.name : uidVal); closeModal(); toast("Employee removed"); paintEmpTable();
     };
   });
 }
@@ -1494,6 +1524,7 @@ function importEmployeeRows(rawRows) {
   const skipped = rawRows.length - mapped.length;
 
   let added = 0, updated = 0;
+  const ops = [];
   mapped.forEach(rec => {
     let existing = null;
     if (rec.id) existing = DB.employees.find(e => e.id && e.id.toLowerCase() === rec.id.toLowerCase());
@@ -1506,14 +1537,17 @@ function importEmployeeRows(rawRows) {
         email: rec.email || existing.email,
         phone: rec.phone || existing.phone,
       });
+      ops.push({ kind: "employees", type: "set", record: existing });
       updated++;
     } else {
-      DB.employees.push({ uid: uid(), id: rec.id || "", name: rec.name, department: rec.department || "", email: rec.email || "", phone: rec.phone || "" });
+      const newRec = { uid: uid(), id: rec.id || "", name: rec.name, department: rec.department || "", email: rec.email || "", phone: rec.phone || "" };
+      DB.employees.push(newRec);
+      ops.push({ kind: "employees", type: "set", record: newRec });
       added++;
     }
   });
 
-  saveDB();
+  batchWrite(ops);
   logAction("Imported employees", `${added} added, ${updated} updated, ${skipped} skipped (from uploaded file)`);
   openModal("Import complete", `
     <p style="margin-top:0">✅ <strong>${added}</strong> new employee${added === 1 ? "" : "s"} added.</p>
@@ -1695,7 +1729,7 @@ function renderStock() {
         const cat = inp.dataset.cat, field = inp.dataset.field;
         if (!DB.stockManual[cat]) DB.stockManual[cat] = { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
         DB.stockManual[cat][field] = Number(inp.value) || 0;
-        saveDB();
+        saveMeta();
         logAction("Edited stock summary", `${cat} — ${field} set to ${DB.stockManual[cat][field]}`);
         renderStock();
       };
@@ -1779,20 +1813,24 @@ function wireRefillBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || refillSelected.size === 0) return;
     confirmBulkDelete(refillSelected.size, "refill entries", () => {
-      const n = refillSelected.size;
+      const idsToDelete = [...refillSelected];
+      const n = idsToDelete.length;
       DB.refills = DB.refills.filter(r => !refillSelected.has(r.uid));
       refillSelected = new Set();
-      saveDB(); logAction("Bulk deleted refill entries", `Deleted ${n} selected entr${n === 1 ? "y" : "ies"}`); toast("Selected entries deleted"); paintRefillTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "refills", type: "delete", uid: u })));
+      logAction("Bulk deleted refill entries", `Deleted ${n} selected entr${n === 1 ? "y" : "ies"}`); toast("Selected entries deleted"); paintRefillTable();
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "refill entries", () => {
-      const n = DB.refills.length;
+      const idsToDelete = DB.refills.map(r => r.uid);
+      const n = idsToDelete.length;
       DB.refills = [];
       refillSelected = new Set();
-      saveDB(); logAction("Bulk deleted refill entries", `Deleted all ${n} refill log entries`); toast("All refill entries deleted"); paintRefillTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "refills", type: "delete", uid: u })));
+      logAction("Bulk deleted refill entries", `Deleted all ${n} refill log entries`); toast("All refill entries deleted"); paintRefillTable();
     });
   };
 }
@@ -1820,15 +1858,16 @@ function openRefillForm() {
       const qty = Number(document.getElementById("f_qty").value);
       if (!qty || qty <= 0) { toast("Enter a valid quantity", "err"); return; }
       const category = document.getElementById("f_cat").value;
-      DB.refills.push({
+      const newRec = {
         uid: uid(), id: DB.refills.length + 1,
         date: document.getElementById("f_date").value,
         category,
         quantity: qty,
         addedBy: document.getElementById("f_by").value.trim(),
         source: document.getElementById("f_source").value.trim(),
-      });
-      saveDB(); logAction("Logged stock refill", `+${qty} ${category}`); closeModal(); toast("Refill logged"); paintRefillTable();
+      };
+      DB.refills.push(newRec);
+      saveRecord("refills", newRec); logAction("Logged stock refill", `+${qty} ${category}`); closeModal(); toast("Refill logged"); paintRefillTable();
     };
   });
 }
@@ -1846,7 +1885,7 @@ function deleteRefill(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.refills = DB.refills.filter(r => r.uid !== uidVal);
       refillSelected.delete(uidVal);
-      saveDB(); logAction("Deleted refill entry", rec ? `-${rec.quantity} ${rec.category}` : uidVal); closeModal(); toast("Refill entry deleted"); paintRefillTable();
+      deleteRecord("refills", uidVal); logAction("Deleted refill entry", rec ? `-${rec.quantity} ${rec.category}` : uidVal); closeModal(); toast("Refill entry deleted"); paintRefillTable();
     };
   });
 }
@@ -1925,20 +1964,24 @@ function wireCatBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireAdminOrWarn() || catSelected.size === 0) return;
     confirmBulkDelete(catSelected.size, "categories", () => {
-      const n = catSelected.size;
+      const idsToDelete = [...catSelected];
+      const n = idsToDelete.length;
       DB.categories = DB.categories.filter(c => !catSelected.has(c.uid));
       catSelected = new Set();
-      saveDB(); logAction("Bulk deleted categories", `Deleted ${n} selected categor${n === 1 ? "y" : "ies"}`); toast("Selected categories deleted"); paintCatTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "categories", type: "delete", uid: u })));
+      logAction("Bulk deleted categories", `Deleted ${n} selected categor${n === 1 ? "y" : "ies"}`); toast("Selected categories deleted"); paintCatTable();
     });
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
     if (!requireAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "categories", () => {
-      const n = DB.categories.length;
+      const idsToDelete = DB.categories.map(c => c.uid);
+      const n = idsToDelete.length;
       DB.categories = [];
       catSelected = new Set();
-      saveDB(); logAction("Bulk deleted categories", `Deleted all ${n} categories`); toast("All categories deleted"); paintCatTable();
+      batchWrite(idsToDelete.map(u => ({ kind: "categories", type: "delete", uid: u })));
+      logAction("Bulk deleted categories", `Deleted all ${n} categories`); toast("All categories deleted"); paintCatTable();
     });
   };
 }
@@ -1962,20 +2005,30 @@ function openCatForm(uidVal) {
         const oldName = editing.name;
         editing.name = name;
         editing.notes = document.getElementById("f_notes").value.trim();
+        const ops = [{ kind: "categories", type: "set", record: editing }];
         if (oldName !== name) {
-          DB.assignments.forEach(a => { if (a.assetName === oldName) a.assetName = name; });
-          DB.refills.forEach(r => { if (r.category === oldName) r.category = name; });
+          DB.assignments.forEach(a => {
+            if (a.assetName === oldName) { a.assetName = name; ops.push({ kind: "assignments", type: "set", record: a }); }
+          });
+          DB.refills.forEach(r => {
+            if (r.category === oldName) { r.category = name; ops.push({ kind: "refills", type: "set", record: r }); }
+          });
           if (DB.stockManual[oldName]) { DB.stockManual[name] = DB.stockManual[oldName]; delete DB.stockManual[oldName]; }
         }
+        batchWrite(ops);
+        saveMeta();
         logAction("Edited category", oldName !== name ? `Renamed "${oldName}" → "${name}"` : name);
         toast("Category updated");
       } else {
-        DB.categories.push({ uid: uid(), name, notes: document.getElementById("f_notes").value.trim() });
+        const newRec = { uid: uid(), name, notes: document.getElementById("f_notes").value.trim() };
+        DB.categories.push(newRec);
         DB.stockManual[name] = { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
+        saveRecord("categories", newRec);
+        saveMeta();
         logAction("Added category", name);
         toast("Category added");
       }
-      saveDB(); closeModal(); paintCatTable();
+      closeModal(); paintCatTable();
     };
   });
 }
@@ -1993,7 +2046,7 @@ function deleteCat(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.categories = DB.categories.filter(c => c.uid !== uidVal);
       catSelected.delete(uidVal);
-      saveDB(); logAction("Deleted category", rec ? rec.name : uidVal); closeModal(); toast("Category deleted"); paintCatTable();
+      deleteRecord("categories", uidVal); logAction("Deleted category", rec ? rec.name : uidVal); closeModal(); toast("Category deleted"); paintCatTable();
     };
   });
 }
@@ -2077,11 +2130,107 @@ function fmtDateTime(iso) {
 }
 
 /* =========================================================
+   REPORTS — export any module (or everything) to Excel
+   ========================================================= */
+function safeFileBit(s) {
+  return String(s || "").replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "") || "office";
+}
+function exportSheet(filenameBase, sheetName, rows) {
+  if (!rows.length) { toast("Nothing to export yet", "err"); return; }
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName.slice(0, 31));
+  XLSX.writeFile(wb, `${filenameBase}.xlsx`);
+  logAction("Exported report", `${sheetName} (${rows.length} rows)`);
+  toast(`Exported ${sheetName}`);
+}
+
+function reportRows(kind) {
+  const stock = kind === "stock" ? computeStockSummary() : null;
+  switch (kind) {
+    case "employees": return DB.employees.map(e => ({ "Employee ID": e.id || "", "Name": e.name || "", "Department": e.department || "", "Email": e.email || "", "Phone": e.phone || "" }));
+    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Remarks": a.remarks || "" }));
+    case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
+    case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
+    case "refill": return DB.refills.map(r => ({ "Date": r.date || "", "Category": r.category || "", "Quantity Added": r.quantity || 0, "Added By": r.addedBy || "", "Source / Remarks": r.source || "" }));
+    case "categories": return DB.categories.map(c => ({ "Category": c.name || "", "Notes": c.notes || "" }));
+    case "activityLog": return activityLogCache.map(l => ({ "When": fmtDateTime(l.ts), "User": l.email || "", "Action": l.action || "", "Details": l.details || "" }));
+    default: return [];
+  }
+}
+
+function renderReports() {
+  const content = document.getElementById("content");
+  const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "office";
+  const modules = [
+    { kind: "employees", label: "Employees", sheet: "Employees", icon: "👥" },
+    { kind: "assignment", label: "Asset Assignment", sheet: "Asset Assignment", icon: "🗂️" },
+    { kind: "inventory", label: "Master Inventory", sheet: "Master Inventory", icon: "💻" },
+    { kind: "stock", label: "Stock Summary", sheet: "Stock Summary", icon: "📦" },
+    { kind: "refill", label: "Stock Refill Log", sheet: "Stock Refill Log", icon: "➕" },
+    { kind: "categories", label: "Asset Categories", sheet: "Asset Categories", icon: "🏷️" },
+  ];
+
+  content.innerHTML = `
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-header">
+        <div><h2>Export Everything</h2><div class="sub">One Excel file with every module below as its own sheet, for <strong>${escapeHtml(officeName)}</strong></div></div>
+        <button class="btn btn-primary btn-sm" id="exportAllBtn">⬇ Export Full Workbook</button>
+      </div>
+      <p class="muted" style="margin-top:0">Mirrors the shape of the original Excel tracker — handy for sharing a snapshot with someone outside the app.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><div><h2>Export by Module</h2><div class="sub">Just one sheet at a time, as its own .xlsx file</div></div></div>
+      <div class="report-grid">
+        ${modules.map(m => `
+          <div class="report-tile">
+            <div class="report-tile-icon">${m.icon}</div>
+            <div class="report-tile-label">${m.label}</div>
+            <button class="btn btn-secondary btn-sm" data-kind="${m.kind}" data-sheet="${escapeHtml(m.sheet)}">Export</button>
+          </div>
+        `).join("")}
+        <div class="report-tile">
+          <div class="report-tile-icon">📝</div>
+          <div class="report-tile-label">Activity Log</div>
+          <button class="btn btn-secondary btn-sm" id="exportLogBtn">Export</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.querySelectorAll(".report-tile button[data-kind]").forEach(btn => {
+    btn.onclick = () => exportSheet(`${safeFileBit(officeName)}_${btn.dataset.kind}`, btn.dataset.sheet, reportRows(btn.dataset.kind));
+  });
+
+  document.getElementById("exportLogBtn").onclick = async () => {
+    await loadActivityLog();
+    exportSheet(`${safeFileBit(officeName)}_activity_log`, "Activity Log", reportRows("activityLog"));
+  };
+
+  document.getElementById("exportAllBtn").onclick = async () => {
+    await loadActivityLog();
+    const wb = XLSX.utils.book_new();
+    modules.forEach(m => {
+      const rows = reportRows(m.kind);
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{ " ": "No data" }]), m.sheet.slice(0, 31));
+    });
+    const logRows = reportRows("activityLog");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(logRows.length ? logRows : [{ " ": "No data" }]), "Activity Log");
+    XLSX.writeFile(wb, `${safeFileBit(officeName)}_full_export.xlsx`);
+    logAction("Exported report", `Full workbook (${modules.length + 1} sheets)`);
+    toast("Full workbook exported");
+  };
+}
+
+/* =========================================================
    SETTINGS — manage dropdown lists
    ========================================================= */
 function renderSettings() {
   const content = document.getElementById("content");
   const admin = isAdmin();
+  const superAdmin = isSuperAdmin();
+  const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "this office";
   const listDefs = [
     { key: "department", label: "Departments" },
     { key: "floor", label: "Floors" },
@@ -2099,18 +2248,31 @@ function renderSettings() {
 
     <div class="card" style="margin-bottom:18px">
       <div class="card-header">
-        <div><h2>Team Access</h2><div class="sub">Who can sign in, and whether they can edit or just view — applies across every office</div></div>
-        ${admin ? `<button class="btn btn-primary btn-sm" id="addRoleBtn">+ Add Person</button>` : ""}
+        <div><h2>Office Access — ${escapeHtml(officeName)}</h2><div class="sub">Who can edit THIS office specifically (Super Admin only to manage)</div></div>
+        ${superAdmin ? `<button class="btn btn-primary btn-sm" id="addOfficeAccessBtn">+ Add Person</button>` : ""}
       </div>
-      ${admin ? `<div class="table-wrap"><table>
+      ${superAdmin ? `<div class="table-wrap"><table>
+        <thead><tr><th>Email</th><th>Role in this office</th><th></th></tr></thead>
+        <tbody id="officeAccessTbody"><tr class="empty-row"><td colspan="3">Loading…</td></tr></tbody>
+      </table></div>` : `<p class="muted" style="margin-top:0">Only Super Admins can view or manage office-specific access. ${admin ? "You're an Admin for this office, granted by a Super Admin." : "Ask a Super Admin to grant you Admin access here if you need to edit this office."}</p>`}
+    </div>
+
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-header">
+        <div><h2>Super Admins</h2><div class="sub">Can edit every office, plus create/delete offices and grant office-specific access</div></div>
+        ${superAdmin ? `<button class="btn btn-primary btn-sm" id="addRoleBtn">+ Add Person</button>` : ""}
+      </div>
+      ${superAdmin ? `<div class="table-wrap"><table>
         <thead><tr><th>Email</th><th>Role</th><th></th></tr></thead>
         <tbody id="rolesTbody"><tr class="empty-row"><td colspan="3">Loading…</td></tr></tbody>
-      </table></div>` : `<p class="muted" style="margin-top:0">Only Admins can view or manage the team access list.</p>`}
+      </table></div>` : `<p class="muted" style="margin-top:0">Only Super Admins can view or manage this list.</p>`}
     </div>
 
     <div class="card">
-      <div class="card-header"><div><h2>Access</h2><div class="sub">How roles work</div></div></div>
-      <p class="muted" style="margin-top:0"><strong>Viewer</strong>: signs in, can browse and search everything, no edits. <strong>Admin</strong>: everything a Viewer can do, plus add / edit / delete / bulk-delete / import / reset. Manage who has which role above, in Team Access.</p>
+      <div class="card-header"><div><h2>How access works</h2></div></div>
+      <p class="muted" style="margin-top:0"><strong>Viewer</strong>: signs in, can browse and search every office, no edits.
+      <strong>Office Admin</strong>: can edit one specific office (granted in "Office Access" above).
+      <strong>Super Admin</strong>: can edit every office and manage who has access to what.</p>
       <p class="muted">Everything is stored in your Cloud Firestore database and synced live to everyone in the same office. Use <strong>Reset Data</strong> in the sidebar to restore the original sheet contents for everyone at any time.</p>
     </div>
   `;
@@ -2140,12 +2302,16 @@ function renderSettings() {
         if (!DB.lists[key]) DB.lists[key] = [];
         if (DB.lists[key].includes(val)) { toast("Already exists", "err"); return; }
         DB.lists[key].push(val);
-        saveDB(); logAction("Added list option", `${key}: "${val}"`); input.value = ""; paintChips(key); toast("Added");
+        saveMeta(); logAction("Added list option", `${key}: "${val}"`); input.value = ""; paintChips(key); toast("Added");
       };
     });
+  }
 
+  if (superAdmin) {
     document.getElementById("addRoleBtn").onclick = () => openRoleForm();
     loadRolesList();
+    document.getElementById("addOfficeAccessBtn").onclick = () => openOfficeAccessForm();
+    loadOfficeAccessList();
   }
 }
 
@@ -2177,7 +2343,7 @@ async function loadRolesList() {
 }
 
 function openRoleForm(existingEmail, existingRole) {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   const editing = !!existingEmail;
   openModal(editing ? "Change Role" : "Add Person", `
     ${editing ? "" : `<p class="muted" style="margin-top:0">The email must exactly match a login already created in Firebase → Authentication → Users.</p>`}
@@ -2214,7 +2380,7 @@ function openRoleForm(existingEmail, existingRole) {
 }
 
 function removeRole(email) {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   if (fauth.currentUser && fauth.currentUser.email === email) {
     toast("You can't remove your own access from here", "err");
     return;
@@ -2241,6 +2407,96 @@ function removeRole(email) {
   });
 }
 
+/* ---------------- Office Access (per-office Admin/Viewer grants) ---------------- */
+async function loadOfficeAccessList() {
+  const tbody = document.getElementById("officeAccessTbody");
+  if (!tbody) return;
+  try {
+    const snap = await docRef().collection("access").get();
+    const rows = [];
+    snap.forEach(doc => rows.push({ email: doc.id, ...doc.data() }));
+    rows.sort((a, b) => (a.email || "").localeCompare(b.email || ""));
+    tbody.innerHTML = rows.length ? rows.map(r => `
+      <tr>
+        <td>${escapeHtml(r.email)}</td>
+        <td><span class="badge ${r.role === "admin" ? "badge-blue" : "badge-grey"}">${r.role === "admin" ? "Admin" : "Viewer"}</span></td>
+        <td>
+          <div class="row-actions">
+            <button class="btn btn-secondary btn-sm btn-icon" title="Change role" onclick="openOfficeAccessForm('${escapeHtml(r.email)}','${r.role}')">✏️</button>
+            <button class="btn btn-danger btn-sm btn-icon" title="Remove access" onclick="removeOfficeAccess('${escapeHtml(r.email)}')">🗑️</button>
+          </div>
+        </td>
+      </tr>
+    `).join("") : `<tr class="empty-row"><td colspan="3">Nobody has office-specific access yet — Super Admins can already edit here.</td></tr>`;
+  } catch (err) {
+    console.error(err);
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="3">Couldn't load access list.</td></tr>`;
+  }
+}
+
+function openOfficeAccessForm(existingEmail, existingRole) {
+  if (!requireSuperAdminOrWarn()) return;
+  const editing = !!existingEmail;
+  const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "this office";
+  openModal(editing ? "Change Office Access" : "Grant Office Access", `
+    ${editing ? "" : `<p class="muted" style="margin-top:0">Grants access to <strong>${escapeHtml(officeName)}</strong> only. The email must exactly match a login already created in Firebase → Authentication → Users.</p>`}
+    <div class="field"><label>Email</label><input type="email" id="f_oaEmail" value="${escapeHtml(existingEmail || "")}" ${editing ? "disabled" : ""} placeholder="person@company.com"></div>
+    <div class="field"><label>Role</label>
+      <select id="f_oaRole">
+        <option value="viewer" ${existingRole === "viewer" ? "selected" : ""}>Viewer — view only</option>
+        <option value="admin" ${existingRole === "admin" ? "selected" : ""}>Admin — can edit this office</option>
+      </select>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelOA">Cancel</button>
+      <button class="btn btn-primary" id="saveOA">${editing ? "Save" : "Grant Access"}</button>
+    </div>
+  `, () => {
+    const emailInp = document.getElementById("f_oaEmail");
+    document.getElementById("cancelOA").onclick = closeModal;
+    document.getElementById("saveOA").onclick = async () => {
+      const email = emailInp.value.trim().toLowerCase();
+      const role = document.getElementById("f_oaRole").value;
+      if (!email) { toast("Enter an email", "err"); return; }
+      try {
+        await docRef().collection("access").doc(email).set({ email, role, updatedAt: new Date().toISOString() }, { merge: true });
+        logAction(editing ? "Changed office access" : "Granted office access", `${email} → ${role === "admin" ? "Admin" : "Viewer"}`);
+        closeModal();
+        toast(editing ? "Access updated" : "Access granted");
+        loadOfficeAccessList();
+      } catch (err) {
+        console.error(err);
+        toast("Couldn't save — check your Firestore Rules", "err");
+      }
+    };
+  });
+}
+
+function removeOfficeAccess(email) {
+  if (!requireSuperAdminOrWarn()) return;
+  const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "this office";
+  openModal("Remove access?", `
+    <p class="muted" style="margin-top:0"><strong>${escapeHtml(email)}</strong> will no longer have office-specific access to <strong>${escapeHtml(officeName)}</strong>. (Super Admins always retain access regardless.)</p>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelOAD">Cancel</button>
+      <button class="btn btn-danger" id="confirmOAD">Remove</button>
+    </div>`, () => {
+    document.getElementById("cancelOAD").onclick = closeModal;
+    document.getElementById("confirmOAD").onclick = async () => {
+      try {
+        await docRef().collection("access").doc(email).delete();
+        logAction("Removed office access", email);
+        closeModal();
+        toast("Access removed");
+        loadOfficeAccessList();
+      } catch (err) {
+        console.error(err);
+        toast("Couldn't remove — check your Firestore Rules", "err");
+      }
+    };
+  });
+}
+
 function paintChips(key) {
   const el = document.getElementById(`chips_${key}`);
   if (!el) return;
@@ -2255,7 +2511,7 @@ function removeListItem(key, encodedVal) {
   if (!requireAdminOrWarn()) return;
   const val = decodeURIComponent(encodedVal);
   DB.lists[key] = (DB.lists[key] || []).filter(v => v !== val);
-  saveDB();
+  saveMeta();
   logAction("Removed list option", `${key}: "${val}"`);
   paintChips(key);
   toast("Removed");
@@ -2279,7 +2535,7 @@ function hideAllGateScreens() {
   const shell = document.querySelector(".app-shell");
   if (shell) shell.style.display = "";
 }
-function showFirebaseSetupScreen(isError) {
+function showFirebaseSetupScreen(isError, detail) {
   const shell = document.querySelector(".app-shell");
   if (shell) shell.style.display = "none";
   document.getElementById("signInGateScreen")?.classList.remove("show");
@@ -2288,7 +2544,14 @@ function showFirebaseSetupScreen(isError) {
   if (el) {
     el.classList.add("show");
     const note = document.getElementById("setupErrorNote");
-    if (note) note.style.display = isError ? "block" : "none";
+    if (note) {
+      note.style.display = isError ? "block" : "none";
+      if (isError && detail) {
+        note.innerHTML = `Firebase is configured, but the app couldn't load data — double-check your config values,
+        that Firestore + Authentication are enabled, and that your Security Rules are published.<br>
+        <code style="display:inline-block;margin-top:6px;">Error: ${escapeHtml(detail)}</code>`;
+      }
+    }
   }
 }
 function showSignInGate(errorMsg) {
@@ -2309,12 +2572,17 @@ function showSignInGate(errorMsg) {
 function renderOfficeCards() {
   const grid = document.getElementById("officeGrid");
   if (!grid) return;
-  const admin = isAdmin();
+  const admin = isAdmin(); // on the picker, currentOfficeRole is unset, so this means Super Admin
   if (!OFFICES.length) {
     grid.innerHTML = `<div class="office-empty-note">No offices yet${admin ? " — add one to get started." : ". Ask an Admin to create one."}</div>`;
     return;
   }
-  grid.innerHTML = OFFICES.map(o => `
+  grid.innerHTML = OFFICES.map(o => {
+    const role = isSuperAdminUser ? "admin" : (officeRoleMap[o.id] || "viewer");
+    const roleBadge = isSuperAdminUser
+      ? `<span class="office-role-badge admin">Super Admin</span>`
+      : `<span class="office-role-badge ${role}">${role === "admin" ? "Admin" : "Viewer"}</span>`;
+    return `
     <div class="office-card" data-id="${escapeHtml(o.id)}">
       ${admin ? `<div class="office-card-actions">
         <button class="office-card-edit" data-id="${escapeHtml(o.id)}" title="Rename office">✎</button>
@@ -2322,9 +2590,10 @@ function renderOfficeCards() {
       </div>` : ""}
       <div class="office-card-icon">🏢</div>
       <div class="office-card-name">${escapeHtml(o.name)}</div>
-      <div class="office-card-city">${escapeHtml(o.city || "—")}</div>
+      <div class="office-card-city">${escapeHtml(o.city || "—")} ${roleBadge}</div>
     </div>
-  `).join("");
+  `;
+  }).join("");
   const addBtn = document.getElementById("addOfficeBtn");
   if (addBtn) addBtn.style.display = admin ? "" : "none";
 }
@@ -2334,16 +2603,18 @@ async function openOffice(officeId) {
   hideAllGateScreens();
   showLoadingScreen();
   try {
+    await fetchOfficeRole();
     await loadInitialData();
     attachRealtimeListener();
     dataBootstrapped = true;
   } catch (err) {
     console.error(err);
     hideLoadingScreen();
-    showFirebaseSetupScreen(true);
+    showFirebaseSetupScreen(true, err && err.message);
     return;
   }
   hideLoadingScreen();
+  paintRoleUI();
   paintOfficeUI();
   logAction("Opened office", `Signed in and opened this office's data`);
   goto(currentPage);
@@ -2353,6 +2624,7 @@ async function showOfficeSelectScreen() {
   DB = null;
   dataBootstrapped = false;
   currentOfficeId = null;
+  currentOfficeRole = null;
   localStorage.removeItem(LAST_OFFICE_KEY);
   const shell = document.querySelector(".app-shell");
   if (shell) shell.style.display = "none";
@@ -2381,7 +2653,7 @@ document.getElementById("officeGrid").addEventListener("click", (e) => {
   const editBtn = e.target.closest(".office-card-edit");
   if (editBtn) {
     e.stopPropagation();
-    if (!requireAdminOrWarn()) return;
+    if (!requireSuperAdminOrWarn()) return;
     const office = OFFICES.find(o => o.id === editBtn.dataset.id);
     if (!office) return;
     openModal("Rename Office", `
@@ -2415,7 +2687,7 @@ document.getElementById("officeGrid").addEventListener("click", (e) => {
   const delBtn = e.target.closest(".office-card-del");
   if (delBtn) {
     e.stopPropagation();
-    if (!requireAdminOrWarn()) return;
+    if (!requireSuperAdminOrWarn()) return;
     const office = OFFICES.find(o => o.id === delBtn.dataset.id);
     openModal(`Delete "${office ? office.name : "this office"}"?`, `
       <p class="muted" style="margin-top:0">This permanently deletes <strong>all data</strong> for this office
@@ -2439,7 +2711,7 @@ document.getElementById("officeGrid").addEventListener("click", (e) => {
   if (card) openOffice(card.dataset.id);
 });
 document.getElementById("addOfficeBtn").addEventListener("click", () => {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   openModal("Add New Office", `
     <div class="field"><label>Office Name</label><input type="text" id="f_officeName" placeholder="e.g. Andheri Branch"></div>
     <div class="field"><label>City</label><input type="text" id="f_officeCity" placeholder="e.g. Mumbai"></div>
@@ -2507,7 +2779,9 @@ async function init() {
   // signed in -> load data once, then keep the app in sync.
   fauth.onAuthStateChanged(async (user) => {
     if (!user) {
-      currentUserRole = null;
+      isSuperAdminUser = false;
+      currentOfficeRole = null;
+      officeRoleMap = {};
       paintRoleUI();
       detachRealtimeListener();
       DB = null;
@@ -2518,7 +2792,8 @@ async function init() {
       return;
     }
 
-    await fetchUserRole();
+    await fetchGlobalRole();
+    await fetchAccessibleOffices();
     paintRoleUI();
 
     // Signed in but no office chosen yet this session — try to resume the

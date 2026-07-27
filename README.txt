@@ -79,49 +79,9 @@ host works the same way — Netlify, Vercel, GitHub Pages, etc. — just
 upload the whole folder including js/firebase-config.js.)
 
 ------------------------------------------------------------
-WHAT'S NEW — DASHBOARD INSIGHTS
-------------------------------------------------------------
-The Dashboard has been rebuilt with more analytics, all computed live from
-data you already have (no new setup, no new Firestore fields required):
-
-- Performance Ratios strip: Utilization % (Assigned / Total Stock),
-  Workforce Coverage % (employees currently holding an asset), New
-  Assignments This Week, and Turnover Rate % (Returned / all assignments).
-- Fleet Allocation pie -> every unit of stock, split by Assigned /
-  Available / Under Repair / Faulty / Lost / Scrap, with percentages.
-- Assignment Status donut -> Assigned / Returned / Overdue, with percentages.
-- Stock by Category  -> bar breakdown of total logged stock per category.
-- Department Leaderboard -> which departments currently hold the most assets.
-- Top Asset Holders   -> people currently holding the most assets, for quick
-  audit checks.
-- Low Stock Alerts    -> now a full-width chip grid so it's easy to scan at
-  a glance across every category that's run low.
-
-Everything on the dashboard is still clickable through to the page it
-summarizes, and all of it respects Viewer/Admin permissions and the
-per-office data separation described below.
-
-------------------------------------------------------------
-SECURITY FIX — REAL DATA REMOVED FROM js/data.js
-------------------------------------------------------------
-Previously, js/data.js shipped real employee names, asset categories, and
-assignment history in plain text as part of the public website — visible
-to anyone who opened the browser's DevTools, even without signing in.
-
-That data has been removed. js/data.js now only contains generic,
-non-sensitive dropdown option lists (status, condition, floor, department
-names) needed for the app's forms to work. Your actual data isn't
-affected — it already lives in Firestore, protected by firestore.rules,
-which is what the app reads from after sign-in.
-
-If you ever need to re-seed a brand-new Firebase project with the
-original historical data, see the separate admin-tools/ folder (not part
-of this website — run it locally with the Firebase Admin SDK). Its own
-README explains when you'd actually need it (most people won't).
-
 WHAT'S INSIDE (mirrors your original Excel workbook)
 ------------------------------------------------------------
-- Dashboard          -> same live counters as your "Dashboard" sheet, plus the insights above
+- Dashboard          -> same live counters as your "Dashboard" sheet
 - Asset Assignment   -> same table/fields as "Asset Assignment" sheet
 - Master Inventory   -> individual asset register (Asset ID, brand, serial, warranty, etc.)
 - Employees          -> same list as "Employees" sheet
@@ -156,33 +116,61 @@ if they inspect the page's code.
 
 ADMIN vs VIEWER — WHO CAN EDIT
 ---------------------------------
-There are two roles:
-  - Viewer: can sign in, browse, and search every page. No add / edit /
+There are now three levels:
+  - Viewer: can sign in, browse, and search every office. No add / edit /
     delete / import / reset buttons.
-  - Admin: everything a Viewer can do, plus full edit access.
+  - Office Admin: full edit access, but for ONE specific office only.
+    Granted per-office from Settings > "Office Access" (while that office
+    is open) — Super Admin only to grant.
+  - Super Admin: full edit access everywhere, plus can create/delete
+    offices and grant Office Admin/Viewer access to anyone, anywhere.
+    Managed from Settings > "Super Admins" (Super Admin only).
 
-Roles are managed from inside the app, under Settings > Team Access
-(Admin only). Add a person's email (it must exactly match a login you
-already created under Authentication > Users) and choose their role.
-Change or remove someone's access there any time — it takes effect
-immediately, even on devices where they're already signed in.
+Change or remove someone's access any time — it takes effect immediately,
+even on devices where they're already signed in. Everyone signed in can
+still browse and search every office regardless of role (only editing is
+restricted) — that keeps things simple and avoids anyone getting locked
+out of viewing by accident.
 
 *** ONE-TIME SETUP STEP — DO THIS OR NOBODY CAN EDIT ANYTHING ***
-Team Access itself requires being an Admin to use — which creates a
+Settings itself requires being a Super Admin to manage roles — a
 chicken-and-egg problem for the very first person. To grant yourself
-Admin the first time, do this once directly in the Firebase console:
+Super Admin the first time, do this once directly in the Firebase console:
 
   1. Firebase console > Build > Firestore Database > Data tab.
   2. Click "Start collection". Collection ID: roles
   3. Document ID: type your exact login email (e.g. you@company.com).
   4. Add a field: name "role", type "string", value "admin". Save.
-  5. Reload index.html and sign in — you're now an Admin, and can grant
-     Admin or Viewer access to everyone else from Settings > Team Access
-     instead of repeating this console step.
+  5. Reload index.html and sign in — you're now a Super Admin, and can
+     grant access to everyone else from Settings instead of repeating
+     this console step.
 
 If you update firestore.rules on an app that was already live and skip
 this step, every existing user (including you) drops to Viewer-only
 until you complete it once.
+
+CONCURRENT EDITS — SAFE BY DESIGN
+------------------------------------
+Employees, Assignments, Inventory, the Refill Log, and Categories are each
+stored as individual documents in Firestore, not one shared file. Two
+Admins editing DIFFERENT records at the same time can never overwrite
+each other's work — only two edits to the exact same record at the exact
+same instant fall back to normal last-write-wins, same as any database.
+(Dropdown Lists and Stock Summary's manual repair/faulty/lost/scrap/
+threshold numbers still share one small settings document per office,
+since those change far less often — a much smaller residual risk.)
+
+If an office still has its older, single-document data from before this
+update, the app converts it automatically and safely the next time
+anyone opens that office — no action needed on your part.
+
+REPORTS — EXPORT TO EXCEL
+-----------------------------
+The "Reports" page lets you export any module (Employees, Assignments,
+Inventory, Stock Summary, Refill Log, Categories, Activity Log) as its own
+.xlsx file, or click "Export Full Workbook" for one Excel file with every
+module as its own sheet — handy for sharing a snapshot with someone
+outside the app, or for your own backups.
 
 ACTIVITY LOG — TRACE WHO DID WHAT
 ------------------------------------
