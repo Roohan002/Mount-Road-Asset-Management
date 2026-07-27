@@ -679,6 +679,192 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
 });
 
 /* =========================================================
+   DASHBOARD CHART HELPERS (pure SVG, no libraries)
+   ========================================================= */
+const CHART_PALETTE = ["#4c5ef8", "#0fb9a7", "#e2a13b", "#e2513b", "#3b8ee2", "#8a5cf6", "#f2578a", "#22b07d", "#f7a94b", "#5b6172"];
+function chartColor(i) { return CHART_PALETTE[i % CHART_PALETTE.length]; }
+
+// Donut chart: data = [{label, value, color}]. Draws each slice as an arc of a
+// thick-stroked circle, rotated to its cumulative start angle — no chart library needed.
+function svgDonutChart(data, opts = {}) {
+  const size = opts.size || 168, stroke = opts.stroke || 22;
+  const cx = size / 2, cy = size / 2, r = (size - stroke) / 2;
+  const circ = 2 * Math.PI * r;
+  const total = data.reduce((s, d) => s + d.value, 0);
+  if (!total) {
+    return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
+      <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--border)" stroke-width="${stroke}"/>
+    </svg>`;
+  }
+  let acc = 0;
+  const segs = data.map(d => {
+    const frac = d.value / total;
+    const dash = Math.max(frac * circ - 1.5, 0.001);
+    const rotate = -90 + (acc / total) * 360;
+    acc += d.value;
+    return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${d.color}" stroke-width="${stroke}"
+      stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" stroke-linecap="round"
+      transform="rotate(${rotate.toFixed(2)} ${cx} ${cy})"><title>${escapeHtml(d.label)}: ${d.value}</title></circle>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
+    ${segs}
+    <text x="${cx}" y="${cy - 2}" text-anchor="middle" font-size="21" font-weight="800" fill="var(--text)">${total}</text>
+    <text x="${cx}" y="${cy + 15}" text-anchor="middle" font-size="10" fill="var(--text-faint)">${escapeHtml(opts.centerLabel || "Total")}</text>
+  </svg>`;
+}
+
+function chartLegend(data) {
+  const total = data.reduce((s, d) => s + d.value, 0) || 1;
+  return `<div class="chart-legend">
+    ${data.map(d => `
+      <div class="legend-item">
+        <span class="legend-dot" style="background:${d.color}"></span>
+        <span class="legend-label" title="${escapeHtml(d.label)}">${escapeHtml(d.label)}</span>
+        <span class="legend-value">${d.value} · ${Math.round(d.value / total * 100)}%</span>
+      </div>
+    `).join("")}
+  </div>`;
+}
+
+function categoryStockBreakdown() {
+  return computeStockSummary()
+    .filter(r => r.total > 0)
+    .sort((a, b) => b.total - a.total)
+    .map((r, i) => ({ label: r.category, value: r.total, color: chartColor(i) }));
+}
+
+function departmentAssignedBreakdown() {
+  const map = {};
+  DB.assignments.filter(a => a.status === "Assigned").forEach(a => {
+    const dept = a.department || "Unassigned";
+    map[dept] = (map[dept] || 0) + 1;
+  });
+  return Object.entries(map).sort((a, b) => b[1] - a[1]).map(([label, value], i) => ({ label, value, color: chartColor(i) }));
+}
+
+// Asset Lifecycle Flow: a small Sankey-style diagram — one "Total Stock" node on the
+// left flowing out to every status bucket on the right, with line thickness scaled to
+// each bucket's share. Shows at a glance where every unit in stock currently sits.
+function svgLifecycleFlow(s) {
+  const nodesAll = [
+    { label: "Assigned", value: s.assigned, color: "#8a5cf6" },
+    { label: "Available", value: s.available, color: "#0fb9a7" },
+    { label: "Under Repair", value: s.underRepair, color: "#e2a13b" },
+    { label: "Faulty", value: s.faulty, color: "#e2513b" },
+    { label: "Lost", value: s.lost, color: "#7c8393" },
+    { label: "Scrap", value: s.scrap, color: "#4c5ef8" },
+  ];
+  const nodes = nodesAll.filter(n => n.value > 0);
+  if (!s.total || !nodes.length) {
+    return `<div class="chart-empty">No stock movement yet — add stock via the Stock Refill Log and log an assignment to see the flow.</div>`;
+  }
+  const nodeH = 38, gap = 15;
+  const height = nodes.length * (nodeH + gap) - gap + 16;
+  const width = 640;
+  const srcW = 138, srcH = 56, srcX = 12, srcY = height / 2 - srcH / 2;
+  const destX = width - 196, destW = 184;
+  const maxV = Math.max(...nodes.map(n => n.value), 1);
+
+  let y = 8;
+  const rows = nodes.map(n => {
+    const cy = y + nodeH / 2;
+    const strokeW = Math.max(3, Math.round((n.value / maxV) * 20));
+    const srcCy = srcY + srcH / 2;
+    const midX = (srcX + srcW + destX) / 2;
+    const path = `M ${srcX + srcW} ${srcCy} C ${midX} ${srcCy}, ${midX} ${cy}, ${destX} ${cy}`;
+    const pct = Math.round((n.value / s.total) * 100);
+    const row = `
+      <path d="${path}" fill="none" stroke="${n.color}" stroke-width="${strokeW}" stroke-opacity="0.32" stroke-linecap="round"/>
+      <rect x="${destX}" y="${y}" width="${destW}" height="${nodeH}" rx="10" fill="${n.color}" fill-opacity="0.1" stroke="${n.color}" stroke-width="1.4"/>
+      <text x="${destX + 14}" y="${y + 16}" font-size="11.5" font-weight="700" fill="var(--text)">${escapeHtml(n.label)}</text>
+      <text x="${destX + 14}" y="${y + 31}" font-size="10.5" fill="var(--text-faint)">${n.value} units · ${pct}%</text>
+    `;
+    y += nodeH + gap;
+    return row;
+  }).join("");
+
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">
+    <rect x="${srcX}" y="${srcY}" width="${srcW}" height="${srcH}" rx="12" fill="var(--primary)" fill-opacity="0.12" stroke="var(--primary)" stroke-width="1.6"/>
+    <text x="${srcX + srcW / 2}" y="${srcY + 24}" text-anchor="middle" font-size="14" font-weight="800" fill="var(--primary-dark)">${s.total}</text>
+    <text x="${srcX + srcW / 2}" y="${srcY + 40}" text-anchor="middle" font-size="10.5" fill="var(--text-faint)">Total Stock</text>
+    ${rows}
+  </svg>`;
+}
+
+// Last 14 days of assignment activity (by Date field), as a smoothed area/line chart.
+function last14DaysActivity() {
+  const days = [];
+  const now = new Date();
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const iso = d.toISOString().slice(0, 10);
+    days.push({ iso, label: d.toLocaleDateString("en-IN", { day: "2-digit", month: "short" }) });
+  }
+  return days.map(d => ({ ...d, count: DB.assignments.filter(a => a.date === d.iso).length }));
+}
+function svgTrendChart(points) {
+  const w = 620, h = 168, padL = 16, padR = 16, padT = 16, padB = 26;
+  const chartW = w - padL - padR, chartH = h - padT - padB;
+  const total = points.reduce((s, p) => s + p.count, 0);
+  const maxV = Math.max(1, ...points.map(p => p.count));
+  const stepX = chartW / (points.length - 1 || 1);
+  const coords = points.map((p, i) => ({
+    ...p,
+    x: padL + i * stepX,
+    y: padT + chartH - (p.count / maxV) * chartH,
+  }));
+  const linePath = coords.map((c, i) => `${i === 0 ? "M" : "L"} ${c.x.toFixed(1)} ${c.y.toFixed(1)}`).join(" ");
+  const areaPath = `${linePath} L ${coords[coords.length - 1].x.toFixed(1)} ${(padT + chartH).toFixed(1)} L ${coords[0].x.toFixed(1)} ${(padT + chartH).toFixed(1)} Z`;
+  const dots = coords.map(c => `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3" fill="#4c5ef8">${c.count ? `<title>${c.label}: ${c.count}</title>` : ""}</circle>`).join("");
+  const labels = coords.map((c, i) => (i % 3 === 0 || i === coords.length - 1)
+    ? `<text x="${c.x.toFixed(1)}" y="${h - 8}" text-anchor="middle" font-size="9.5" fill="var(--text-faint)">${c.label}</text>` : "").join("");
+  const svg = `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">
+    <defs>
+      <linearGradient id="trendFillGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#4c5ef8" stop-opacity="0.3"/>
+        <stop offset="100%" stop-color="#4c5ef8" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <line x1="${padL}" y1="${(padT + chartH).toFixed(1)}" x2="${w - padR}" y2="${(padT + chartH).toFixed(1)}" stroke="var(--border)" stroke-width="1"/>
+    <path d="${areaPath}" fill="url(#trendFillGrad)"/>
+    <path d="${linePath}" fill="none" stroke="#4c5ef8" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+    ${dots}
+    ${labels}
+  </svg>`;
+  return total ? svg : svg + `<div class="chart-caption">No assignments logged in the last 14 days</div>`;
+}
+
+// Horizontal bar comparison: Assigned vs Available for the largest-stock categories.
+function svgCategoryBarCompare(rows) {
+  const top = [...rows].filter(r => r.total > 0).sort((a, b) => b.total - a.total).slice(0, 6);
+  if (!top.length) return `<div class="chart-empty">No stock yet — add categories and log a refill to see this chart.</div>`;
+  const rowH = 34, gap = 10, labelW = 118, width = 560, chartW = width - labelW - 44;
+  const height = top.length * (rowH + gap) - gap + 6;
+  const maxV = Math.max(...top.map(r => Math.max(r.assigned, r.available)), 1);
+  let y = 4;
+  const rowsHtml = top.map(r => {
+    const aW = (r.assigned / maxV) * chartW;
+    const avW = (r.available / maxV) * chartW;
+    const label = r.category.length > 15 ? r.category.slice(0, 14) + "…" : r.category;
+    const row = `
+      <text x="0" y="${y + 9}" font-size="11.3" font-weight="600" fill="var(--text)">${escapeHtml(label)}</text>
+      <rect x="${labelW}" y="${y}" width="${Math.max(aW, r.assigned ? 3 : 0)}" height="10" rx="4" fill="#8a5cf6"/>
+      <text x="${labelW + Math.max(aW, 8) + 6}" y="${y + 9}" font-size="10" fill="var(--text-faint)">${r.assigned}</text>
+      <rect x="${labelW}" y="${y + 14}" width="${Math.max(avW, r.available ? 3 : 0)}" height="10" rx="4" fill="#0fb9a7"/>
+      <text x="${labelW + Math.max(avW, 8) + 6}" y="${y + 23}" font-size="10" fill="var(--text-faint)">${r.available}</text>
+    `;
+    y += rowH + gap;
+    return row;
+  }).join("");
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">${rowsHtml}</svg>
+    <div class="chart-legend" style="flex-direction:row; gap:16px; margin-top:6px;">
+      <div class="legend-item"><span class="legend-dot" style="background:#8a5cf6"></span><span class="legend-label">Assigned</span></div>
+      <div class="legend-item"><span class="legend-dot" style="background:#0fb9a7"></span><span class="legend-label">Available</span></div>
+    </div>`;
+}
+
+/* =========================================================
    DASHBOARD
    ========================================================= */
 function renderDashboard() {
@@ -702,6 +888,8 @@ function renderDashboard() {
   const recentAssignments = sortAssignmentsNewestFirst(DB.assignments).slice(0, 6);
   const lowStockRows = s.rows.filter(r => r.low);
   const isFreshOffice = s.categories === 0;
+  const catData = categoryStockBreakdown();
+  const deptData = departmentAssignedBreakdown();
 
   content.innerHTML = `
     ${viewerNotice()}
@@ -732,21 +920,64 @@ function renderDashboard() {
       `).join("")}
     </div>
 
-    <div class="grid-2">
+    <div class="dash-stack">
+      <div class="grid-2-even">
+        <div class="card">
+          <div class="card-header">
+            <div><h2>Stock Distribution</h2><div class="sub">Share of total stock by category</div></div>
+            <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
+          </div>
+          ${catData.length ? `<div class="chart-flex">${svgDonutChart(catData, { centerLabel: "Units" })}${chartLegend(catData)}</div>`
+            : `<div class="chart-empty">No stock yet — add categories and log a refill to see this chart.</div>`}
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <div><h2>Assignments by Department</h2><div class="sub">Currently assigned units, by department</div></div>
+            <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">View all →</button>
+          </div>
+          ${deptData.length ? `<div class="chart-flex">${svgDonutChart(deptData, { centerLabel: "Assigned" })}${chartLegend(deptData)}</div>`
+            : `<div class="chart-empty">No active assignments yet.</div>`}
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-header">
-          <div><h2>Recent Assignments</h2><div class="sub">Latest activity from the assignment log${admin ? " — click a row to edit" : ""}</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">View all →</button>
+          <div><h2>Asset Lifecycle Flow</h2><div class="sub">Where every unit currently in stock sits right now</div></div>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Date</th><th>Asset</th><th>Employee</th><th>Dept</th><th>Status</th></tr></thead>
-            <tbody>
-              ${recentAssignments.length ? recentAssignments.map(a => `
-                <tr ${admin ? `style="cursor:pointer" title="Click to edit" onclick="openAssignForm('${a.uid}')"` : ""}>
-                  <td>${fmtAssignDateCell(a)}</td>
-                  <td>${escapeHtml(a.assetName)}</td>
-                  <td>${escapeHtml(a.employeeName)}</td>
+        ${svgLifecycleFlow(s)}
+      </div>
+
+      <div class="grid-2-even">
+        <div class="card">
+          <div class="card-header">
+            <div><h2>Assignment Activity</h2><div class="sub">Units handed out per day — last 14 days</div></div>
+          </div>
+          ${svgTrendChart(last14DaysActivity())}
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <div><h2>Top Categories</h2><div class="sub">Assigned vs available, largest stock first</div></div>
+            <button class="btn btn-secondary btn-sm" onclick="goto('stock')">Stock summary →</button>
+          </div>
+          ${svgCategoryBarCompare(s.rows)}
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <div><h2>Recent Assignments</h2><div class="sub">Latest activity from the assignment log${admin ? " — click a row to edit" : ""}</div></div>
+            <button class="btn btn-secondary btn-sm" onclick="goto('assignment')">View all →</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Date</th><th>Asset</th><th>Employee</th><th>Dept</th><th>Status</th></tr></thead>
+              <tbody>
+                ${recentAssignments.length ? recentAssignments.map(a => `
+                  <tr ${admin ? `style="cursor:pointer" title="Click to edit" onclick="openAssignForm('${a.uid}')"` : ""}>
+                    <td>${fmtAssignDateCell(a)}</td>
+                    <td>${escapeHtml(a.assetName)}</td>
+                    <td>${escapeHtml(a.employeeName)}</td>
                   <td>${escapeHtml(a.department || "—")}</td>
                   <td>${statusBadge(a.status)}</td>
                 </tr>`).join("") : `<tr class="empty-row"><td colspan="5">No assignments yet</td></tr>`}
@@ -770,6 +1001,7 @@ function renderDashboard() {
           </div>
         `).join("") : `<p class="muted">All categories are healthily stocked. ✅</p>`}
       </div>
+    </div>
     </div>
 
     <p class="footer-note"><span class="live-dot" style="display:inline-block;vertical-align:middle;margin-right:6px;"></span>Speelfinance · Asset Management Tracker — live, synced in real time</p>
