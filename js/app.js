@@ -527,6 +527,26 @@ function bulkToolbarHtml(selectedSize, totalSize) {
   `;
 }
 
+/* ---------------- Asset Tag Numbers (per-unit tracking for bulk items) ---------------- */
+// Every unit handed out (e.g. each of 10 headphones given to a team) gets its own
+// sequential tag like "HEA-0007" so it stays traceable even though the category
+// itself is a bulk/non-serialized item. The running counter is per-category and
+// lives in DB.stockManual (same small "meta" doc as repair/faulty/lost/scrap), so
+// it persists across sessions and never reuses a number.
+function categoryTagPrefix(name) {
+  const clean = String(name || "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  return (clean.slice(0, 3) || "AST").padEnd(3, "X");
+}
+function nextAssetTagNo(categoryName) {
+  if (!DB.stockManual[categoryName]) {
+    DB.stockManual[categoryName] = { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5, tagSeq: 0 };
+  }
+  if (!DB.stockManual[categoryName].tagSeq) DB.stockManual[categoryName].tagSeq = 0;
+  DB.stockManual[categoryName].tagSeq += 1;
+  const seq = String(DB.stockManual[categoryName].tagSeq).padStart(4, "0");
+  return `${categoryTagPrefix(categoryName)}-${seq}`;
+}
+
 /* ---------------- Computed: Stock Summary ---------------- */
 function computeStockSummary() {
   return DB.categories.map(cat => {
@@ -789,7 +809,7 @@ function renderAssignment() {
       <div class="table-wrap"><table>
         <thead><tr>
           ${isAdmin() ? `<th class="ck-col"><input type="checkbox" class="select-ck" id="assignSelectAll" aria-label="Select all assignments"></th>` : ""}
-          <th>Date</th><th>Asset</th><th>Employee</th><th>Dept</th><th>Assigned By</th>
+          <th>Date</th><th>Asset</th><th>Asset Tag</th><th>Employee</th><th>Dept</th><th>Assigned By</th>
           <th>Return Date</th><th>Status</th><th>Remarks</th>${isAdmin() ? "<th></th>" : ""}
         </tr></thead>
         <tbody id="assignTbody"></tbody>
@@ -843,6 +863,7 @@ function paintAssignTable() {
       ${admin ? `<td class="ck-col"><input type="checkbox" class="select-ck row-ck" data-uid="${a.uid}" aria-label="Select assignment for ${escapeHtml(a.employeeName)}" ${assignSelected.has(a.uid) ? "checked" : ""}></td>` : ""}
       <td>${fmtAssignDateCell(a)}</td>
       <td>${escapeHtml(a.assetName)}</td>
+      <td>${a.assetTagNo ? `<span class="badge badge-grey">${escapeHtml(a.assetTagNo)}</span>` : "—"}</td>
       <td>${escapeHtml(a.employeeName)}</td>
       <td>${escapeHtml(a.department || "—")}</td>
       <td>${escapeHtml(a.assignedBy || "—")}</td>
@@ -856,7 +877,7 @@ function paintAssignTable() {
         </div>
       </td>` : ""}
     </tr>
-  `).join("") : `<tr class="empty-row"><td colspan="10">${filterActive ? `No records match your search/filters. <a href="#" id="assignEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No assignments yet"}</td></tr>`;
+  `).join("") : `<tr class="empty-row"><td colspan="11">${filterActive ? `No records match your search/filters. <a href="#" id="assignEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No assignments yet"}</td></tr>`;
 
   document.getElementById("assignBulkBar").innerHTML = bulkToolbarHtml(assignSelected.size, rows.length);
   const emptyClear = document.getElementById("assignEmptyClear");
@@ -923,9 +944,10 @@ function openAssignForm(uidVal) {
   const assetFieldHtml = editing
     ? `<div class="field"><label>Asset</label>
         <select id="f_asset">${cats.map(c => `<option ${editing.assetName === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select>
+        ${editing.assetTagNo ? `<div class="muted" style="margin-top:4px;">Asset Tag: <strong>${escapeHtml(editing.assetTagNo)}</strong></div>` : ""}
       </div>`
     : `<div class="field">
-        <label>Assets <span class="muted" style="font-weight:500;">(tick one or more — one entry gets logged for each, so you don't have to retype the employee)</span></label>
+        <label>Assets <span class="muted" style="font-weight:500;">(tick one or more, set Qty for bulk items — e.g. tick Headphone and set Qty 10 to log 10 headphones to one recipient in one go; each unit gets its own asset tag automatically)</span></label>
         <div class="asset-multiselect" id="assetMultiSelect">
           <div class="asset-multiselect-actions">
             <button type="button" class="btn btn-secondary btn-sm" id="assetSelectAll">Select All</button>
@@ -935,6 +957,8 @@ function openAssignForm(uidVal) {
             <label class="asset-check-row">
               <input type="checkbox" class="f_asset_multi" value="${escapeHtml(c)}">
               <span>${escapeHtml(c)}</span>
+              <span class="qty-label">Qty</span>
+              <input type="number" class="f_asset_qty" data-cat="${escapeHtml(c)}" min="1" step="1" value="1" title="How many units of ${escapeHtml(c)} to log">
             </label>
           `).join("")}
         </div>
@@ -950,8 +974,8 @@ function openAssignForm(uidVal) {
     ${assetFieldHtml}
     `}
     <div class="field-row">
-      <div class="field"><label>Employee Name</label>
-        <input type="text" id="f_emp" list="empList" value="${escapeHtml(editing ? editing.employeeName : "")}" placeholder="Type or pick a name — ID & department auto-fill">
+      <div class="field"><label>Employee / Recipient Name</label>
+        <input type="text" id="f_emp" list="empList" value="${escapeHtml(editing ? editing.employeeName : "")}" placeholder="Employee name, or a team/TL name like 'KYC Training'">
         <datalist id="empList">${DB.employees.map(e => `<option value="${escapeHtml(e.name)}">`).join("")}</datalist>
       </div>
       <div class="field"><label>Employee ID</label><input type="text" id="f_empid" value="${escapeHtml(editing ? editing.employeeId || "" : "")}"></div>
@@ -1033,17 +1057,44 @@ function openAssignForm(uidVal) {
         logAction("Edited assignment", `${rec.assetName} → ${empName}`);
         toast("Assignment updated");
       } else {
-        const selectedAssets = [...document.querySelectorAll(".f_asset_multi:checked")].map(cb => cb.value);
-        if (!selectedAssets.length) { toast("Select at least one asset", "err"); return; }
-        selectedAssets.forEach(assetName => {
-          const newRec = { uid: uid(), id: DB.assignments.length + 1, createdAt: nowISO(), ...common, assetName };
-          DB.assignments.push(newRec);
-          newRecords.push(newRec);
+        const selectedBoxes = [...document.querySelectorAll(".f_asset_multi:checked")];
+        if (!selectedBoxes.length) { toast("Select at least one asset", "err"); return; }
+
+        // Each ticked category can carry its own Qty (default 1). One assignment
+        // record — with its own unique, sequential asset tag — is created per unit,
+        // so 10 headphones handed to one recipient becomes 10 linked, traceable
+        // records instead of one entry with a quantity buried inside it. Because
+        // each unit is its own "Assigned" record, the dashboard/stock counts
+        // (which count assignment records, not a separate quantity field) stay
+        // accurate automatically — nothing to reconcile by hand.
+        const picks = selectedBoxes.map(cb => {
+          const qtyInput = document.querySelector(`.f_asset_qty[data-cat="${CSS.escape(cb.value)}"]`);
+          const qty = Math.max(1, Math.floor(Number(qtyInput?.value) || 1));
+          return { assetName: cb.value, qty };
         });
+
+        const summaryParts = [];
+        picks.forEach(({ assetName, qty }) => {
+          for (let i = 0; i < qty; i++) {
+            const newRec = {
+              uid: uid(),
+              id: DB.assignments.length + 1,
+              createdAt: nowISO(),
+              ...common,
+              assetName,
+              assetTagNo: nextAssetTagNo(assetName),
+            };
+            DB.assignments.push(newRec);
+            newRecords.push(newRec);
+          }
+          summaryParts.push(qty > 1 ? `${assetName} × ${qty}` : assetName);
+        });
+
         newRecords.forEach(r => saveRecord("assignments", r));
-        logAction("Added assignment(s)", `${selectedAssets.join(", ")} → ${empName}`);
-        toast(selectedAssets.length > 1
-          ? `${selectedAssets.length} assignments added for ${empName}`
+        saveMeta(); // persists the updated per-category tag-number counters
+        logAction("Added assignment(s)", `${summaryParts.join(", ")} → ${empName}`);
+        toast(newRecords.length > 1
+          ? `${newRecords.length} assignments added for ${empName}`
           : "Assignment added");
       }
       closeModal();
@@ -1663,17 +1714,18 @@ function openEmpHistoryModal(empUid) {
     </div>
     <div class="table-wrap">
       <table style="min-width:640px">
-        <thead><tr><th>Date</th><th>Asset</th><th>Status</th><th>Assigned By</th><th>Return Date</th><th>Remarks</th></tr></thead>
+        <thead><tr><th>Date</th><th>Asset</th><th>Asset Tag</th><th>Status</th><th>Assigned By</th><th>Return Date</th><th>Remarks</th></tr></thead>
         <tbody>
           ${records.length ? records.map(a => `
             <tr>
               <td>${fmtAssignDateCell(a)}</td>
               <td>${escapeHtml(a.assetName)}</td>
+              <td>${a.assetTagNo ? escapeHtml(a.assetTagNo) : "—"}</td>
               <td>${statusBadge(a.status)}</td>
               <td>${escapeHtml(a.assignedBy || "—")}</td>
               <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}</td>
               <td>${escapeHtml(a.remarks || "—")}</td>
-            </tr>`).join("") : `<tr class="empty-row"><td colspan="6">No assets have been issued to this employee yet</td></tr>`}
+            </tr>`).join("") : `<tr class="empty-row"><td colspan="7">No assets have been issued to this employee yet</td></tr>`}
         </tbody>
       </table>
     </div>
@@ -2149,7 +2201,7 @@ function reportRows(kind) {
   const stock = kind === "stock" ? computeStockSummary() : null;
   switch (kind) {
     case "employees": return DB.employees.map(e => ({ "Employee ID": e.id || "", "Name": e.name || "", "Department": e.department || "", "Email": e.email || "", "Phone": e.phone || "" }));
-    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Remarks": a.remarks || "" }));
+    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Remarks": a.remarks || "" }));
     case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
     case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
     case "refill": return DB.refills.map(r => ({ "Date": r.date || "", "Category": r.category || "", "Quantity Added": r.quantity || 0, "Added By": r.addedBy || "", "Source / Remarks": r.source || "" }));
