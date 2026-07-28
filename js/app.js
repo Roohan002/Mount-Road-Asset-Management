@@ -516,11 +516,12 @@ function confirmBulkDelete(count, label, onConfirm) {
 }
 
 /* Renders the "N selected · Delete Selected · Delete All" strip used on every list page */
-function bulkToolbarHtml(selectedSize, totalSize) {
+function bulkToolbarHtml(selectedSize, totalSize, extraButtonsHtml) {
   if (!isAdmin()) return "";
   return `
     <div class="bulk-actions">
       <span class="bulk-count">${selectedSize} selected</span>
+      ${extraButtonsHtml || ""}
       <button class="btn btn-danger btn-sm" id="deleteSelectedBtn" ${selectedSize === 0 ? "disabled" : ""}>🗑 Delete Selected</button>
       <button class="btn btn-secondary btn-sm" id="deleteAllBtn" ${totalSize === 0 ? "disabled" : ""}>Delete All</button>
     </div>
@@ -1114,7 +1115,7 @@ function paintAssignTable() {
     </tr>
   `).join("") : `<tr class="empty-row"><td colspan="${admin ? 11 : 10}">${filterActive ? `No records match your search/filters. <a href="#" id="assignEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No assignments yet"}</td></tr>`;
 
-  document.getElementById("assignBulkBar").innerHTML = bulkToolbarHtml(assignSelected.size, rows.length);
+  document.getElementById("assignBulkBar").innerHTML = bulkToolbarHtml(assignSelected.size, rows.length, assignSlipBtnHtml());
   const emptyClear = document.getElementById("assignEmptyClear");
   if (emptyClear) emptyClear.onclick = (e) => { e.preventDefault(); document.getElementById("assignClearFiltersBtn").click(); };
   wireAssignBulk(rows);
@@ -1133,7 +1134,7 @@ function wireAssignBulk(rows) {
   document.querySelectorAll("#assignTbody .row-ck").forEach(ck => {
     ck.onchange = () => {
       ck.checked ? assignSelected.add(ck.dataset.uid) : assignSelected.delete(ck.dataset.uid);
-      document.getElementById("assignBulkBar").innerHTML = bulkToolbarHtml(assignSelected.size, rows.length);
+      document.getElementById("assignBulkBar").innerHTML = bulkToolbarHtml(assignSelected.size, rows.length, assignSlipBtnHtml());
       wireAssignBulk(rows);
     };
   });
@@ -1149,6 +1150,12 @@ function wireAssignBulk(rows) {
       logAction("Bulk deleted assignments", `Deleted ${n} selected assignment record(s)`); toast("Selected assignments deleted"); paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
     });
+  };
+  const slipBtn = document.getElementById("bulkSlipBtn");
+  if (slipBtn) slipBtn.onclick = () => {
+    if (assignSelected.size === 0) return;
+    const records = DB.assignments.filter(a => assignSelected.has(a.uid));
+    openCombinedHandoverSlip(records);
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) {
@@ -1170,11 +1177,47 @@ function wireAssignBulk(rows) {
 }
 
 /* ---------------- Asset Handover Slip (PDF, with signature) ---------------- */
+function assignSlipBtnHtml() {
+  return `<button class="btn btn-secondary btn-sm" id="bulkSlipBtn" ${assignSelected.size === 0 ? "disabled" : ""}>📄 Generate Slip for Selected</button>`;
+}
+
+// Single row's 📄 button — one asset, one employee, with signature capture.
 function openHandoverSlip(uidVal) {
   const rec = DB.assignments.find(a => a.uid === uidVal);
   if (!rec) return;
-  openModal("Asset Handover Slip", `
-    <p class="muted" style="margin-top:0"><strong>${escapeHtml(rec.assetName)}</strong>${rec.assetTagNo ? ` (${escapeHtml(rec.assetTagNo)})` : ""} → <strong>${escapeHtml(rec.employeeName)}</strong> on ${fmtDate(rec.date)}</p>
+  openSignatureSlipModal([rec], `<strong>${escapeHtml(rec.assetName)}</strong>${rec.assetTagNo ? ` (${escapeHtml(rec.assetTagNo)})` : ""} → <strong>${escapeHtml(rec.employeeName)}</strong> on ${fmtDate(rec.date)}`);
+}
+
+// Bulk "Generate Slip for Selected" — groups the selection by employee. One
+// employee selected → single combined slip (with signature) listing every
+// asset they're getting. Multiple employees selected → one multi-page PDF,
+// one page per employee, no signature capture (nothing sensible to sign for
+// a batch spanning several people in one sitting).
+function openCombinedHandoverSlip(records) {
+  if (!records.length) return;
+  const groups = groupAssignmentsByEmployee(records);
+  if (groups.length === 1) {
+    const g = groups[0];
+    openSignatureSlipModal(g.records, `<strong>${g.records.length} asset${g.records.length > 1 ? "s" : ""}</strong> → <strong>${escapeHtml(g.employeeName)}</strong>`);
+  } else {
+    generateHandoverSlipPDF(groups, null);
+  }
+}
+
+function groupAssignmentsByEmployee(records) {
+  const map = new Map();
+  records.forEach(r => {
+    const key = `${r.employeeName || ""}__${r.employeeId || ""}`;
+    if (!map.has(key)) map.set(key, { employeeName: r.employeeName, employeeId: r.employeeId, department: r.department, assignedBy: r.assignedBy, records: [] });
+    map.get(key).records.push(r);
+  });
+  return [...map.values()];
+}
+
+function openSignatureSlipModal(records, summaryHtml) {
+  const groups = groupAssignmentsByEmployee(records);
+  openModal(records.length > 1 ? "Combined Asset Handover Slip" : "Asset Handover Slip", `
+    <p class="muted" style="margin-top:0">${summaryHtml}</p>
     <div class="field"><label>Employee Signature (optional — draw with mouse/finger)</label>
       <div class="sig-pad-wrap">
         <canvas id="sigPad" class="sig-pad" width="480" height="150"></canvas>
@@ -1207,13 +1250,16 @@ function openHandoverSlip(uidVal) {
     document.getElementById("cancelSlip").onclick = closeModal;
     document.getElementById("downloadSlipBtn").onclick = () => {
       const sigDataUrl = hasSignature ? canvas.toDataURL("image/png") : null;
-      generateHandoverSlipPDF(rec, sigDataUrl);
+      generateHandoverSlipPDF(groups, sigDataUrl);
       closeModal();
     };
   });
 }
 
-function generateHandoverSlipPDF(rec, signatureDataUrl) {
+// groups: [{ employeeName, employeeId, department, assignedBy, records: [assignment,...] }, ...]
+// One page per employee group. signatureDataUrl (if given) is only stamped on the
+// first/only page — it only makes sense when there's exactly one employee group.
+function generateHandoverSlipPDF(groups, signatureDataUrl) {
   if (typeof window.jspdf === "undefined") { toast("PDF library didn't load — check your connection", "err"); return; }
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ unit: "pt", format: "a4" });
@@ -1221,63 +1267,100 @@ function generateHandoverSlipPDF(rec, signatureDataUrl) {
   const officeName = officeInfo.name || "Speelfinance";
   const officeCity = officeInfo.city || "";
   const marginX = 48;
-  let y = 56;
+  const pageWidth = 595;
 
-  doc.setFont("helvetica", "bold"); doc.setFontSize(18);
-  doc.text("Speelfinance", marginX, y);
-  doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(100);
-  doc.text(`${officeName}${officeCity ? " — " + officeCity : ""}`, marginX, y + 16);
-  doc.setTextColor(0);
-  doc.setFont("helvetica", "bold"); doc.setFontSize(13);
-  doc.text("ASSET HANDOVER SLIP", 595 - marginX, y, { align: "right" });
-  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(100);
-  doc.text(`Generated ${fmtDate(todayISO())}`, 595 - marginX, y + 16, { align: "right" });
-  doc.setTextColor(0);
-  y += 36;
-  doc.setDrawColor(220); doc.line(marginX, y, 595 - marginX, y);
-  y += 28;
+  groups.forEach((g, gi) => {
+    if (gi > 0) doc.addPage();
+    let y = 56;
 
-  const rows = [
-    ["Employee Name", rec.employeeName || "—"],
-    ["Employee ID", rec.employeeId || "—"],
-    ["Department", rec.department || "—"],
-    ["Asset", rec.assetName || "—"],
-    ["Asset Tag No.", rec.assetTagNo || "—"],
-    ["Assignment Date", rec.date ? fmtDate(rec.date) : "—"],
-    ["Assigned By", rec.assignedBy || "—"],
-    ["Status", rec.status || "—"],
-    ["Remarks", rec.remarks || "—"],
-  ];
-  doc.setFontSize(11);
-  rows.forEach(([label, value]) => {
-    doc.setFont("helvetica", "bold"); doc.text(label, marginX, y);
-    doc.setFont("helvetica", "normal"); doc.text(String(value), marginX + 150, y);
-    y += 22;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(18);
+    doc.text("Speelfinance", marginX, y);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(100);
+    doc.text(`${officeName}${officeCity ? " — " + officeCity : ""}`, marginX, y + 16);
+    doc.setTextColor(0);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(13);
+    doc.text("ASSET HANDOVER SLIP", pageWidth - marginX, y, { align: "right" });
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(100);
+    doc.text(`Generated ${fmtDate(todayISO())}`, pageWidth - marginX, y + 16, { align: "right" });
+    doc.setTextColor(0);
+    y += 36;
+    doc.setDrawColor(220); doc.line(marginX, y, pageWidth - marginX, y);
+    y += 28;
+
+    const header = [
+      ["Employee Name", g.employeeName || "—"],
+      ["Employee ID", g.employeeId || "—"],
+      ["Department", g.department || "—"],
+      ["Assigned By", g.assignedBy || "—"],
+    ];
+    doc.setFontSize(11);
+    header.forEach(([label, value]) => {
+      doc.setFont("helvetica", "bold"); doc.text(label, marginX, y);
+      doc.setFont("helvetica", "normal"); doc.text(String(value), marginX + 150, y);
+      y += 22;
+    });
+    y += 8;
+
+    // Asset table — one row per asset, even when there's only one.
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10);
+    const cols = [
+      { label: "Asset", x: marginX, w: 165 },
+      { label: "Tag No.", x: marginX + 165, w: 80 },
+      { label: "Date", x: marginX + 245, w: 75 },
+      { label: "Status", x: marginX + 320, w: 70 },
+      { label: "Remarks", x: marginX + 390, w: pageWidth - marginX - (marginX + 390) },
+    ];
+    doc.setDrawColor(200); doc.line(marginX, y + 4, pageWidth - marginX, y + 4);
+    y += 16;
+    cols.forEach(c => doc.text(c.label, c.x, y));
+    y += 8;
+    doc.line(marginX, y, pageWidth - marginX, y);
+    y += 16;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+    g.records.forEach(rec => {
+      const vals = [rec.assetName || "—", rec.assetTagNo || "—", rec.date ? fmtDate(rec.date) : "—", rec.status || "—", rec.remarks || "—"];
+      let maxLines = 1;
+      cols.forEach((c, i) => {
+        const wrapped = doc.splitTextToSize(String(vals[i]), c.w - 4);
+        doc.text(wrapped, c.x, y);
+        maxLines = Math.max(maxLines, wrapped.length);
+      });
+      y += maxLines * 12 + 8;
+    });
+
+    y += 20;
+    doc.setFont("helvetica", "italic"); doc.setFontSize(9.5); doc.setTextColor(70);
+    const declaration = "I acknowledge receipt of the asset(s) listed above in good working condition. I agree to take reasonable care of them, use them only for authorized purposes, and return them upon request or upon exit from the organization.";
+    const wrapped = doc.splitTextToSize(declaration, pageWidth - marginX * 2);
+    doc.text(wrapped, marginX, y);
+    y += wrapped.length * 13 + 30;
+    doc.setTextColor(0);
+
+    if (signatureDataUrl && groups.length === 1) {
+      doc.addImage(signatureDataUrl, "PNG", marginX, y - 45, 180, 56);
+    }
+    doc.setDrawColor(120);
+    doc.line(marginX, y + 14, marginX + 200, y + 14);
+    doc.line(340, y + 14, 340 + 200, y + 14);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+    doc.text("Employee Signature", marginX, y + 28);
+    doc.text("Issued By Signature", 340, y + 28);
+    doc.text(`Name: ${g.employeeName || ""}`, marginX, y + 44);
+    doc.text(`Name: ${g.assignedBy || ""}`, 340, y + 44);
   });
 
-  y += 14;
-  doc.setFont("helvetica", "italic"); doc.setFontSize(9.5); doc.setTextColor(70);
-  const declaration = "I acknowledge receipt of the asset(s) listed above in good working condition. I agree to take reasonable care of it, use it only for authorized purposes, and return it upon request or upon exit from the organization.";
-  const wrapped = doc.splitTextToSize(declaration, 595 - marginX * 2);
-  doc.text(wrapped, marginX, y);
-  y += wrapped.length * 13 + 30;
-  doc.setTextColor(0);
-
-  if (signatureDataUrl) {
-    doc.addImage(signatureDataUrl, "PNG", marginX, y - 45, 180, 56);
-  }
-  doc.setDrawColor(120);
-  doc.line(marginX, y + 14, marginX + 200, y + 14);
-  doc.line(340, y + 14, 340 + 200, y + 14);
-  doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
-  doc.text("Employee Signature", marginX, y + 28);
-  doc.text("Issued By Signature", 340, y + 28);
-  doc.text(`Name: ${rec.employeeName || ""}`, marginX, y + 44);
-  doc.text(`Name: ${rec.assignedBy || ""}`, 340, y + 44);
-
-  const filename = `Handover_${safeFileBit(rec.employeeName)}_${safeFileBit(rec.assetName)}.pdf`;
+  const first = groups[0] || {};
+  const filename = groups.length === 1 && first.records.length === 1
+    ? `Handover_${safeFileBit(first.employeeName)}_${safeFileBit(first.records[0].assetName)}.pdf`
+    : groups.length === 1
+      ? `Handover_${safeFileBit(first.employeeName)}_${first.records.length}_assets.pdf`
+      : `Handover_${groups.length}_employees.pdf`;
   doc.save(filename);
-  logAction("Generated handover slip", `${rec.assetName} → ${rec.employeeName}`);
+
+  const totalAssets = groups.reduce((s, g) => s + g.records.length, 0);
+  logAction("Generated handover slip", groups.length === 1
+    ? `${totalAssets} asset(s) → ${first.employeeName}`
+    : `${totalAssets} asset(s) across ${groups.length} employees`);
   toast("Handover slip downloaded");
 }
 
@@ -2573,6 +2656,15 @@ function renderReports() {
   content.innerHTML = `
     <div class="card" style="margin-bottom:18px">
       <div class="card-header">
+        <div><h2>Backup This Office</h2><div class="sub">A raw JSON snapshot — restorable exactly via the admin-tools restore script, unlike the Excel exports below</div></div>
+        <button class="btn btn-primary btn-sm" id="jsonBackupBtn">⬇ Download Backup (JSON)</button>
+      </div>
+      <p class="muted" style="margin-top:0">For real ongoing "automated" backups (not just whenever someone remembers to click this), see
+      <code>admin-tools_DO_NOT_UPLOAD/backup-firestore.js</code> — it can be scheduled to run on its own.</p>
+    </div>
+
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-header">
         <div><h2>Export Everything</h2><div class="sub">One Excel file with every module below as its own sheet, for <strong>${escapeHtml(officeName)}</strong></div></div>
         <button class="btn btn-primary btn-sm" id="exportAllBtn">⬇ Export Full Workbook</button>
       </div>
@@ -2597,6 +2689,25 @@ function renderReports() {
       </div>
     </div>
   `;
+
+  document.getElementById("jsonBackupBtn").onclick = async () => {
+    await loadActivityLog();
+    const snapshot = {
+      generatedAt: new Date().toISOString(),
+      info: OFFICES.find(o => o.id === currentOfficeId) || { id: currentOfficeId },
+      lists: DB.lists, stockManual: DB.stockManual,
+      employees: DB.employees, assignments: DB.assignments, inventory: DB.inventory,
+      refills: DB.refills, categories: DB.categories, logs: activityLogCache,
+    };
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${safeFileBit(officeName)}_backup_${todayISO()}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    logAction("Downloaded backup", `Manual JSON backup for ${officeName}`);
+    toast("Backup downloaded");
+  };
 
   document.querySelectorAll(".report-tile button[data-kind]").forEach(btn => {
     btn.onclick = () => exportSheet(`${safeFileBit(officeName)}_${btn.dataset.kind}`, btn.dataset.sheet, reportRows(btn.dataset.kind));

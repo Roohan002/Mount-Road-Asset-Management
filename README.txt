@@ -206,25 +206,45 @@ handle that — but both are good practice once you're comfortable.
 ASSET HANDOVER SLIPS (PDF)
 -------------------------------
 On the Asset Assignment page, click the 📄 icon on any row to generate a
-signed PDF handover slip — asset + employee details, a declaration of
-receipt, and an optional on-screen signature (draw with mouse or finger)
-embedded into the PDF. Downloads straight to your device; every slip
-generated is recorded in the Activity Log.
+signed PDF handover slip for that one item — asset + employee details, a
+declaration of receipt, and an optional on-screen signature (draw with
+mouse or finger) embedded into the PDF.
 
-REPORTS — EXPORT TO EXCEL
------------------------------
+To hand over several assets to someone at once, tick their rows' checkboxes
+and click "📄 Generate Slip for Selected" in the bulk bar — that produces
+ONE combined slip listing every selected asset for that employee (still
+with signature capture). If your selection spans more than one employee,
+it instead generates one multi-page PDF, one page per employee (no
+signature capture in that case — nothing sensible to sign for a batch
+covering several people at once).
+
+Every slip generated, single or combined, is recorded in the Activity Log.
+
+REPORTS — EXPORT TO EXCEL & BACKUPS
+----------------------------------------
 The "Reports" page lets you export any module (Employees, Assignments,
 Inventory, Stock Summary, Refill Log, Categories, Activity Log) as its own
 .xlsx file, or click "Export Full Workbook" for one Excel file with every
 module as its own sheet — handy for sharing a snapshot with someone
-outside the app, or for your own backups.
+outside the app.
 
-ACTIVITY LOG — TRACE WHO DID WHAT
-------------------------------------
+For an actual restorable backup (not just a spreadsheet to look at), use
+"Download Backup (JSON)" at the top of that page — but that only runs
+when someone remembers to click it. For real ongoing automated backups,
+see admin-tools_DO_NOT_UPLOAD/backup-firestore.js, which can be scheduled
+to run on its own (details in that folder's README).
+
+ACTIVITY LOG — TRACE WHO DID WHAT, APPEND-ONLY
+----------------------------------------------------
 Since multiple people can sign in, every add, edit, delete, import, and
 reset is recorded to the "Activity Log" page in the sidebar — showing the
 timestamp, the signed-in email that did it, the action, and what changed.
 Search and filter by user to trace down a specific mistake.
+
+The log is append-only, enforced by firestore.rules: entries can be
+created but never edited or deleted by anyone, not even Admins. That's
+what makes it trustworthy as an actual audit trail rather than just
+another editable list.
 
 Each office keeps its own completely separate activity log, matching how
 each office's data is separate — actions in "Andheri Branch" never show up
