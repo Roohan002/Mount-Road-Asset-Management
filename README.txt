@@ -164,6 +164,53 @@ If an office still has its older, single-document data from before this
 update, the app converts it automatically and safely the next time
 anyone opens that office — no action needed on your part.
 
+YOUR REAL EMPLOYEE DATA IS NO LONGER IN THE PUBLIC WEBSITE FILES
+--------------------------------------------------------------------
+Previously, js/data.js — a file that loads in every visitor's browser
+before any login check — contained your actual employee names, IDs,
+departments, and assignment history in plain text. Anyone could open
+Chrome DevTools > Sources and read it, no account needed. That's now
+fixed: js/data.js only contains generic, non-sensitive defaults (category
+names like "PC"/"Headphone", dropdown option lists, stock thresholds).
+Your real data lives only in Firestore, behind the sign-in wall.
+
+Your original data isn't lost — it's saved in
+admin-tools_DO_NOT_UPLOAD/seed-data.json, alongside a Node.js script to
+re-seed a Firestore office from it if you ever need to (see that folder's
+own README). As the folder name says: never upload that folder to your
+website — keep it on your own computer only.
+
+ABOUT THE FIREBASE API KEY BEING VISIBLE
+--------------------------------------------
+If you've inspected js/firebase-config.js and noticed the apiKey is
+readable — that's expected and not a security bug. Unlike a password or
+a server secret key, a Firebase Web API key isn't meant to be secret; it
+just tells your browser which Firebase project to talk to. Every
+Firebase web app in existence ships this the same way (Google's own
+docs confirm this). Your actual protection is:
+  - Firestore Security Rules (firestore.rules) — nobody can read or
+    write data without being signed in, exactly as before.
+  - Firebase Authentication — only accounts you create can sign in.
+
+Two optional extra hardening steps if you want to be extra cautious:
+  1. Restrict the API key to your domain: Google Cloud Console
+     (console.cloud.google.com) > APIs & Services > Credentials > click
+     your Firebase API key > "Application restrictions" > "Websites" >
+     add your Netlify domain (and localhost if you test locally).
+     This stops the key from being usable from any other website.
+  2. Enable Firebase App Check (Firebase console > Build > App Check)
+     for an extra layer against automated abuse of your project.
+Neither is required for your data to be safe — Firestore Rules already
+handle that — but both are good practice once you're comfortable.
+
+ASSET HANDOVER SLIPS (PDF)
+-------------------------------
+On the Asset Assignment page, click the 📄 icon on any row to generate a
+signed PDF handover slip — asset + employee details, a declaration of
+receipt, and an optional on-screen signature (draw with mouse or finger)
+embedded into the PDF. Downloads straight to your device; every slip
+generated is recorded in the Activity Log.
+
 REPORTS — EXPORT TO EXCEL
 -----------------------------
 The "Reports" page lets you export any module (Employees, Assignments,

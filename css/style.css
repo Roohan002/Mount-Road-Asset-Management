@@ -591,3 +591,7 @@ tbody tr{ transition: background-color .12s ease; }
 .report-tile:hover{ box-shadow: var(--shadow-sm); transform: translateY(-1px); }
 .report-tile-icon{ font-size:24px; }
 .report-tile-label{ font-size:13px; font-weight:600; color:var(--text); }
+
+/* ---------- Signature pad (handover slips) ---------- */
+.sig-pad-wrap{ border:1.5px dashed var(--border); border-radius:8px; overflow:hidden; background:#fff; }
+.sig-pad{ display:block; width:100%; height:150px; cursor:crosshair; touch-action:none; }

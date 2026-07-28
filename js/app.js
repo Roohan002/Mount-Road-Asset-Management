@@ -301,13 +301,13 @@ function viewerNotice() {
 function seedFromSource() {
   const d = JSON.parse(JSON.stringify(SEED_DATA));
   return {
-    employees: d.employees.map(e => ({ ...e, uid: uid() })),
-    categories: d.categories.map(c => ({ ...c, uid: uid() })),
-    lists: d.lists,
-    assignments: d.assignments.map(a => ({ ...a, uid: uid() })),
-    refills: d.refills.map(r => ({ ...r, uid: uid() })),
+    employees: (d.employees || []).map(e => ({ ...e, uid: uid() })),
+    categories: (d.categories || []).map(c => ({ ...c, uid: uid() })),
+    lists: d.lists || {},
+    assignments: (d.assignments || []).map(a => ({ ...a, uid: uid() })),
+    refills: (d.refills || []).map(r => ({ ...r, uid: uid() })),
     inventory: [],
-    stockManual: d.stockManual,
+    stockManual: d.stockManual || {},
   };
 }
 
@@ -1042,7 +1042,7 @@ function renderAssignment() {
         <thead><tr>
           ${isAdmin() ? `<th class="ck-col"><input type="checkbox" class="select-ck" id="assignSelectAll" aria-label="Select all assignments"></th>` : ""}
           <th>Date</th><th>Asset</th><th>Asset Tag</th><th>Employee</th><th>Dept</th><th>Assigned By</th>
-          <th>Return Date</th><th>Status</th><th>Remarks</th>${isAdmin() ? "<th></th>" : ""}
+          <th>Return Date</th><th>Status</th><th>Remarks</th><th></th>
         </tr></thead>
         <tbody id="assignTbody"></tbody>
       </table></div>
@@ -1102,14 +1102,17 @@ function paintAssignTable() {
       <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}</td>
       <td>${statusBadge(a.status)}</td>
       <td>${escapeHtml(a.remarks || "—")}</td>
-      ${admin ? `<td>
+      <td>
         <div class="row-actions">
+          <button class="btn btn-secondary btn-sm btn-icon" title="Handover Slip (PDF)" aria-label="Generate handover slip for ${escapeHtml(a.employeeName)}" onclick="openHandoverSlip('${a.uid}')">📄</button>
+          ${admin ? `
           <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit assignment for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
           <button class="btn btn-danger btn-sm btn-icon" title="Delete" aria-label="Delete assignment for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>
+          ` : ""}
         </div>
-      </td>` : ""}
+      </td>
     </tr>
-  `).join("") : `<tr class="empty-row"><td colspan="11">${filterActive ? `No records match your search/filters. <a href="#" id="assignEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No assignments yet"}</td></tr>`;
+  `).join("") : `<tr class="empty-row"><td colspan="${admin ? 11 : 10}">${filterActive ? `No records match your search/filters. <a href="#" id="assignEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No assignments yet"}</td></tr>`;
 
   document.getElementById("assignBulkBar").innerHTML = bulkToolbarHtml(assignSelected.size, rows.length);
   const emptyClear = document.getElementById("assignEmptyClear");
@@ -1164,6 +1167,118 @@ function wireAssignBulk(rows) {
       });
     };
   }
+}
+
+/* ---------------- Asset Handover Slip (PDF, with signature) ---------------- */
+function openHandoverSlip(uidVal) {
+  const rec = DB.assignments.find(a => a.uid === uidVal);
+  if (!rec) return;
+  openModal("Asset Handover Slip", `
+    <p class="muted" style="margin-top:0"><strong>${escapeHtml(rec.assetName)}</strong>${rec.assetTagNo ? ` (${escapeHtml(rec.assetTagNo)})` : ""} → <strong>${escapeHtml(rec.employeeName)}</strong> on ${fmtDate(rec.date)}</p>
+    <div class="field"><label>Employee Signature (optional — draw with mouse/finger)</label>
+      <div class="sig-pad-wrap">
+        <canvas id="sigPad" class="sig-pad" width="480" height="150"></canvas>
+      </div>
+      <button type="button" class="btn btn-secondary btn-sm" id="sigClearBtn" style="margin-top:8px;">Clear Signature</button>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelSlip">Cancel</button>
+      <button class="btn btn-primary" id="downloadSlipBtn">⬇ Generate PDF</button>
+    </div>
+  `, () => {
+    const canvas = document.getElementById("sigPad");
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "#1c2333"; ctx.lineWidth = 2; ctx.lineCap = "round";
+    let drawing = false, hasSignature = false;
+    const pos = (e) => {
+      const r = canvas.getBoundingClientRect();
+      const p = e.touches ? e.touches[0] : e;
+      return { x: (p.clientX - r.left) * (canvas.width / r.width), y: (p.clientY - r.top) * (canvas.height / r.height) };
+    };
+    const start = (e) => { drawing = true; hasSignature = true; const p = pos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); e.preventDefault(); };
+    const move = (e) => { if (!drawing) return; const p = pos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); e.preventDefault(); };
+    const end = () => { drawing = false; };
+    canvas.addEventListener("mousedown", start); canvas.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", end);
+    canvas.addEventListener("touchstart", start); canvas.addEventListener("touchmove", move); canvas.addEventListener("touchend", end);
+    document.getElementById("sigClearBtn").onclick = () => { ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, canvas.width, canvas.height); hasSignature = false; };
+
+    document.getElementById("cancelSlip").onclick = closeModal;
+    document.getElementById("downloadSlipBtn").onclick = () => {
+      const sigDataUrl = hasSignature ? canvas.toDataURL("image/png") : null;
+      generateHandoverSlipPDF(rec, sigDataUrl);
+      closeModal();
+    };
+  });
+}
+
+function generateHandoverSlipPDF(rec, signatureDataUrl) {
+  if (typeof window.jspdf === "undefined") { toast("PDF library didn't load — check your connection", "err"); return; }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const officeInfo = OFFICES.find(o => o.id === currentOfficeId) || {};
+  const officeName = officeInfo.name || "Speelfinance";
+  const officeCity = officeInfo.city || "";
+  const marginX = 48;
+  let y = 56;
+
+  doc.setFont("helvetica", "bold"); doc.setFontSize(18);
+  doc.text("Speelfinance", marginX, y);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(100);
+  doc.text(`${officeName}${officeCity ? " — " + officeCity : ""}`, marginX, y + 16);
+  doc.setTextColor(0);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(13);
+  doc.text("ASSET HANDOVER SLIP", 595 - marginX, y, { align: "right" });
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(100);
+  doc.text(`Generated ${fmtDate(todayISO())}`, 595 - marginX, y + 16, { align: "right" });
+  doc.setTextColor(0);
+  y += 36;
+  doc.setDrawColor(220); doc.line(marginX, y, 595 - marginX, y);
+  y += 28;
+
+  const rows = [
+    ["Employee Name", rec.employeeName || "—"],
+    ["Employee ID", rec.employeeId || "—"],
+    ["Department", rec.department || "—"],
+    ["Asset", rec.assetName || "—"],
+    ["Asset Tag No.", rec.assetTagNo || "—"],
+    ["Assignment Date", rec.date ? fmtDate(rec.date) : "—"],
+    ["Assigned By", rec.assignedBy || "—"],
+    ["Status", rec.status || "—"],
+    ["Remarks", rec.remarks || "—"],
+  ];
+  doc.setFontSize(11);
+  rows.forEach(([label, value]) => {
+    doc.setFont("helvetica", "bold"); doc.text(label, marginX, y);
+    doc.setFont("helvetica", "normal"); doc.text(String(value), marginX + 150, y);
+    y += 22;
+  });
+
+  y += 14;
+  doc.setFont("helvetica", "italic"); doc.setFontSize(9.5); doc.setTextColor(70);
+  const declaration = "I acknowledge receipt of the asset(s) listed above in good working condition. I agree to take reasonable care of it, use it only for authorized purposes, and return it upon request or upon exit from the organization.";
+  const wrapped = doc.splitTextToSize(declaration, 595 - marginX * 2);
+  doc.text(wrapped, marginX, y);
+  y += wrapped.length * 13 + 30;
+  doc.setTextColor(0);
+
+  if (signatureDataUrl) {
+    doc.addImage(signatureDataUrl, "PNG", marginX, y - 45, 180, 56);
+  }
+  doc.setDrawColor(120);
+  doc.line(marginX, y + 14, marginX + 200, y + 14);
+  doc.line(340, y + 14, 340 + 200, y + 14);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+  doc.text("Employee Signature", marginX, y + 28);
+  doc.text("Issued By Signature", 340, y + 28);
+  doc.text(`Name: ${rec.employeeName || ""}`, marginX, y + 44);
+  doc.text(`Name: ${rec.assignedBy || ""}`, 340, y + 44);
+
+  const filename = `Handover_${safeFileBit(rec.employeeName)}_${safeFileBit(rec.assetName)}.pdf`;
+  doc.save(filename);
+  logAction("Generated handover slip", `${rec.assetName} → ${rec.employeeName}`);
+  toast("Handover slip downloaded");
 }
 
 function openAssignForm(uidVal) {
