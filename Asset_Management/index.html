@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Speelfinance — Asset Management</title>
+<link rel="icon" type="image/png" href="assets/speelfinance-icon.png" />
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <div class="app-shell">
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <img class="brand-mark" src="assets/speelfinance-icon.png" alt="Speelfinance">
+        <div class="brand-text">
+          <div class="brand-title">Speelfinance</div>
+          <div class="brand-sub">Asset Management</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-page="dashboard">
+          <span class="nav-icon">📊</span><span>Dashboard</span>
+        </button>
+        <button class="nav-item" data-page="assignment">
+          <span class="nav-icon">🗂️</span><span>Asset Assignment</span>
+        </button>
+        <button class="nav-item" data-page="inventory">
+          <span class="nav-icon">💻</span><span>Master Inventory</span>
+        </button>
+        <button class="nav-item" data-page="employees">
+          <span class="nav-icon">👥</span><span>Employees</span>
+        </button>
+        <button class="nav-item" data-page="empHistory">
+          <span class="nav-icon">🕘</span><span>Employee History</span>
+        </button>
+        <button class="nav-item" data-page="stock">
+          <span class="nav-icon">📦</span><span>Stock Summary</span>
+        </button>
+        <button class="nav-item" data-page="refill">
+          <span class="nav-icon">➕</span><span>Stock Refill Log</span>
+        </button>
+        <button class="nav-item" data-page="categories">
+          <span class="nav-icon">🏷️</span><span>Asset Categories</span>
+        </button>
+        <button class="nav-item" data-page="activityLog">
+          <span class="nav-icon">📝</span><span>Activity Log</span>
+        </button>
+        <button class="nav-item" data-page="reports">
+          <span class="nav-icon">📤</span><span>Reports</span>
+        </button>
+        <button class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙️</span><span>Settings</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="office-box" id="officeBox">
+          <div class="role-row">
+            <span class="role-label">Office</span>
+            <span class="office-badge" id="officeBadge">—</span>
+          </div>
+          <button class="btn-ghost" id="switchOfficeBtn">🏢 Switch Office</button>
+        </div>
+        <div class="role-box">
+          <div class="role-row">
+            <span class="role-label">Signed in as</span>
+            <span class="role-badge" id="roleBadge">Viewer</span>
+          </div>
+          <div class="role-email" id="roleEmailLabel"></div>
+          <button class="btn-ghost" id="roleSwitchBtn">Sign Out</button>
+        </div>
+        <button class="btn-ghost" id="resetDataBtn" title="Reset to original sheet data">↺ Reset Data</button>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <div class="main">
+      <header class="topbar">
+        <button class="hamburger" id="hamburger">☰</button>
+        <h1 class="page-title" id="pageTitle">Dashboard</h1>
+      </header>
+
+      <main class="content" id="content">
+        <!-- page content injected here -->
+      </main>
+    </div>
+  </div>
+
+  <!-- Modal -->
+  <div class="modal-overlay" id="modalOverlay">
+    <div class="modal" id="modal">
+      <div class="modal-header">
+        <h2 id="modalTitle">Title</h2>
+        <button class="modal-close" id="modalClose">✕</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+  <!-- hidden file input used for bulk employee import (CSV / XLSX / XLS) -->
+  <input type="file" id="employeeFileInput" accept=".csv,.xlsx,.xls,text/csv" style="display:none" />
+
+  <!-- Loading overlay shown while the first Firestore fetch is in flight -->
+  <div class="loading-screen" id="loadingScreen">
+    <div class="loading-box">
+      <div class="spinner"></div>
+      <div>Connecting to Firebase…</div>
+    </div>
+  </div>
+
+  <!-- Shown instead of the app when js/firebase-config.js still has placeholder values,
+       or if Firebase can't be reached (wrong config / rules / offline) -->
+  <div class="setup-screen" id="firebaseSetupScreen">
+    <div class="setup-box">
+      <img class="brand-mark" style="margin-bottom:16px" src="assets/speelfinance-icon.png" alt="Speelfinance">
+      <h1>Connect this app to Firebase</h1>
+      <p id="setupErrorNote" style="display:none; color:var(--red); font-weight:600;">
+        Firebase is configured, but the app couldn't load data — double-check your config values,
+        that Firestore + Authentication are enabled, and that your Security Rules are published.
+      </p>
+      <p>This app stores its data in <strong>Cloud Firestore</strong>, private to people you give a login to.
+      Open <code>js/firebase-config.js</code> in a text editor and follow the steps written at the top of
+      that file, then reload this page.</p>
+      <ol>
+        <li>Create a free project at <a href="https://console.firebase.google.com" target="_blank" rel="noopener">console.firebase.google.com</a></li>
+        <li>Register a Web app and copy its config values into <code>js/firebase-config.js</code></li>
+        <li>Enable <strong>Firestore Database</strong> and <strong>Authentication → Email/Password</strong></li>
+        <li>Add each person who should have access under Authentication → Users</li>
+        <li>Paste the Firestore rules from <code>firestore.rules</code> and publish them</li>
+      </ol>
+      <p class="muted">Full walkthrough with step-by-step details is in <code>README.txt</code> inside this download.</p>
+    </div>
+  </div>
+
+  <!-- Shown instead of the app when nobody is signed in — this app requires a login to view anything -->
+  <div class="signin-screen" id="signInGateScreen">
+    <div class="signin-orb signin-orb-a"></div>
+    <div class="signin-orb signin-orb-b"></div>
+    <div class="signin-card">
+      <div class="signin-logo-ring"><img src="assets/speelfinance-icon.png" alt="Speelfinance"></div>
+      <h1>Welcome back</h1>
+      <p class="signin-sub">Sign in to open the Speelfinance asset tracker</p>
+
+      <div class="signin-field">
+        <label for="gate_email">Email</label>
+        <input type="email" id="gate_email" placeholder="you@company.com" autocomplete="username">
+      </div>
+      <div class="signin-field">
+        <label for="gate_pw">Password</label>
+        <input type="password" id="gate_pw" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <p id="gateErrorNote" class="signin-error" style="display:none;"></p>
+      <button class="signin-btn" id="gateSignInBtn">Sign In</button>
+
+      <div class="signin-footer">Speelfinance · Asset Management</div>
+    </div>
+  </div>
+
+  <!-- Shown after sign-in — pick which office/location's data to open. Every office is
+       stored completely separately in Firestore, so nothing syncs between offices. -->
+  <div class="signin-screen" id="officeSelectScreen">
+    <div class="signin-orb signin-orb-a"></div>
+    <div class="signin-orb signin-orb-b"></div>
+    <div class="office-select-card">
+      <div class="signin-logo-ring"><img src="assets/speelfinance-icon.png" alt="Speelfinance"></div>
+      <h1>Select an Office</h1>
+      <p class="signin-sub">Choose which office's asset data you want to open. Each office keeps its own separate, independent data.</p>
+      <div class="office-grid" id="officeGrid">
+        <!-- office cards injected here by js/app.js -->
+      </div>
+      <button class="btn-ghost" id="addOfficeBtn" style="margin-top:18px; width:100%;">+ Add New Office</button>
+      <div class="signin-footer">Speelfinance · Asset Management</div>
+    </div>
+  </div>
+
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="js/firebase-config.js"></script>
+  <script src="js/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="js/data.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
