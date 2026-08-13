@@ -245,6 +245,7 @@ async function renameOffice(id, name, city) {
 // even by inspecting the page.
 let isSuperAdminUser = false;   // global, from roles/{email}
 let currentOfficeRole = null;   // "admin" | "teamlead" | "viewer" | null — from this office's access/{email}
+let currentOfficeTeam = null;   // which Team a "teamlead" is responsible for, e.g. "KYC Team A" — same access doc
 let officeRoleMap = {};         // officeId -> "admin"|"teamlead"|"viewer", for badges on the office picker
 const OFFICE_ROLES = ["admin", "teamlead", "viewer"]; // valid values for access/{email}.role, most-privileged first
 
@@ -261,17 +262,23 @@ async function fetchGlobalRole() {
 
 async function fetchOfficeRole() {
   currentOfficeRole = null;
+  currentOfficeTeam = null;
   if (!fauth || !fauth.currentUser || !currentOfficeId) return;
   if (isSuperAdminUser) { currentOfficeRole = "admin"; return; }
   try {
     const snap = await docRef().collection("access").doc(fauth.currentUser.email).get();
-    const role = snap.exists ? snap.data().role : "viewer";
+    const data = snap.exists ? snap.data() : {};
+    const role = data.role || "viewer";
     currentOfficeRole = OFFICE_ROLES.includes(role) ? role : "viewer";
+    currentOfficeTeam = (data.team || "").trim();
   } catch (err) {
     console.error("Couldn't look up office role, defaulting to Viewer:", err);
     currentOfficeRole = "viewer";
   }
 }
+// Which Team the signed-in Team Lead is responsible for (blank if not yet
+// assigned one, or if they're not a Team Lead at all).
+function myTeam() { return currentOfficeTeam || ""; }
 
 // Every office is still visible to everyone signed in (view access stays simple and
 // open, so nobody loses the ability to browse an office they could see before).
@@ -833,6 +840,29 @@ function goto(page) {
   PAGES[page].render();
   document.getElementById("sidebar").classList.remove("open");
   window.scrollTo(0, 0);
+  updateRequestsNavBadge();
+}
+// Unread-style count on the "Asset Requests" nav item — Submitted requests an
+// Admin hasn't looked at yet, same idea as a chat app's unread badge. Called
+// from goto() so it stays live on every page render AND every realtime data
+// update (attachRealtimeListener calls goto(currentPage) on change), without
+// needing its own separate listener.
+function updateRequestsNavBadge() {
+  const btn = document.querySelector('.nav-item[data-page="assetRequests"]');
+  if (!btn) return;
+  let badge = btn.querySelector(".nav-badge");
+  const count = isAdmin() ? (DB.requests || []).filter(r => r.status === "Submitted").length : 0;
+  if (count > 0) {
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "nav-badge";
+      btn.appendChild(badge);
+    }
+    badge.textContent = count > 99 ? "99+" : String(count);
+    badge.title = `${count} new asset request${count === 1 ? "" : "s"} awaiting review`;
+  } else if (badge) {
+    badge.remove();
+  }
 }
 
 document.getElementById("nav").addEventListener("click", (e) => {
@@ -1006,7 +1036,7 @@ function svgLifecycleFlow(s) {
 }
 
 // Last 14 days of assignment activity (by Date field), as a smoothed area/line chart.
-function last14DaysActivity() {
+function last14DaysActivityFor(records) {
   const days = [];
   const now = new Date();
   for (let i = 13; i >= 0; i--) {
@@ -1015,8 +1045,9 @@ function last14DaysActivity() {
     const iso = d.toISOString().slice(0, 10);
     days.push({ iso, label: d.toLocaleDateString("en-IN", { day: "2-digit", month: "short" }) });
   }
-  return days.map(d => ({ ...d, count: DB.assignments.filter(a => a.date === d.iso).length }));
+  return days.map(d => ({ ...d, count: records.filter(a => a.date === d.iso).length }));
 }
+function last14DaysActivity() { return last14DaysActivityFor(DB.assignments); }
 function svgTrendChart(points) {
   const w = 620, h = 168, padL = 16, padR = 16, padT = 16, padB = 26;
   const chartW = w - padL - padR, chartH = h - padT - padB;
@@ -1081,11 +1112,162 @@ function svgCategoryBarCompare(rows) {
 /* =========================================================
    DASHBOARD
    ========================================================= */
+// Everything about a Team Lead's own team, in one place: who's on it, what
+// they're currently holding, who has nothing yet, and a category breakdown —
+// joined purely by matching Employee.team against Assignment.employeeName
+// (assignments don't carry a team of their own, so this is the link).
+function computeTeamOverview(team) {
+  const teamKey = (team || "").trim().toLowerCase();
+  const members = teamKey ? DB.employees.filter(e => (e.team || "").trim().toLowerCase() === teamKey) : [];
+  const memberNameKeys = new Set(members.map(e => (e.name || "").trim().toLowerCase()));
+  const teamAssignments = DB.assignments.filter(a => memberNameKeys.has((a.employeeName || "").trim().toLowerCase()));
+  const heldAssignments = teamAssignments.filter(a => a.status === "Assigned");
+
+  const perMember = members.map(emp => {
+    const nameKey = (emp.name || "").trim().toLowerCase();
+    const held = heldAssignments.filter(a => (a.employeeName || "").trim().toLowerCase() === nameKey);
+    return { employee: emp, held };
+  }).sort((a, b) => b.held.length - a.held.length || (a.employee.name || "").localeCompare(b.employee.name || ""));
+
+  const catMap = {};
+  heldAssignments.forEach(a => { catMap[a.assetName] = (catMap[a.assetName] || 0) + 1; });
+  const categoryBreakdown = Object.entries(catMap).sort((a, b) => b[1] - a[1]).map(([label, value], i) => ({ label, value, color: chartColor(i) }));
+
+  return {
+    team, members, memberCount: members.length,
+    assetsHeld: heldAssignments.length,
+    membersWithNothing: perMember.filter(m => m.held.length === 0).length,
+    distinctCategories: Object.keys(catMap).length,
+    perMember, teamAssignments, heldAssignments, categoryBreakdown,
+  };
+}
+function teamStatCards(ov) {
+  return [
+    { icon: "👥", cls: "icon-blue", value: ov.memberCount, label: "Team Members" },
+    { icon: "📦", cls: "icon-purple", value: ov.assetsHeld, label: "Assets Currently Held" },
+    { icon: "🙈", cls: "icon-amber", value: ov.membersWithNothing, label: "With Nothing Assigned" },
+    { icon: "🏷️", cls: "icon-teal", value: ov.distinctCategories, label: "Asset Types In Use" },
+  ];
+}
+
+// A Team Lead's "home" — their own team's asset picture front and center
+// (who has what, who has nothing, category mix, recent activity), plus their
+// own request queue below it so both halves of the job are in one place.
+function renderTeamLeadDashboard() {
+  const content = document.getElementById("content");
+  const team = myTeam();
+  const ov = computeTeamOverview(team);
+  const mine = sortRequestsNewestFirst(getMyRequests());
+  const reqSummary = computeRequestsSummary(mine);
+  const recentRequests = mine.slice(0, 6);
+  const recentTeamActivity = sortAssignmentsNewestFirst(ov.teamAssignments).slice(0, 8);
+
+  content.innerHTML = `
+    ${viewerNotice()}
+    ${!team ? `
+      <div class="viewer-note" style="align-items:flex-start;border-color:var(--amber,#e2a13b);">
+        <span style="font-size:16px;">👋</span>
+        <div>
+          <strong>Your account isn't linked to a team yet.</strong>
+          <div style="margin-top:2px;">Ask an Admin to assign one under Settings → Office Access, and this page will fill in with your team's asset picture. Your own requests still work below in the meantime.</div>
+        </div>
+      </div>
+    ` : `
+      <div class="req-detail-head" style="margin-bottom:16px;">
+        <div><h2 style="margin:0;font-size:17px;">${escapeHtml(team)}</h2><div class="muted" style="font-size:12.5px;margin-top:2px;">${ov.memberCount} team member${ov.memberCount === 1 ? "" : "s"}</div></div>
+        <button class="btn btn-primary btn-sm" id="tlNewReqBtn">+ New Asset Request</button>
+      </div>
+      ${renderStatGrid(teamStatCards(ov))}
+
+      <div class="dash-stack">
+        <div class="grid-2-even">
+          <div class="card">
+            <div class="card-header">
+              <div><h2>Assets by Category</h2><div class="sub">Currently held by your team</div></div>
+            </div>
+            ${ov.categoryBreakdown.length ? `<div class="chart-flex">${svgDonutChart(ov.categoryBreakdown, { centerLabel: "Held" })}${chartLegend(ov.categoryBreakdown)}</div>`
+              : `<div class="chart-empty">Nobody on your team has an asset assigned yet.</div>`}
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <div><h2>Team Activity</h2><div class="sub">Assignments &amp; returns — last 14 days</div></div>
+            </div>
+            ${svgTrendChart(last14DaysActivityFor(ov.teamAssignments))}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div><h2>Who Has What</h2><div class="sub">Every team member and what's currently assigned to them</div></div>
+          </div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Employee</th><th>Employee ID</th><th>Currently Held</th><th>Count</th></tr></thead>
+            <tbody>
+              ${ov.perMember.length ? ov.perMember.map(m => `
+                <tr>
+                  <td>${escapeHtml(m.employee.name)}</td>
+                  <td>${escapeHtml(m.employee.id || "—")}</td>
+                  <td>${m.held.length ? m.held.map(a => `<span class="badge badge-grey" style="margin:1px 3px 1px 0;">${escapeHtml(a.assetName)}${a.assetTagNo ? ` (${escapeHtml(a.assetTagNo)})` : ""}</span>`).join("") : `<span class="muted">Nothing assigned</span>`}</td>
+                  <td>${m.held.length}</td>
+                </tr>
+              `).join("") : `<tr class="empty-row"><td colspan="4">No employees found with Team = "${escapeHtml(team)}" yet — set it on the Employees page, or it fills in automatically the next time a request for them is approved.</td></tr>`}
+            </tbody>
+          </table></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div><h2>Recent Team Asset Activity</h2><div class="sub">Latest assignments &amp; returns for your team</div></div>
+          </div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Date</th><th>Asset</th><th>Employee</th><th>Status</th></tr></thead>
+            <tbody>
+              ${recentTeamActivity.length ? recentTeamActivity.map(a => `
+                <tr>
+                  <td>${fmtAssignDateCell(a)}</td>
+                  <td>${escapeHtml(a.assetName)}${a.assetTagNo ? ` <span class="muted">(${escapeHtml(a.assetTagNo)})</span>` : ""}</td>
+                  <td>${escapeHtml(a.employeeName)}</td>
+                  <td>${statusBadge(a.status)}</td>
+                </tr>
+              `).join("") : `<tr class="empty-row"><td colspan="4">No activity yet for this team.</td></tr>`}
+            </tbody>
+          </table></div>
+        </div>
+      </div>
+    `}
+
+    <div class="card-header" style="margin:22px 0 2px;">
+      <div><h2 style="margin:0;">My Asset Requests</h2><div class="sub">Requests you've submitted, across every status</div></div>
+      <button class="btn btn-secondary btn-sm" onclick="goto('assetRequests')">View all →</button>
+    </div>
+    ${renderStatGrid(requestStatCards(reqSummary))}
+    <div class="card">
+      <div class="table-wrap"><table>
+        <thead><tr><th>Request ID</th><th>Employee</th><th>Assets</th><th>Status</th><th>Last Updated</th></tr></thead>
+        <tbody>
+          ${recentRequests.length ? recentRequests.map(r => `
+            <tr style="cursor:pointer" title="Click to view" onclick="openRequestDetail('${r.uid}')">
+              <td>${r.requestId ? `<span class="badge badge-grey">${escapeHtml(r.requestId)}</span>` : `<span class="muted">Draft</span>`}</td>
+              <td>${escapeHtml(r.employeeName || "—")}</td>
+              <td>${escapeHtml(requestItemsSummary(r))}</td>
+              <td>${requestStatusBadge(r.status)}</td>
+              <td>${fmtDate((r.updatedAt || r.createdAt || "").slice(0, 10))}</td>
+            </tr>
+          `).join("") : `<tr class="empty-row"><td colspan="5">No asset requests yet — click "+ New Asset Request" to submit one for your team.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>
+
+    <p class="footer-note"><span class="live-dot" style="display:inline-block;vertical-align:middle;margin-right:6px;"></span>Speelfinance · Asset Management Tracker — live, synced in real time</p>
+  `;
+  const newReqBtn = document.getElementById("tlNewReqBtn");
+  if (newReqBtn) newReqBtn.onclick = () => openRequestForm();
+}
+
 function renderDashboard() {
-  // A pure Team Lead's "home" is their own request queue, not the full org
-  // dashboard (§20) — reuses renderMyAssetRequests() as-is rather than building
-  // a second, near-identical stat-card+table page.
-  if (isTeamLead()) return renderMyAssetRequests();
+  // A pure Team Lead's home is their own team's asset picture + their own
+  // request queue (§20) — a dedicated dashboard, not the full org one below.
+  if (isTeamLead()) return renderTeamLeadDashboard();
 
   const s = computeDashboard();
   const content = document.getElementById("content");
@@ -4579,17 +4761,17 @@ async function loadOfficeAccessList() {
     tbody.innerHTML = rows.length ? rows.map(r => `
       <tr>
         <td>${escapeHtml(r.email)}</td>
-        <td><span class="badge ${officeRoleBadgeClass(r.role)}">${officeRoleLabel(r.role)}</span></td>
+        <td><span class="badge ${officeRoleBadgeClass(r.role)}">${officeRoleLabel(r.role)}</span>${r.role === "teamlead" && r.team ? `<div class="muted" style="font-size:11px;margin-top:2px;">${escapeHtml(r.team)}</div>` : ""}</td>
         <td>
           <div class="row-actions">
-            <button class="btn btn-secondary btn-sm btn-icon oa-edit-btn" title="Change role" data-email="${escapeHtml(r.email)}" data-role="${escapeHtml(r.role)}">✏️</button>
+            <button class="btn btn-secondary btn-sm btn-icon oa-edit-btn" title="Change role" data-email="${escapeHtml(r.email)}" data-role="${escapeHtml(r.role)}" data-team="${escapeHtml(r.team || "")}">✏️</button>
             <button class="btn btn-danger btn-sm btn-icon oa-del-btn" title="Remove access" data-email="${escapeHtml(r.email)}">🗑️</button>
           </div>
         </td>
       </tr>
     `).join("") : `<tr class="empty-row"><td colspan="3">Nobody has office-specific access yet — Super Admins can already edit here.</td></tr>`;
     tbody.querySelectorAll(".oa-edit-btn").forEach(btn => {
-      btn.onclick = () => openOfficeAccessForm(btn.dataset.email, btn.dataset.role);
+      btn.onclick = () => openOfficeAccessForm(btn.dataset.email, btn.dataset.role, btn.dataset.team);
     });
     tbody.querySelectorAll(".oa-del-btn").forEach(btn => {
       btn.onclick = () => removeOfficeAccess(btn.dataset.email);
@@ -4600,10 +4782,11 @@ async function loadOfficeAccessList() {
   }
 }
 
-function openOfficeAccessForm(existingEmail, existingRole) {
+function openOfficeAccessForm(existingEmail, existingRole, existingTeam) {
   if (!requireSuperAdminOrWarn()) return;
   const editing = !!existingEmail;
   const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "this office";
+  const teams = distinctEmployeeTeams();
   openModal(editing ? "Change Office Access" : "Grant Office Access", `
     ${editing ? "" : `<p class="muted" style="margin-top:0">Grants access to <strong>${escapeHtml(officeName)}</strong> only. The email must exactly match a login already created in Firebase → Authentication → Users.</p>`}
     <div class="field"><label>Email</label><input type="email" id="f_oaEmail" value="${escapeHtml(existingEmail || "")}" ${editing ? "disabled" : ""} placeholder="person@company.com"></div>
@@ -4614,20 +4797,31 @@ function openOfficeAccessForm(existingEmail, existingRole) {
         <option value="admin" ${existingRole === "admin" ? "selected" : ""}>Admin — can edit this office</option>
       </select>
     </div>
+    <div class="field" id="f_oaTeamWrap" style="display:none">
+      <label>Team <span class="muted" style="font-weight:500;">(which team this Team Lead's dashboard shows — matches employees' Team field)</span></label>
+      <input type="text" id="f_oaTeam" list="oaTeamList" value="${escapeHtml(existingTeam || "")}">
+      <datalist id="oaTeamList">${teams.map(t => `<option value="${escapeHtml(t)}">`).join("")}</datalist>
+    </div>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelOA">Cancel</button>
       <button class="btn btn-primary" id="saveOA">${editing ? "Save" : "Grant Access"}</button>
     </div>
   `, () => {
     const emailInp = document.getElementById("f_oaEmail");
+    const roleSel = document.getElementById("f_oaRole");
+    const teamWrap = document.getElementById("f_oaTeamWrap");
+    const syncTeamWrap = () => { teamWrap.style.display = roleSel.value === "teamlead" ? "" : "none"; };
+    roleSel.addEventListener("change", syncTeamWrap);
+    syncTeamWrap();
     document.getElementById("cancelOA").onclick = closeModal;
     document.getElementById("saveOA").onclick = async () => {
       const email = emailInp.value.trim().toLowerCase();
-      const role = document.getElementById("f_oaRole").value;
+      const role = roleSel.value;
+      const team = role === "teamlead" ? document.getElementById("f_oaTeam").value.trim() : "";
       if (!email) { toast("Enter an email", "err"); return; }
       try {
-        await docRef().collection("access").doc(email).set({ email, role, updatedAt: new Date().toISOString() }, { merge: true });
-        logAction(editing ? "Changed office access" : "Granted office access", `${email} → ${officeRoleLabel(role)}`);
+        await docRef().collection("access").doc(email).set({ email, role, team, updatedAt: new Date().toISOString() }, { merge: true });
+        logAction(editing ? "Changed office access" : "Granted office access", `${email} → ${officeRoleLabel(role)}${team ? ` (${team})` : ""}`);
         closeModal();
         toast(editing ? "Access updated" : "Access granted");
         loadOfficeAccessList();

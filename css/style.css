@@ -85,6 +85,11 @@ body{
   transition: background .15s, color .15s;
 }
 .nav-icon{ font-size:16px; width:20px; text-align:center; }
+.nav-badge{
+  margin-left:auto; background:#ef4444; color:#fff; font-size:10.5px; font-weight:800;
+  min-width:18px; height:18px; padding:0 5px; border-radius:999px; line-height:1;
+  display:flex; align-items:center; justify-content:center; flex-shrink:0;
+}
 .nav-item:hover{ background: rgba(255,255,255,.06); color:#fff; }
 .nav-item.active{
   background: linear-gradient(135deg, var(--primary), #6a5cf6);
