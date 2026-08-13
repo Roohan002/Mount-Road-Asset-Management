@@ -77,27 +77,22 @@ function requestsQuery() {
 // subcollection (not the office meta doc, which only Admins can write) so a Team
 // Lead submitting a request can still get a real, collision-safe number.
 function requestCounterRef() { return docRef().collection("counters").doc("assetRequests"); }
-// The counter is one shared document, so two people submitting a request in
-// the same instant genuinely do contend for it — Firestore surfaces that as
-// 'aborted'/'resource-exhausted', not a real connectivity problem. A couple of
-// quick retries clears that up almost every time instead of failing outright.
-async function nextRequestId(retriesLeft = 2) {
+// fdb.runTransaction() already retries internally on real contention (two
+// people submitting at the same instant) — adding our own retry loop on top
+// of that just compounds into dozens of attempts and a much longer wait
+// without fixing anything, especially for 'resource-exhausted', which usually
+// means an actual Firestore quota/rate limit, not a one-document traffic jam
+// that a retry will clear. So: one attempt, fail fast, and let the caller
+// show a clear reason instead of spinning.
+async function nextRequestId() {
   const year = new Date().getFullYear();
-  try {
-    const seq = await fdb.runTransaction(async tx => {
-      const snap = await tx.get(requestCounterRef());
-      const cur = ((snap.exists && snap.data()[year]) || 0) + 1;
-      tx.set(requestCounterRef(), { [year]: cur }, { merge: true });
-      return cur;
-    });
-    return `AST-REQ-${year}-${String(seq).padStart(5, "0")}`;
-  } catch (err) {
-    if (retriesLeft > 0 && ["resource-exhausted", "aborted", "unavailable"].includes(err && err.code)) {
-      await new Promise(r => setTimeout(r, 500 * (3 - retriesLeft)));
-      return nextRequestId(retriesLeft - 1);
-    }
-    throw err;
-  }
+  const seq = await fdb.runTransaction(async tx => {
+    const snap = await tx.get(requestCounterRef());
+    const cur = ((snap.exists && snap.data()[year]) || 0) + 1;
+    tx.set(requestCounterRef(), { [year]: cur }, { merge: true });
+    return cur;
+  });
+  return `AST-REQ-${year}-${String(seq).padStart(5, "0")}`;
 }
 
 function saveRecord(kind, record) {
@@ -3046,8 +3041,10 @@ async function submitRequestForm(vals, editing, targetStatus) {
     } catch (err) {
       console.error(err);
       const code = err && err.code;
-      const msg = code === "resource-exhausted" || code === "aborted"
-        ? "A lot of submissions hit at the same moment — please wait a few seconds and try once, clicking Submit repeatedly makes this worse"
+      const msg = code === "resource-exhausted"
+        ? "Firestore's quota has been hit for now — this usually means the project's daily free-tier limit, not a busy moment. Retrying won't help immediately; tell your Admin to check Firebase Console → Usage and billing."
+        : code === "aborted"
+        ? "Another submission landed at the exact same moment — please try again."
         : code === "permission-denied"
         ? "You don't have permission to submit this — ask an Admin to check your access"
         : "Couldn't reserve a Request ID — check your connection and try again";
