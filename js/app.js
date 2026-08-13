@@ -1273,7 +1273,7 @@ function paintAssignTable() {
     <tr>
       ${admin ? `<td class="ck-col"><input type="checkbox" class="select-ck row-ck" data-uid="${a.uid}" aria-label="Select assignment for ${escapeHtml(a.employeeName)}" ${assignSelected.has(a.uid) ? "checked" : ""}></td>` : ""}
       <td>${fmtAssignDateCell(a)}</td>
-      <td>${escapeHtml(a.assetName)}</td>
+      <td>${escapeHtml(a.assetName)}${a.sourceRequestId ? `<div class="muted" style="font-size:11px;margin-top:2px;">${admin ? `<a href="#" onclick="event.preventDefault();openRequestByRequestId('${escapeHtml(a.sourceRequestId)}')" style="color:var(--primary);font-weight:600;">📋 from ${escapeHtml(a.sourceRequestId)}</a>` : `📋 from ${escapeHtml(a.sourceRequestId)}`}</div>` : ""}${a.reassignedFromEmployee ? `<div class="muted" style="font-size:11px;margin-top:2px;">🔁 reassigned from ${escapeHtml(a.reassignedFromEmployee)}</div>` : ""}</td>
       <td>${a.assetTagNo ? `<span class="badge badge-grey">${escapeHtml(a.assetTagNo)}</span>` : "—"}</td>
       <td>${escapeHtml(a.employeeName)}</td>
       <td>${escapeHtml(a.department || "—")}</td>
@@ -1286,6 +1286,7 @@ function paintAssignTable() {
           <button class="btn btn-secondary btn-sm btn-icon" title="Handover Slip (PDF)" aria-label="Generate handover slip for ${escapeHtml(a.employeeName)}" onclick="openHandoverSlip('${a.uid}')">📄</button>
           ${admin ? `
           ${a.status !== "Returned" ? `<button class="btn btn-secondary btn-sm btn-icon" title="Return this asset" aria-label="Return asset for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}', true)">↩️</button>` : ""}
+          ${a.status === "Returned" && (a.returnOutcome || "Available") === "Available" ? `<button class="btn btn-primary btn-sm btn-icon" title="Reassign to someone else" aria-label="Reassign ${escapeHtml(a.assetName)} to a different employee" onclick="openReassignForm('${a.uid}')">🔁</button>` : ""}
           <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit assignment for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
           <button class="btn btn-danger btn-sm btn-icon" title="Delete" aria-label="Delete assignment for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>
           ` : ""}
@@ -1799,6 +1800,124 @@ function deleteAssignment(uidVal) {
   });
 }
 
+// Reassign a previously-returned asset — still identified by its original
+// Asset Tag — straight to a different employee, without minting a new tag or
+// losing the return that came before it. Creates a brand-new "Assigned"
+// record for the same physical unit, linked both ways to the record it came
+// from (reassignedFromUid / reassignedToUid), so there's a proper, traceable
+// handover history — this is why it must show up correctly, not a fresh
+// assignment that looks unrelated to the return that preceded it.
+function openReassignForm(returnedUidVal) {
+  if (!requireAdminOrWarn()) return;
+  const prev = DB.assignments.find(a => a.uid === returnedUidVal);
+  if (!prev) { toast("Record not found", "err"); return; }
+  if (prev.status !== "Returned") { toast("Only a returned asset can be reassigned", "err"); return; }
+  const outcome = prev.returnOutcome || "Available";
+  if (outcome !== "Available") { toast(`This asset is marked "${outcome}" — it can't be reassigned until it's back to Available`, "err"); return; }
+
+  const depts = DB.lists.department || [];
+  openModal(`Reassign ${prev.assetName}${prev.assetTagNo ? ` (${prev.assetTagNo})` : ""}`, `
+    <div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">🔁</span><div>Reassigning the <strong>same physical asset</strong>${prev.assetTagNo ? ` — tag <strong>${escapeHtml(prev.assetTagNo)}</strong>` : ""}, last returned by <strong>${escapeHtml(prev.employeeName)}</strong> on ${fmtDate(prev.returnDate || prev.date)}. This creates a new Assignment record and keeps the original return on file.</div></div>
+    <div class="field"><label>Date</label><input type="date" id="rf_date" value="${todayISO()}"></div>
+    <div class="field-row">
+      <div class="field"><label>Employee / Recipient Name</label>
+        <input type="text" id="rf_emp" list="rf_empList" placeholder="Employee name, or a team/TL name like 'KYC Training'">
+        <datalist id="rf_empList">${DB.employees.map(e => `<option value="${escapeHtml(e.name)}">`).join("")}</datalist>
+      </div>
+      <div class="field"><label>Employee ID</label><input type="text" id="rf_empid"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Department</label>
+        <select id="rf_dept"><option value="">—</option>${depts.map(d => `<option>${escapeHtml(d)}</option>`).join("")}</select>
+      </div>
+      <div class="field"><label>Assigned By</label><input type="text" id="rf_by" value="${escapeHtml((fauth.currentUser || {}).email || "")}"></div>
+    </div>
+    <div class="field"><label>Remarks <span class="muted" style="font-weight:500;">(optional — e.g. reason for reassigning)</span></label><textarea id="rf_remarks" rows="2"></textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="rf_cancel">Cancel</button>
+      <button class="btn btn-primary" id="rf_save">Reassign Asset</button>
+    </div>
+  `, () => {
+    document.getElementById("modal").classList.add("modal-wide");
+    // Same "don't overwrite a field the admin already touched" autofill pattern
+    // used by the main Assignment form.
+    const empIdInput = document.getElementById("rf_empid");
+    const deptSel = document.getElementById("rf_dept");
+    let empIdTouched = false, deptTouched = false;
+    empIdInput.addEventListener("input", () => { empIdTouched = true; });
+    deptSel.addEventListener("change", () => { deptTouched = true; });
+    const empInput = document.getElementById("rf_emp");
+    const autofillFromName = () => {
+      const typed = empInput.value.trim().toLowerCase();
+      if (!typed) return;
+      const match = DB.employees.find(e => (e.name || "").trim().toLowerCase() === typed);
+      if (!match) return;
+      if (!empIdTouched && match.id) empIdInput.value = match.id;
+      if (!deptTouched && match.department && [...deptSel.options].some(o => o.value === match.department)) deptSel.value = match.department;
+    };
+    empInput.addEventListener("input", autofillFromName);
+    empInput.addEventListener("change", autofillFromName);
+
+    document.getElementById("rf_cancel").onclick = closeModal;
+    document.getElementById("rf_save").onclick = () => {
+      const empName = empInput.value.trim();
+      if (!empName) { toast("Employee name is required", "err"); return; }
+      const dateVal = document.getElementById("rf_date").value;
+      if (!dateVal) { toast("Date is required", "err"); return; }
+      if (empName.toLowerCase() === (prev.employeeName || "").trim().toLowerCase()) {
+        toast("Pick a different recipient — this asset was already with them", "err"); return;
+      }
+
+      const newRec = {
+        uid: uid(),
+        id: DB.assignments.length + 1,
+        createdAt: nowISO(),
+        date: dateVal,
+        employeeName: empName,
+        employeeId: empIdInput.value.trim(),
+        department: deptSel.value,
+        assignedBy: document.getElementById("rf_by").value.trim(),
+        status: "Assigned",
+        returnDate: "", returnCondition: "", returnOutcome: "",
+        remarks: document.getElementById("rf_remarks").value.trim(),
+        assetName: prev.assetName,
+        assetTagNo: prev.assetTagNo || "",
+        sourceRequestId: "",
+        reassignedFromUid: prev.uid,
+        reassignedFromEmployee: prev.employeeName || "",
+      };
+      DB.assignments.push(newRec);
+      saveRecord("assignments", newRec);
+
+      // Leave a forward-pointer + note on the record it came from, so the
+      // return stays on file but also shows exactly where the asset went next.
+      prev.reassignedToUid = newRec.uid;
+      prev.remarks = prev.remarks ? `${prev.remarks}\nReassigned to ${empName} on ${fmtDate(dateVal)}` : `Reassigned to ${empName} on ${fmtDate(dateVal)}`;
+      saveRecord("assignments", prev);
+
+      // The Master Inventory row auto-created when this asset was returned
+      // needs to flip back to Assigned, or it keeps showing as available stock
+      // that's actually back out with someone.
+      if (newRec.assetTagNo) {
+        const inv = DB.inventory.find(i => i.assetId === newRec.assetTagNo);
+        if (inv) {
+          inv.status = "Assigned";
+          inv.assignedTo = empName;
+          inv.department = deptSel.value || inv.department;
+          saveRecord("inventory", inv);
+        }
+      }
+
+      logAction("Reassigned asset", `${prev.assetName}${prev.assetTagNo ? ` (${prev.assetTagNo})` : ""} reassigned from ${prev.employeeName || "—"} to ${empName}`);
+      toast(`${prev.assetName} reassigned to ${empName}`);
+      closeModal();
+      if (currentPage === "returns") paintReturnsTable();
+      if (currentPage === "assignment") paintAssignTable();
+      if (currentPage === "dashboard") renderDashboard();
+    };
+  });
+}
+
 /* =========================================================
    ASSET RETURNS  (dedicated view over assignments where status = "Returned")
    ========================================================= */
@@ -1943,6 +2062,7 @@ function paintReturnsTable() {
         <div class="row-actions">
           <button class="btn btn-secondary btn-sm btn-icon" title="Handover Slip (PDF)" aria-label="Generate handover slip for ${escapeHtml(a.employeeName)}" onclick="openHandoverSlip('${a.uid}')">📄</button>
           ${admin ? `
+          ${(a.returnOutcome || "Available") === "Available" ? `<button class="btn btn-primary btn-sm btn-icon" title="Reassign to someone else" aria-label="Reassign ${escapeHtml(a.assetName)} to a different employee" onclick="openReassignForm('${a.uid}')">🔁</button>` : ""}
           <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit return for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
           <button class="btn btn-danger btn-sm btn-icon" title="Delete" aria-label="Delete return for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>
           ` : ""}
@@ -2160,6 +2280,7 @@ function paintAdminRequestsTable() {
       <td>${fmtDate((r.updatedAt || r.createdAt || "").slice(0, 10))}</td>
       <td><div class="row-actions">
         <button class="btn btn-secondary btn-sm btn-icon" title="View / Review" aria-label="Review request ${escapeHtml(r.requestId || "")}" onclick="openRequestDetail('${r.uid}')">👁️</button>
+        ${r.status === "Approved" ? `<button class="btn btn-primary btn-sm btn-icon" title="Assign Asset — creates the Asset Assignment record" aria-label="Assign asset for request ${escapeHtml(r.requestId || "")}" onclick="assignAssetForRequest('${r.uid}')">📦</button>` : ""}
       </div></td>
     </tr>
   `).join("") : `<tr class="empty-row"><td colspan="12">${filterActive ? `No requests match your filters. <a href="#" id="reqEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No asset requests submitted yet."}</td></tr>`;
@@ -2615,6 +2736,8 @@ function openRequestDetail(uidVal) {
       <div>${requestStatusBadge(rec.status)} ${priorityBadge(rec.priority)}</div>
       <div class="muted">${escapeHtml(rec.requestedBy)} · ${fmtDateTime(rec.createdAt)}</div>
     </div>
+    ${admin && rec.status === "Approved" ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📦</span><div>This request is approved but <strong>no asset has been handed over yet</strong> — nothing will show up on the Asset Assignment page until you click <strong>Assign Asset</strong> below and complete the handover.</div></div>` : ""}
+    ${rec.status === "Fulfilled" ? `<div class="viewer-note" style="border-color:var(--green,#22c55e);"><span style="font-size:16px;">✅</span><div>Fulfilled — asset ${rec.assignedAssetTagNo ? `<strong>${escapeHtml(rec.assignedAssetTagNo)}</strong> ` : ""}is recorded on the <a href="#" id="rd_gotoAssignment" style="color:var(--primary);font-weight:600;">Asset Assignment page</a>.</div></div>` : ""}
     <div class="table-wrap"><table>
       <tbody>
         <tr><th>Employee</th><td>${escapeHtml(rec.employeeName)}${rec.isNewEmployee ? ` <span class="badge badge-purple">New Employee</span>` : ""}</td></tr>
@@ -2659,18 +2782,23 @@ function openRequestDetail(uidVal) {
   `, () => {
     document.getElementById("modal").classList.add("modal-wide");
     document.getElementById("rd_closeBtn").onclick = closeModal;
+    const gotoAssignLink = document.getElementById("rd_gotoAssignment");
+    if (gotoAssignLink) gotoAssignLink.onclick = (e) => { e.preventDefault(); closeModal(); goto("assignment"); };
 
     const pushHistory = (action, fromStatus, toStatus, comment) => {
       rec.history = [...(rec.history || []), { ts: nowISO(), email: myEmail, role: admin ? "admin" : "teamlead", action, fromStatus, toStatus, comment: comment || "" }];
     };
-    const persist = (label, detail) => {
+    // `reopen: true` swaps back into this same detail view instead of closing —
+    // used after Approve so the "Assign Asset" button is right there, rather than
+    // dropping the admin back on the list and hoping they remember to come back.
+    const persist = (label, detail, opts) => {
       rec.updatedAt = nowISO();
       saveRecord("requests", rec);
       logAction(label, detail);
-      closeModal();
       toast(label);
       if (currentPage === "assetRequests") renderAssetRequests();
       if (currentPage === "dashboard") renderDashboard();
+      if (opts && opts.reopen) openRequestDetail(rec.uid); else closeModal();
     };
 
     const reviewBtn = document.getElementById("rd_reviewBtn");
@@ -2701,7 +2829,7 @@ function openRequestDetail(uidVal) {
           rec.adminComment = comment;
           rec.reviewedAt = nowISO();
           pushHistory("Approved", from, "Approved", comment);
-          persist("Request approved", `${rec.requestId || rec.uid} approved`);
+          persist("Request approved — now assign the actual asset", `${rec.requestId || rec.uid} approved`, { reopen: true });
         };
       });
     };
@@ -2734,15 +2862,7 @@ function openRequestDetail(uidVal) {
     };
 
     const assignBtn = document.getElementById("rd_assignBtn");
-    if (assignBtn) assignBtn.onclick = () => {
-      closeModal();
-      openAssignForm(null, false, {
-        requestUid: rec.uid, requestId: rec.requestId, employeeName: rec.employeeName,
-        employeeCode: rec.employeeCode, department: rec.department,
-        assetType: rec.assetType === "Other" ? "" : rec.assetType,
-        quantity: rec.quantity || 1,
-      });
-    };
+    if (assignBtn) assignBtn.onclick = () => assignAssetForRequest(rec.uid);
 
     const cancelBtn = document.getElementById("rd_cancelBtn");
     if (cancelBtn) cancelBtn.onclick = () => {
@@ -2763,6 +2883,34 @@ function openRequestDetail(uidVal) {
       });
     };
   });
+}
+
+// Shared entry point into "hand over the actual asset for this Approved
+// request" — used by both the detail modal's "Assign Asset" button and the
+// quick-action icon on the admin requests table row, so there's more than one
+// obvious path into it (this is the step that actually creates the Asset
+// Assignment record — Approve alone does not).
+function assignAssetForRequest(uidVal) {
+  const rec = (DB.requests || []).find(r => r.uid === uidVal);
+  if (!rec) { toast("Request not found", "err"); return; }
+  if (!isAdmin()) { toast("Only Admins can assign an asset", "err"); return; }
+  if (rec.status !== "Approved") { toast("Only Approved requests can be assigned", "err"); return; }
+  closeModal();
+  openAssignForm(null, false, {
+    requestUid: rec.uid, requestId: rec.requestId, employeeName: rec.employeeName,
+    employeeCode: rec.employeeCode, department: rec.department,
+    assetType: rec.assetType === "Other" ? "" : rec.assetType,
+    quantity: rec.quantity || 1,
+  });
+}
+
+// Jump from a linked "AST-REQ-..." badge (shown on assignment rows) straight
+// to that request's detail — lets an admin trace an assignment back to the
+// request that caused it, and vice versa.
+function openRequestByRequestId(requestId) {
+  const rec = (DB.requests || []).find(r => r.requestId === requestId);
+  if (!rec) { toast("Linked request not found", "err"); return; }
+  openRequestDetail(rec.uid);
 }
 
 // Called once an Approved request's asset has actually been handed over via
@@ -3381,7 +3529,7 @@ function openEmpHistoryModal(empUid) {
           ${records.length ? records.map(a => `
             <tr>
               <td>${fmtAssignDateCell(a)}</td>
-              <td>${escapeHtml(a.assetName)}</td>
+              <td>${escapeHtml(a.assetName)}${a.sourceRequestId ? `<div class="muted" style="font-size:11px;margin-top:2px;">📋 from ${escapeHtml(a.sourceRequestId)}</div>` : ""}${a.reassignedFromEmployee ? `<div class="muted" style="font-size:11px;margin-top:2px;">🔁 reassigned from ${escapeHtml(a.reassignedFromEmployee)}</div>` : ""}</td>
               <td>${a.assetTagNo ? escapeHtml(a.assetTagNo) : "—"}</td>
               <td>${statusBadge(a.status)}</td>
               <td>${escapeHtml(a.assignedBy || "—")}</td>
@@ -3863,7 +4011,7 @@ function reportRows(kind) {
   const stock = kind === "stock" ? computeStockSummary() : null;
   switch (kind) {
     case "employees": return DB.employees.map(e => ({ "Employee ID": e.id || "", "Name": e.name || "", "Department": e.department || "", "Email": e.email || "", "Phone": e.phone || "" }));
-    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "" }));
+    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "", "Linked Asset Request": a.sourceRequestId || "", "Reassigned From": a.reassignedFromEmployee || "" }));
     case "returns": return getReturnedAssignments().map(a => ({ "Return Date": a.returnDate || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Returned By": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "" }));
     case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
     case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
