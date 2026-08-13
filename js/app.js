@@ -77,15 +77,27 @@ function requestsQuery() {
 // subcollection (not the office meta doc, which only Admins can write) so a Team
 // Lead submitting a request can still get a real, collision-safe number.
 function requestCounterRef() { return docRef().collection("counters").doc("assetRequests"); }
-async function nextRequestId() {
+// The counter is one shared document, so two people submitting a request in
+// the same instant genuinely do contend for it — Firestore surfaces that as
+// 'aborted'/'resource-exhausted', not a real connectivity problem. A couple of
+// quick retries clears that up almost every time instead of failing outright.
+async function nextRequestId(retriesLeft = 2) {
   const year = new Date().getFullYear();
-  const seq = await fdb.runTransaction(async tx => {
-    const snap = await tx.get(requestCounterRef());
-    const cur = ((snap.exists && snap.data()[year]) || 0) + 1;
-    tx.set(requestCounterRef(), { [year]: cur }, { merge: true });
-    return cur;
-  });
-  return `AST-REQ-${year}-${String(seq).padStart(5, "0")}`;
+  try {
+    const seq = await fdb.runTransaction(async tx => {
+      const snap = await tx.get(requestCounterRef());
+      const cur = ((snap.exists && snap.data()[year]) || 0) + 1;
+      tx.set(requestCounterRef(), { [year]: cur }, { merge: true });
+      return cur;
+    });
+    return `AST-REQ-${year}-${String(seq).padStart(5, "0")}`;
+  } catch (err) {
+    if (retriesLeft > 0 && ["resource-exhausted", "aborted", "unavailable"].includes(err && err.code)) {
+      await new Promise(r => setTimeout(r, 500 * (3 - retriesLeft)));
+      return nextRequestId(retriesLeft - 1);
+    }
+    throw err;
+  }
 }
 
 function saveRecord(kind, record) {
@@ -2894,7 +2906,12 @@ function wireRequestForm(vals, editing) {
   if (draftBtn) draftBtn.onclick = () => {
     readRequestFormValues(vals);
     if (!vals.employeeName) { toast("Employee Name is required, even for a draft", "err"); return; }
-    submitRequestForm(vals, editing, "Draft");
+    // Disabled for the duration of the save so an impatient extra click can't
+    // fire a second write on top of the first one.
+    draftBtn.disabled = true;
+    const label = draftBtn.textContent;
+    draftBtn.textContent = "Saving…";
+    submitRequestForm(vals, editing, "Draft").finally(() => { draftBtn.disabled = false; draftBtn.textContent = label; });
   };
   g("rf_reviewBtn").onclick = () => {
     readRequestFormValues(vals);
@@ -2972,7 +2989,17 @@ function showRequestReviewStep(vals, editing) {
   const submitBtn = document.getElementById("rf_submitBtn");
   const overrideCk = document.getElementById("rf_dupOverride");
   if (overrideCk) overrideCk.addEventListener("change", () => { submitBtn.disabled = !!warn && !overrideCk.checked; });
-  submitBtn.onclick = () => submitRequestForm(vals, editing, "Submitted");
+  submitBtn.onclick = () => {
+    // Disabled for the duration of the submit so a repeated/impatient click
+    // can't fire a second overlapping write against the shared Request ID
+    // counter — that's exactly what turns one contention hiccup into a storm.
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Submitting…";
+    submitRequestForm(vals, editing, "Submitted").finally(() => {
+      submitBtn.disabled = !!warn && !(overrideCk && overrideCk.checked);
+      submitBtn.textContent = "Submit Request";
+    });
+  };
 }
 
 async function submitRequestForm(vals, editing, targetStatus) {
@@ -3018,7 +3045,13 @@ async function submitRequestForm(vals, editing, targetStatus) {
       rec.requestId = await nextRequestId();
     } catch (err) {
       console.error(err);
-      toast("Couldn't reserve a Request ID — check your connection and try again", "err");
+      const code = err && err.code;
+      const msg = code === "resource-exhausted" || code === "aborted"
+        ? "A lot of submissions hit at the same moment — please wait a few seconds and try once, clicking Submit repeatedly makes this worse"
+        : code === "permission-denied"
+        ? "You don't have permission to submit this — ask an Admin to check your access"
+        : "Couldn't reserve a Request ID — check your connection and try again";
+      toast(msg, "err");
       return;
     }
   }
