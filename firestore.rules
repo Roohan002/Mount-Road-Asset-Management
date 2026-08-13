@@ -64,9 +64,15 @@ service cloud.firestore {
       // Delete is Super-Admin-only everywhere in this app — an Office Admin can
       // add/edit records in their office, but only a Super Admin can permanently
       // remove one (single, bulk, or "Delete All").
+      // Team Leads can CREATE a brand-new employee record (auto-added the moment
+      // they submit an Asset Request for someone not yet on file — saves the
+      // Admin from typing it in by hand later) but cannot UPDATE or DELETE an
+      // existing one — that stays Admin-only, same as every other master data
+      // edit right a Team Lead doesn't get.
       match /employees/{recordId} {
         allow read: if canViewOffice(officeId);
-        allow create, update: if canEditOffice(officeId);
+        allow create: if canEditOffice(officeId) || isTeamLead(officeId);
+        allow update: if canEditOffice(officeId);
         allow delete: if isSuperAdmin();
       }
       match /assignments/{recordId} {

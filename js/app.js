@@ -2403,7 +2403,10 @@ function buildRequestFormHtml(vals, editing) {
       <div class="field"><label>Employee Code</label><input type="text" id="rf_empCode" value="${escapeHtml(vals.employeeCode)}"></div>
     </div>
     <div class="field-row">
-      <div class="field"><label>Team</label><input type="text" id="rf_team" value="${escapeHtml(vals.team)}"></div>
+      <div class="field"><label>Team <span class="muted" style="font-weight:500;">(auto-fills from the employee if known; saved for next time otherwise)</span></label>
+        <input type="text" id="rf_team" list="rf_teamList" value="${escapeHtml(vals.team)}">
+        <datalist id="rf_teamList">${distinctEmployeeTeams().map(t => `<option value="${escapeHtml(t)}">`).join("")}</datalist>
+      </div>
       <div class="field"><label>Location</label><input type="text" id="rf_location" value="${escapeHtml(vals.location)}" readonly title="Auto-filled from your office — Settings > Switch Office to change it"></div>
     </div>
 
@@ -2574,14 +2577,20 @@ function wireRequestForm(vals, editing) {
   newEmpCk.addEventListener("change", syncNewEmpMode);
   syncNewEmpMode();
 
-  // Autofill Employee Code / Department from a matched Employee record — same
-  // "touched" pattern as the Assignment form (js/app.js openAssignForm), so it
-  // never clobbers something the Team Lead already typed themselves.
+  // Autofill Employee Code / Department / Team from a matched Employee record —
+  // same "touched" pattern as the Assignment form (js/app.js openAssignForm), so
+  // it never clobbers something the Team Lead already typed themselves. Team in
+  // particular is usually blank on older employee records — whatever gets typed
+  // here gets saved back onto the employee at Approval time (see
+  // ensureEmployeeExists) so it's remembered for next time.
   const deptSel = g("rf_dept");
+  const teamInput = g("rf_team");
   let empCodeTouched = !!empCodeInput.value.trim();
   let deptTouched = !!deptSel.value;
+  let teamTouched = !!teamInput.value.trim();
   empCodeInput.addEventListener("input", () => { empCodeTouched = true; });
   deptSel.addEventListener("change", () => { deptTouched = true; });
+  teamInput.addEventListener("input", () => { teamTouched = true; });
   const autofillFromEmployee = () => {
     if (newEmpCk.checked) return;
     const typed = empInput.value.trim().toLowerCase();
@@ -2592,6 +2601,7 @@ function wireRequestForm(vals, editing) {
     if (!deptTouched && match.department && [...deptSel.options].some(o => o.value === match.department)) {
       deptSel.value = match.department;
     }
+    if (!teamTouched && match.team) teamInput.value = match.team;
   };
   empInput.addEventListener("input", autofillFromEmployee);
   empInput.addEventListener("change", autofillFromEmployee);
@@ -2787,6 +2797,11 @@ async function submitRequestForm(vals, editing, targetStatus) {
     }
   }
 
+  // Auto-add a not-yet-registered employee the moment the request is actually
+  // Submitted (not on every Draft save) — Team Leads get CREATE-only rights on
+  // Employees in firestore.rules specifically for this. See ensureEmployeeExists().
+  const addedEmployee = targetStatus === "Submitted" ? ensureEmployeeExists(rec) : null;
+
   rec.history = [...(rec.history || []), {
     ts: nowIso, email: myEmail, role: isAdmin() ? "admin" : "teamlead",
     action: targetStatus === "Draft" ? (isNewRecord ? "Created draft" : "Updated draft") : "Submitted",
@@ -2798,7 +2813,9 @@ async function submitRequestForm(vals, editing, targetStatus) {
   logAction(targetStatus === "Draft" ? "Saved asset request draft" : "Submitted asset request",
     `${rec.requestId || "(draft)"} — ${requestItemsSummary(rec)} for ${rec.employeeName}`);
   closeModal();
-  toast(targetStatus === "Draft" ? "Draft saved" : `Request ${rec.requestId} submitted`);
+  toast(targetStatus === "Draft" ? "Draft saved"
+    : addedEmployee ? `Request ${rec.requestId} submitted — added ${addedEmployee.name} to Employees`
+    : `Request ${rec.requestId} submitted`);
   if (currentPage === "assetRequests") renderAssetRequests();
   if (currentPage === "dashboard") renderDashboard();
 }
@@ -3058,27 +3075,48 @@ function openRequestByRequestId(requestId) {
   openRequestDetail(rec.uid);
 }
 
-// Saves the Admin a manual step: if the request names someone who isn't in the
-// Employees list yet (whether or not the Team Lead remembered to tick "new
-// employee"), add them automatically the moment the request is approved — this
-// runs as the Admin approving it, who already has write access to Employees;
-// Team Leads never gain that access themselves. Returns the new employee record
-// if one was created, or null if the name already matched someone on file.
+// Saves a manual step in two ways:
+//  1. If the request names someone who isn't in the Employees list yet
+//     (whether or not "new employee" was ticked), add them automatically —
+//     called the moment a Team Lead SUBMITS the request (not at Approval), so
+//     a new executive's name/code/department/team are on file immediately,
+//     the same instant the request is filed. firestore.rules grants Team
+//     Leads CREATE (only — never update/delete) on employees specifically
+//     for this; see the `employees` match block for the reasoning.
+//  2. If they already exist but don't have a Team on file yet, save whatever
+//     Team was entered on this request onto their employee record — so the
+//     next request for the same person auto-fills it. This part edits an
+//     EXISTING record, which stays Admin-only (Team Leads still can't update
+//     employees), so it only runs when called as an Admin — e.g. still runs
+//     as a safety net at Approve time for older requests filed before this
+//     existed, or when an Admin files a request on someone's behalf.
+// Returns the new employee record if one was created, or null otherwise
+// (including when an existing employee's Team was just backfilled).
 function ensureEmployeeExists(rec) {
   const name = (rec.employeeName || "").trim();
   if (!name) return null;
-  const exists = DB.employees.some(e => (e.name || "").trim().toLowerCase() === name.toLowerCase());
-  if (exists) return null;
+  const team = (rec.team || "").trim();
+  const existing = DB.employees.find(e => (e.name || "").trim().toLowerCase() === name.toLowerCase());
+  if (existing) {
+    if (isAdmin() && team && !(existing.team || "").trim()) {
+      existing.team = team;
+      saveRecord("employees", existing);
+      logAction("Saved employee team (auto, from Asset Request)", `${name} — ${team} (via ${rec.requestId || rec.uid})`);
+    }
+    return null;
+  }
   const newEmp = {
     uid: uid(),
     id: (rec.employeeCode || "").trim(),
     name,
     department: rec.department || "",
+    team,
     phone: "", email: "",
   };
   DB.employees.push(newEmp);
   saveRecord("employees", newEmp);
-  logAction("Added employee (auto, from Asset Request)", `${name}${rec.department ? " — " + rec.department : ""} (via ${rec.requestId || rec.uid})`);
+  logAction(isAdmin() ? "Added employee (auto, from Asset Request)" : "Added employee (auto, by Team Lead's Asset Request)",
+    `${name}${rec.department ? " — " + rec.department : ""} (via ${rec.requestId || rec.uid})`);
   return newEmp;
 }
 
@@ -3395,6 +3433,14 @@ function getFilteredEmployees() {
   return rows;
 }
 
+// Every distinct "Team" value already saved on an employee — powers the
+// autocomplete suggestion list on both the Add/Edit Employee form and the
+// Asset Request form's Team field, so it fills in from what's already on
+// file instead of everyone retyping the same team names from scratch.
+function distinctEmployeeTeams() {
+  return [...new Set(DB.employees.map(e => (e.team || "").trim()).filter(Boolean))].sort();
+}
+
 function paintEmpTable() {
   const tbody = document.getElementById("empTbody");
   if (!tbody) return;
@@ -3470,6 +3516,7 @@ function openEmpForm(uidVal) {
   if (!requireAdminOrWarn()) return;
   const editing = uidVal ? DB.employees.find(e => e.uid === uidVal) : null;
   const depts = DB.lists.department || [];
+  const teams = distinctEmployeeTeams();
   openModal(editing ? "Edit Employee" : "Add Employee", `
     <div class="field-row">
       <div class="field"><label>Employee ID</label><input type="text" id="f_id" value="${escapeHtml(editing ? editing.id || "" : "")}"></div>
@@ -3479,9 +3526,15 @@ function openEmpForm(uidVal) {
       <div class="field"><label>Department</label>
         <select id="f_dept"><option value="">—</option>${depts.map(d => `<option ${editing && editing.department === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}</select>
       </div>
-      <div class="field"><label>Phone</label><input type="text" id="f_phone" value="${escapeHtml(editing ? editing.phone || "" : "")}"></div>
+      <div class="field"><label>Team <span class="muted" style="font-weight:500;">(sub-team within the department, optional)</span></label>
+        <input type="text" id="f_team" list="empTeamList" value="${escapeHtml(editing ? editing.team || "" : "")}">
+        <datalist id="empTeamList">${teams.map(t => `<option value="${escapeHtml(t)}">`).join("")}</datalist>
+      </div>
     </div>
-    <div class="field"><label>Email</label><input type="email" id="f_email" value="${escapeHtml(editing ? editing.email || "" : "")}"></div>
+    <div class="field-row">
+      <div class="field"><label>Phone</label><input type="text" id="f_phone" value="${escapeHtml(editing ? editing.phone || "" : "")}"></div>
+      <div class="field"><label>Email</label><input type="email" id="f_email" value="${escapeHtml(editing ? editing.email || "" : "")}"></div>
+    </div>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelBtn">Cancel</button>
       <button class="btn btn-primary" id="saveBtn">${editing ? "Save Changes" : "Add Employee"}</button>
@@ -3495,6 +3548,7 @@ function openEmpForm(uidVal) {
         id: document.getElementById("f_id").value.trim(),
         name,
         department: document.getElementById("f_dept").value,
+        team: document.getElementById("f_team").value.trim(),
         phone: document.getElementById("f_phone").value.trim(),
         email: document.getElementById("f_email").value.trim(),
       };
