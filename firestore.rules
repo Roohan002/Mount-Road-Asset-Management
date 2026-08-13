@@ -25,15 +25,25 @@ service cloud.firestore {
     function isOfficeMember(officeId) {
       return isSignedIn() && exists(/databases/$(database)/documents/assetTracker/$(officeId)/access/$(request.auth.token.email));
     }
+    // A Team Lead (assetTracker/{officeId}/access/{their email} with role: "teamlead")
+    // can submit and track their own Asset Requests for that office, but can't edit
+    // office data and can't approve/fulfill even their own requests — see the
+    // requests/ rules below for exactly what that role can and can't do.
+    function isTeamLead(officeId) {
+      return isSignedIn() && get(/databases/$(database)/documents/assetTracker/$(officeId)/access/$(request.auth.token.email)).data.role == 'teamlead';
+    }
     function canEditOffice(officeId) {
       return isSuperAdmin() || isOfficeAdmin(officeId);
     }
-    // Anyone signed in can currently READ any office's data (needed for the
-    // simple "everyone with a login can view" setup). If you want Viewers
-    // restricted to only the offices they've been granted access to as well,
-    // swap the allow-read lines below to: isSuperAdmin() || isOfficeMember(officeId)
+    function canCreateRequest(officeId) {
+      return isSuperAdmin() || isOfficeAdmin(officeId) || isTeamLead(officeId);
+    }
+    // Only a Super Admin, or someone specifically granted access to THIS
+    // office (assetTracker/{officeId}/access/{their email}), can read its
+    // data. Being signed in alone isn't enough — a Viewer at Office A can't
+    // browse Office B's employees/assets just because they have a login.
     function canViewOffice(officeId) {
-      return isSignedIn();
+      return isSuperAdmin() || isOfficeMember(officeId);
     }
 
     // Nobody can view OR change anything unless they're signed in through
@@ -77,6 +87,33 @@ service cloud.firestore {
         // exists. That's what makes the audit trail actually trustworthy.
         allow create: if canEditOffice(officeId);
         allow update, delete: if false;
+      }
+
+      // Asset Requests: Team Leads submit and track their OWN requests only;
+      // Admins/Super Admins see and manage every request in this office. A Team
+      // Lead can never write a request into Under Review/Approved/Rejected/
+      // Fulfilled — even for their own request — so approving your own request
+      // isn't just hidden in the UI, it's rejected here.
+      match /requests/{recordId} {
+        allow read: if canEditOffice(officeId)
+          || (isTeamLead(officeId) && resource.data.requestedBy == request.auth.token.email);
+        allow create: if canCreateRequest(officeId)
+          && request.resource.data.requestedBy == request.auth.token.email;
+        allow update: if canEditOffice(officeId)
+          || (isTeamLead(officeId)
+              && resource.data.requestedBy == request.auth.token.email
+              && request.resource.data.requestedBy == request.auth.token.email
+              && request.resource.data.status in ['Draft', 'Submitted', 'Cancelled']);
+        allow delete: if canEditOffice(officeId)
+          || (isTeamLead(officeId) && resource.data.requestedBy == request.auth.token.email && resource.data.status == 'Draft');
+      }
+      // Sequential, server-safe numbering for Request IDs (AST-REQ-2026-00001, ...) —
+      // a tiny counter doc incremented inside a transaction, separate from the
+      // office meta doc so Team Leads (who can't write that doc) can still create
+      // requests and get a real number.
+      match /counters/{counterId} {
+        allow read: if canViewOffice(officeId);
+        allow write: if canCreateRequest(officeId);
       }
 
       // Per-office access grants (assetTracker/{officeId}/access/{email} ->

@@ -237,6 +237,31 @@ tbody tr:hover{ background: var(--surface-2); }
 }
 .field-row{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
 .form-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:20px; padding-top:16px; border-top:1px solid var(--border); }
+.field label.required::after{ content:" *"; color:var(--red); }
+
+/* ---------- Asset Requests: request-type radio cards ---------- */
+.request-type-cards{ display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
+.request-type-card{
+  position:relative; display:flex; flex-direction:column; gap:4px; text-align:left; cursor:pointer;
+  padding:12px 14px; border-radius:12px; border:1.5px solid var(--border); background:var(--surface-2);
+  transition: border-color .12s, background .12s, transform .1s;
+}
+.request-type-card:hover{ border-color: var(--primary); transform: translateY(-1px); }
+.request-type-card.active{ border-color: var(--primary); background: var(--primary-light); }
+.request-type-card input[type="radio"]{ position:absolute; top:10px; right:10px; width:auto; }
+.request-type-card-icon{ font-size:18px; }
+.request-type-card-title{ font-size:12.8px; font-weight:700; color:var(--text); }
+.request-type-card-desc{ font-size:11.3px; color:var(--text-muted); line-height:1.35; }
+@media (max-width: 760px){ .request-type-cards{ grid-template-columns: 1fr; } }
+
+/* ---------- Asset Requests: review/detail table + audit timeline ---------- */
+.req-detail-head{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; flex-wrap:wrap; }
+.req-timeline{ display:flex; flex-direction:column; gap:14px; padding-left:4px; }
+.req-timeline-item{ display:flex; gap:10px; }
+.req-timeline-dot{
+  width:9px; height:9px; margin-top:5px; border-radius:50%; background:var(--primary); flex:none;
+}
+.req-timeline-action{ font-size:12.8px; font-weight:700; }
 
 /* ---------- Toolbar ---------- */
 .toolbar{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
@@ -322,6 +347,7 @@ tbody tr:hover{ background: var(--surface-2); }
   background: rgba(255,255,255,.1); color:#dfe2f2;
 }
 .role-badge.admin{ background: linear-gradient(135deg, var(--teal), #0a9a8b); color:#fff; }
+.role-badge.teamlead{ background: linear-gradient(135deg, var(--purple), #6c3fd6); color:#fff; }
 .role-badge.viewer{ background: rgba(255,255,255,.1); color:#c7cbe3; }
 .role-email{ font-size:10.8px; color:#7c82a0; margin-bottom:8px; word-break:break-all; }
 
@@ -521,6 +547,7 @@ input:disabled, select:disabled, textarea:disabled{ background:var(--grey-light)
   vertical-align:middle;
 }
 .office-role-badge.admin{ background: rgba(15,185,167,.18); color:#5eead4; }
+.office-role-badge.teamlead{ background: rgba(138,92,246,.18); color:#c9b3fb; }
 .office-role-badge.viewer{ background: rgba(255,255,255,.08); color:#a6acc9; }
 .office-card-actions{
   position:absolute; top:10px; right:10px; display:flex; gap:6px;

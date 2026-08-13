@@ -62,8 +62,30 @@ function assignmentsColl() { return docRef().collection("assignments"); }
 function inventoryColl() { return docRef().collection("inventory"); }
 function refillsColl() { return docRef().collection("refills"); }
 function categoriesColl() { return docRef().collection("categories"); }
+function requestsColl() { return docRef().collection("requests"); }
 function collFor(kind) {
-  return { employees: employeesColl, assignments: assignmentsColl, inventory: inventoryColl, refills: refillsColl, categories: categoriesColl }[kind]();
+  return { employees: employeesColl, assignments: assignmentsColl, inventory: inventoryColl, refills: refillsColl, categories: categoriesColl, requests: requestsColl }[kind]();
+}
+// Team Leads can only ever list THEIR OWN requests (enforced by firestore.rules —
+// an unfiltered query would be denied outright for them), so which query to run
+// depends on who's asking. Admins/Super Admins get the full office queue.
+function requestsQuery() {
+  return isAdmin() ? requestsColl() : requestsColl().where("requestedBy", "==", (fauth.currentUser || {}).email || "");
+}
+// Sequential, human-facing Request IDs (AST-REQ-2026-00001, ...) — a small counter
+// document incremented inside a real Firestore transaction, kept in its own
+// subcollection (not the office meta doc, which only Admins can write) so a Team
+// Lead submitting a request can still get a real, collision-safe number.
+function requestCounterRef() { return docRef().collection("counters").doc("assetRequests"); }
+async function nextRequestId() {
+  const year = new Date().getFullYear();
+  const seq = await fdb.runTransaction(async tx => {
+    const snap = await tx.get(requestCounterRef());
+    const cur = ((snap.exists && snap.data()[year]) || 0) + 1;
+    tx.set(requestCounterRef(), { [year]: cur }, { merge: true });
+    return cur;
+  });
+  return `AST-REQ-${year}-${String(seq).padStart(5, "0")}`;
 }
 
 function saveRecord(kind, record) {
@@ -147,7 +169,7 @@ function emptyOfficeDB() {
 }
 async function resetOfficeData(toOriginalSheet) {
   const deleteOps = [];
-  ["employees", "categories", "assignments", "refills", "inventory"].forEach(kind => {
+  ["employees", "categories", "assignments", "refills", "inventory", "requests"].forEach(kind => {
     (DB[kind] || []).forEach(r => deleteOps.push({ kind, type: "delete", uid: r.uid }));
   });
   if (deleteOps.length) await batchWrite(deleteOps);
@@ -222,8 +244,9 @@ async function renameOffice(id, name, city) {
 // firestore.rules) — not just this UI, so a Viewer genuinely cannot write
 // even by inspecting the page.
 let isSuperAdminUser = false;   // global, from roles/{email}
-let currentOfficeRole = null;   // "admin" | "viewer" | null — from this office's access/{email}
-let officeRoleMap = {};         // officeId -> "admin"|"viewer", for badges on the office picker
+let currentOfficeRole = null;   // "admin" | "teamlead" | "viewer" | null — from this office's access/{email}
+let officeRoleMap = {};         // officeId -> "admin"|"teamlead"|"viewer", for badges on the office picker
+const OFFICE_ROLES = ["admin", "teamlead", "viewer"]; // valid values for access/{email}.role, most-privileged first
 
 async function fetchGlobalRole() {
   if (!fauth || !fauth.currentUser) { isSuperAdminUser = false; return; }
@@ -242,7 +265,8 @@ async function fetchOfficeRole() {
   if (isSuperAdminUser) { currentOfficeRole = "admin"; return; }
   try {
     const snap = await docRef().collection("access").doc(fauth.currentUser.email).get();
-    currentOfficeRole = snap.exists ? (snap.data().role === "admin" ? "admin" : "viewer") : "viewer";
+    const role = snap.exists ? snap.data().role : "viewer";
+    currentOfficeRole = OFFICE_ROLES.includes(role) ? role : "viewer";
   } catch (err) {
     console.error("Couldn't look up office role, defaulting to Viewer:", err);
     currentOfficeRole = "viewer";
@@ -260,7 +284,8 @@ async function fetchAccessibleOffices() {
     const snap = await fdb.collectionGroup("access").where("email", "==", fauth.currentUser.email).get();
     snap.forEach(doc => {
       const officeId = doc.ref.parent.parent.id;
-      officeRoleMap[officeId] = doc.data().role === "admin" ? "admin" : "viewer";
+      const role = doc.data().role;
+      officeRoleMap[officeId] = OFFICE_ROLES.includes(role) ? role : "viewer";
     });
   } catch (err) {
     console.error("Couldn't look up accessible offices:", err);
@@ -273,6 +298,11 @@ function isAdmin() {
 function isSuperAdmin() {
   return !!(fauth && fauth.currentUser) && isSuperAdminUser;
 }
+// A Team Lead can submit and track their own Asset Requests, but has none of the
+// Admin's edit rights — isAdmin() stays false for them everywhere else in the app.
+function isTeamLead() {
+  return !!(fauth && fauth.currentUser) && !isAdmin() && currentOfficeRole === "teamlead";
+}
 function paintRoleUI() {
   const badge = document.getElementById("roleBadge");
   const btn = document.getElementById("roleSwitchBtn");
@@ -280,11 +310,13 @@ function paintRoleUI() {
   if (!badge || !btn) return;
   const signedIn = !!(fauth && fauth.currentUser);
   const admin = isAdmin();
-  badge.textContent = !signedIn ? "Signed out" : (isSuperAdminUser ? "Super Admin" : (admin ? "Admin" : "Viewer"));
-  badge.className = "role-badge " + (admin ? "admin" : "viewer");
+  const teamLead = isTeamLead();
+  badge.textContent = !signedIn ? "Signed out" : (isSuperAdminUser ? "Super Admin" : (admin ? "Admin" : (teamLead ? "Team Lead" : "Viewer")));
+  badge.className = "role-badge " + (admin ? "admin" : (teamLead ? "teamlead" : "viewer"));
   btn.textContent = "Sign Out";
   btn.style.display = signedIn ? "" : "none";
   if (emailLbl) emailLbl.textContent = signedIn ? (fauth.currentUser.email || "") : "";
+  applyNavVisibility();
 }
 document.getElementById("roleSwitchBtn").addEventListener("click", () => {
   if (!fauth || !fauth.currentUser) return;
@@ -334,7 +366,9 @@ async function loadInitialData() {
       stockManual: meta.stockManual || {},
       employees: meta.employees || [], categories: meta.categories || [],
       assignments: meta.assignments || [], refills: meta.refills || [], inventory: meta.inventory || [],
+      requests: [],
     };
+    await fetchRequestsIntoDB();
     return;
   }
 
@@ -360,7 +394,7 @@ async function loadInitialData() {
   DB = {
     lists: meta.lists || JSON.parse(JSON.stringify(SEED_DATA.lists || {})),
     stockManual: meta.stockManual || {},
-    employees: [], categories: [], assignments: [], refills: [], inventory: [],
+    employees: [], categories: [], assignments: [], refills: [], inventory: [], requests: [],
   };
   const [empSnap, catSnap, asgSnap, refSnap, invSnap] = await Promise.all([
     employeesColl().get(), categoriesColl().get(), assignmentsColl().get(), refillsColl().get(), inventoryColl().get(),
@@ -370,6 +404,20 @@ async function loadInitialData() {
   asgSnap.forEach(d => DB.assignments.push(d.data()));
   refSnap.forEach(d => DB.refills.push(d.data()));
   invSnap.forEach(d => DB.inventory.push(d.data()));
+  await fetchRequestsIntoDB();
+}
+// Asset Requests are loaded separately from the rest of the collections (rather
+// than folded into the Promise.all above) because WHICH query is even allowed
+// depends on the signed-in user's role — see requestsQuery(). A Team Lead's
+// unfiltered query would be denied outright by firestore.rules.
+async function fetchRequestsIntoDB() {
+  DB.requests = [];
+  try {
+    const snap = await requestsQuery().get();
+    snap.forEach(d => DB.requests.push(d.data()));
+  } catch (err) {
+    console.error("Couldn't load asset requests:", err);
+  }
 }
 
 async function migrateLegacyBlobToRecords(meta) {
@@ -409,6 +457,14 @@ function attachRealtimeListener() {
     if (data.stockManual) DB.stockManual = data.stockManual;
     goto(currentPage);
   }, err => console.error("Firestore listener error (meta):", err)));
+  // Kept separate from the `colls` loop above — the query itself (all requests vs.
+  // just this person's own) depends on role, see requestsQuery().
+  unsubscribeFns.push(requestsQuery().onSnapshot(snap => {
+    const list = [];
+    snap.forEach(d => list.push(d.data()));
+    DB.requests = list;
+    goto(currentPage);
+  }, err => console.error("Firestore listener error (requests):", err)));
 }
 function detachRealtimeListener() {
   unsubscribeFns.forEach(fn => fn());
@@ -596,12 +652,101 @@ function statusBadge(status) {
   return `<span class="badge ${cls}">${escapeHtml(status)}</span>`;
 }
 
+function conditionBadge(cond) {
+  const map = { "New": "badge-green", "Good": "badge-green", "Fair": "badge-amber", "Poor": "badge-red", "Damaged": "badge-red" };
+  const cls = map[cond] || "badge-grey";
+  return `<span class="badge ${cls}">${escapeHtml(cond)}</span>`;
+}
+
+/* ---------------- Asset Requests: shared badge helpers ---------------- */
+function requestStatusBadge(status) {
+  const map = {
+    "Draft": "badge-grey", "Submitted": "badge-blue", "Under Review": "badge-amber",
+    "Approved": "badge-purple", "Rejected": "badge-red", "Fulfilled": "badge-green", "Cancelled": "badge-grey",
+  };
+  return `<span class="badge ${map[status] || "badge-grey"}">${escapeHtml(status)}</span>`;
+}
+function priorityBadge(priority) {
+  const map = { "Normal": "badge-grey", "High": "badge-amber", "Urgent": "badge-red" };
+  return `<span class="badge ${map[priority] || "badge-grey"}">${escapeHtml(priority)}</span>`;
+}
+const REQUEST_ACTIVE_STATUSES = ["Draft", "Submitted", "Under Review", "Approved"];
+
+/* ---------------- Asset Returns ---------------- */
+// Maps a return "Outcome" (what happens to the unit once it's back) onto the
+// same manual repair/faulty/lost/scrap counters the Stock Summary page uses,
+// so a broken phone coming back doesn't silently count itself as "Available"
+// again — it actually lands in the right bucket.
+const RETURN_OUTCOME_BUCKET = { "Under Repair": "underRepair", "Faulty": "faulty", "Lost": "lost", "Scrap": "scrap" };
+
+// Suggests a sensible default Outcome from the Condition the item came back in.
+// Just a starting point — the admin can always override it in the form.
+function suggestReturnOutcome(condition) {
+  if (condition === "Poor") return "Under Repair";
+  if (condition === "Damaged") return "Faulty";
+  return "Available";
+}
+
+// Runs once, the moment an assignment record transitions INTO "Returned" —
+// whether that's through the quick "↩ Return" button, editing an existing
+// assignment's status, or logging a brand-new record that's already marked
+// Returned (for backfilling assets you never entered an "Assigned" row for).
+//
+// 1. Adjusts the category's manual stock counters so Available reflects reality.
+// 2. Finds or creates the matching Master Inventory row (by Asset Tag), so even
+//    assets that were never registered in Master Inventory get one automatically
+//    the first time a return is recorded for them — no manual pre-step needed.
+function applyReturnSideEffects(rec) {
+  const outcome = rec.returnOutcome || "Available";
+  const bucket = RETURN_OUTCOME_BUCKET[outcome];
+  if (bucket) {
+    if (!DB.stockManual[rec.assetName]) {
+      DB.stockManual[rec.assetName] = { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
+    }
+    DB.stockManual[rec.assetName][bucket] = (DB.stockManual[rec.assetName][bucket] || 0) + 1;
+    saveMeta();
+  }
+
+  if (rec.assetTagNo) {
+    const note = `Returned ${fmtDate(rec.returnDate || todayISO())} by ${rec.employeeName}` +
+      (rec.remarks ? ` — ${rec.remarks}` : "");
+    const existing = DB.inventory.find(i => i.assetId === rec.assetTagNo);
+    if (existing) {
+      existing.status = outcome;
+      existing.condition = rec.returnCondition || existing.condition || "";
+      existing.assignedTo = "";
+      existing.remarks = existing.remarks ? `${existing.remarks}\n${note}` : note;
+      saveRecord("inventory", existing);
+    } else {
+      const newInv = {
+        uid: uid(),
+        assetId: rec.assetTagNo,
+        assetName: rec.assetName,
+        brand: "", model: "", serial: "",
+        purchaseDate: "", purchaseCost: "", vendor: "", warrantyExpiry: "",
+        status: outcome,
+        assignedTo: "",
+        department: rec.department || "",
+        floor: "",
+        condition: rec.returnCondition || "",
+        remarks: `Auto-created from asset return — ${note}`,
+      };
+      DB.inventory.push(newInv);
+      saveRecord("inventory", newInv);
+    }
+  }
+
+  logAction("Returned asset", `${rec.assetName}${rec.assetTagNo ? ` (${rec.assetTagNo})` : ""} returned by ${rec.employeeName} — condition: ${rec.returnCondition || "—"}, now ${outcome}`);
+}
+
 /* =========================================================
    ROUTER
    ========================================================= */
 const PAGES = {
   dashboard: { title: "Dashboard", render: renderDashboard },
   assignment: { title: "Asset Assignment", render: renderAssignment },
+  returns: { title: "Asset Returns", render: renderReturns },
+  assetRequests: { title: "Asset Requests", render: renderAssetRequests },
   inventory: { title: "Master Inventory", render: renderInventory },
   employees: { title: "Employees", render: renderEmployees },
   empHistory: { title: "Employee History", render: renderEmployeeHistory },
@@ -613,8 +758,28 @@ const PAGES = {
   settings: { title: "Settings", render: renderSettings },
 };
 
+// Pages a pure Team Lead (has the "teamlead" role and isn't also an Admin) is allowed to
+// open — this only drives the nav/UX; the real enforcement is always firestore.rules, so
+// even someone forcing goto('inventory') from the console gets no more read/write access
+// than the rules already grant a Team Lead (same as any other role in this app).
+const TEAM_LEAD_PAGES = new Set(["dashboard", "assetRequests"]);
+// Asset Requests itself is Team-Lead-and-Admin-only — a plain Viewer never sees it,
+// same spirit as Settings already being admin-only content.
+function canOpenAssetRequests() { return isAdmin() || isTeamLead(); }
+function applyNavVisibility() {
+  const teamLeadOnly = isTeamLead();
+  document.querySelectorAll(".nav-item").forEach(b => {
+    const page = b.dataset.page;
+    if (teamLeadOnly) { b.style.display = TEAM_LEAD_PAGES.has(page) ? "" : "none"; return; }
+    if (page === "assetRequests") { b.style.display = canOpenAssetRequests() ? "" : "none"; return; }
+    b.style.display = "";
+  });
+}
+
 function goto(page) {
   if (!PAGES[page]) page = "dashboard"; // guard against a stale/invalid saved page
+  if (isTeamLead() && !TEAM_LEAD_PAGES.has(page)) page = "dashboard";
+  if (page === "assetRequests" && !canOpenAssetRequests()) page = "dashboard";
   currentPage = page;
   localStorage.setItem(LAST_PAGE_KEY, page);
   document.querySelectorAll(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page === page));
@@ -632,33 +797,34 @@ document.getElementById("nav").addEventListener("click", (e) => {
 document.getElementById("hamburger").addEventListener("click", () => {
   document.getElementById("sidebar").classList.toggle("open");
 });
-const RESET_CONFIRM_PASSWORD = "reset123"; // change this to whatever you like — required to actually run a reset
-
 document.getElementById("resetDataBtn").addEventListener("click", () => {
   if (!requireAdminOrWarn()) return;
   const isDefaultOffice = currentOfficeId === DEFAULT_OFFICE_ID;
   const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "this office";
+  // Confirmed by typing the office's own name back (like GitHub's "delete this repo" flow) —
+  // no shared secret to keep track of, and it forces you to actually read which office you're
+  // about to wipe instead of muscle-memory-typing a password.
   openModal("Reset this office's data?", `
     <p class="muted" style="margin-top:0">This resets the dashboard, assignments, employees and logs for
     <strong>${escapeHtml(officeName)}</strong> ${isDefaultOffice ? "back to the original uploaded sheet" : "to a blank slate"} —
     for everyone viewing this office, since data is shared live via Firebase. Other offices are not affected.
     Anything anyone has added or edited for this office will be lost.</p>
-    <div class="field"><label>Type the confirmation password to continue</label>
-      <input type="password" id="resetConfirmPw" placeholder="Confirmation password" autocomplete="off">
+    <div class="field"><label>Type <strong>${escapeHtml(officeName)}</strong> to confirm</label>
+      <input type="text" id="resetConfirmName" placeholder="${escapeHtml(officeName)}" autocomplete="off">
     </div>
-    <p id="resetPwError" style="display:none; color:var(--red); font-weight:600; font-size:12.5px; margin-top:-6px;">Incorrect password.</p>
+    <p id="resetPwError" style="display:none; color:var(--red); font-weight:600; font-size:12.5px; margin-top:-6px;">That doesn't match the office name.</p>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelReset">Cancel</button>
       <button class="btn btn-danger" id="confirmReset">Yes, reset this office's data</button>
     </div>
   `, () => {
-    const pwInp = document.getElementById("resetConfirmPw");
-    pwInp.focus();
+    const nameInp = document.getElementById("resetConfirmName");
+    nameInp.focus();
     document.getElementById("cancelReset").onclick = closeModal;
     const attempt = async () => {
-      if (pwInp.value !== RESET_CONFIRM_PASSWORD) {
+      if (nameInp.value.trim().toLowerCase() !== officeName.trim().toLowerCase()) {
         document.getElementById("resetPwError").style.display = "block";
-        pwInp.focus();
+        nameInp.focus();
         return;
       }
       document.getElementById("confirmReset").disabled = true;
@@ -675,7 +841,7 @@ document.getElementById("resetDataBtn").addEventListener("click", () => {
       }
     };
     document.getElementById("confirmReset").onclick = attempt;
-    pwInp.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); });
+    nameInp.addEventListener("keydown", (e) => { if (e.key === "Enter") attempt(); });
   });
 });
 
@@ -869,9 +1035,15 @@ function svgCategoryBarCompare(rows) {
    DASHBOARD
    ========================================================= */
 function renderDashboard() {
+  // A pure Team Lead's "home" is their own request queue, not the full org
+  // dashboard (§20) — reuses renderMyAssetRequests() as-is rather than building
+  // a second, near-identical stat-card+table page.
+  if (isTeamLead()) return renderMyAssetRequests();
+
   const s = computeDashboard();
   const content = document.getElementById("content");
   const admin = isAdmin();
+  const reqSummary = computeRequestsSummary(DB.requests || []);
 
   // Cards link to wherever that number actually lives, so the dashboard
   // works as a jumping-off point rather than a dead-end summary.
@@ -884,6 +1056,12 @@ function renderDashboard() {
     { label: "Faulty", value: s.faulty, icon: "🔴", cls: "icon-red", foot: "Needs attention", goto: "stock" },
     { label: "Lost", value: s.lost, icon: "✖", cls: "icon-grey", foot: "Unaccounted", goto: "stock" },
     { label: "Scrap", value: s.scrap, icon: "⚫", cls: "icon-grey", foot: "Decommissioned", goto: "stock" },
+    // Kept to just these two so the dashboard doesn't get overloaded (§21) —
+    // the full request queue with every filter lives on Asset Requests itself.
+    ...(admin ? [
+      { label: "Pending Asset Requests", value: reqSummary.pending, icon: "📋", cls: "icon-blue", foot: "Awaiting review", goto: "assetRequests" },
+      { label: "Urgent Requests", value: reqSummary.urgent, icon: "🔥", cls: "icon-red", foot: "Marked Urgent, still open", goto: "assetRequests" },
+    ] : []),
   ];
 
   const recentAssignments = sortAssignmentsNewestFirst(DB.assignments).slice(0, 6);
@@ -907,7 +1085,7 @@ function renderDashboard() {
     ` : ""}
     <div class="stat-grid">
       ${cards.map(c => `
-        <div class="stat-card" role="button" tabindex="0" title="View in ${c.goto === "assignment" ? "Asset Assignment" : c.goto === "categories" ? "Asset Categories" : "Stock Summary"}"
+        <div class="stat-card" role="button" tabindex="0" title="View in ${c.goto === "assignment" ? "Asset Assignment" : c.goto === "categories" ? "Asset Categories" : c.goto === "assetRequests" ? "Asset Requests" : "Stock Summary"}"
           style="cursor:pointer"
           onclick="${c.presetFilter ? `assignFilter.status='${c.presetFilter}';` : ""}goto('${c.goto}')"
           onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
@@ -1100,13 +1278,14 @@ function paintAssignTable() {
       <td>${escapeHtml(a.employeeName)}</td>
       <td>${escapeHtml(a.department || "—")}</td>
       <td>${escapeHtml(a.assignedBy || "—")}</td>
-      <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}</td>
+      <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}${a.returnCondition ? `<br>${conditionBadge(a.returnCondition)}` : ""}</td>
       <td>${statusBadge(a.status)}</td>
       <td>${escapeHtml(a.remarks || "—")}</td>
       <td>
         <div class="row-actions">
           <button class="btn btn-secondary btn-sm btn-icon" title="Handover Slip (PDF)" aria-label="Generate handover slip for ${escapeHtml(a.employeeName)}" onclick="openHandoverSlip('${a.uid}')">📄</button>
           ${admin ? `
+          ${a.status !== "Returned" ? `<button class="btn btn-secondary btn-sm btn-icon" title="Return this asset" aria-label="Return asset for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}', true)">↩️</button>` : ""}
           <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit assignment for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
           <button class="btn btn-danger btn-sm btn-icon" title="Delete" aria-label="Delete assignment for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>
           ` : ""}
@@ -1364,12 +1543,23 @@ function generateHandoverSlipPDF(groups, signatureDataUrl) {
   toast("Handover slip downloaded");
 }
 
-function openAssignForm(uidVal) {
+// `requestPrefill` (optional) is set when this is opened via an Approved Asset
+// Request's "Assign Asset" button (§18) — {requestUid, requestId, employeeName,
+// employeeCode, department, assetType, quantity}. It only applies to a brand-new
+// assignment (uidVal null); on save, the created assignment gets stamped with
+// sourceRequestId and the source request is flipped to Fulfilled — see
+// fulfillRequestFromAssignment(), no separate assignment system involved.
+function openAssignForm(uidVal, quickReturn, requestPrefill) {
   if (!requireAdminOrWarn()) return;
   const editing = uidVal ? DB.assignments.find(a => a.uid === uidVal) : null;
   const cats = DB.categories.map(c => c.name);
   const depts = DB.lists.department || [];
   const statuses = DB.lists.assignmentStatus || ["Assigned", "Returned", "Overdue"];
+  const conditions = DB.lists.condition || ["New", "Good", "Fair", "Poor", "Damaged"];
+  const outcomes = (DB.lists.status || []).filter(s => s !== "Assigned");
+  const initialStatus = quickReturn ? "Returned" : (editing ? editing.status : "Assigned");
+  const initialCondition = editing ? editing.returnCondition || "" : "";
+  const initialOutcome = editing ? editing.returnOutcome || "" : "";
 
   const assetFieldHtml = editing
     ? `<div class="field"><label>Asset</label>
@@ -1383,18 +1573,22 @@ function openAssignForm(uidVal) {
             <button type="button" class="btn btn-secondary btn-sm" id="assetSelectAll">Select All</button>
             <button type="button" class="btn btn-secondary btn-sm" id="assetSelectNone">Clear</button>
           </div>
-          ${cats.map(c => `
+          ${cats.map(c => {
+            const preChecked = !editing && requestPrefill && requestPrefill.assetType === c;
+            return `
             <label class="asset-check-row">
-              <input type="checkbox" class="f_asset_multi" value="${escapeHtml(c)}">
+              <input type="checkbox" class="f_asset_multi" value="${escapeHtml(c)}" ${preChecked ? "checked" : ""}>
               <span>${escapeHtml(c)}</span>
               <span class="qty-label">Qty</span>
-              <input type="number" class="f_asset_qty" data-cat="${escapeHtml(c)}" min="1" step="1" value="1" title="How many units of ${escapeHtml(c)} to log">
+              <input type="number" class="f_asset_qty" data-cat="${escapeHtml(c)}" min="1" step="1" value="${preChecked ? (requestPrefill.quantity || 1) : 1}" title="How many units of ${escapeHtml(c)} to log">
             </label>
-          `).join("")}
+          `;
+          }).join("")}
         </div>
       </div>`;
 
-  openModal(editing ? "Edit Assignment" : "New Assignment", `
+  openModal(quickReturn ? "Return Asset" : (editing ? "Edit Assignment" : (requestPrefill ? `Fulfill Request ${requestPrefill.requestId || ""}` : "New Assignment")), `
+    ${requestPrefill ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📋</span><div>Fulfilling <strong>${escapeHtml(requestPrefill.requestId || "")}</strong> for ${escapeHtml(requestPrefill.employeeName || "")} — pick the actual asset to hand over below.</div></div>` : ""}
     ${editing ? `
     <div class="field-row">
       <div class="field"><label>Date</label><input type="date" id="f_date" value="${editing.date || ""}"></div>
@@ -1405,27 +1599,35 @@ function openAssignForm(uidVal) {
     `}
     <div class="field-row">
       <div class="field"><label>Employee / Recipient Name</label>
-        <input type="text" id="f_emp" list="empList" value="${escapeHtml(editing ? editing.employeeName : "")}" placeholder="Employee name, or a team/TL name like 'KYC Training'">
+        <input type="text" id="f_emp" list="empList" value="${escapeHtml(editing ? editing.employeeName : (requestPrefill ? requestPrefill.employeeName || "" : ""))}" placeholder="Employee name, or a team/TL name like 'KYC Training'">
         <datalist id="empList">${DB.employees.map(e => `<option value="${escapeHtml(e.name)}">`).join("")}</datalist>
       </div>
-      <div class="field"><label>Employee ID</label><input type="text" id="f_empid" value="${escapeHtml(editing ? editing.employeeId || "" : "")}"></div>
+      <div class="field"><label>Employee ID</label><input type="text" id="f_empid" value="${escapeHtml(editing ? editing.employeeId || "" : (requestPrefill ? requestPrefill.employeeCode || "" : ""))}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>Department</label>
-        <select id="f_dept"><option value="">—</option>${depts.map(d => `<option ${editing && editing.department === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}</select>
+        <select id="f_dept"><option value="">—</option>${depts.map(d => `<option ${(editing ? editing.department === d : (requestPrefill && requestPrefill.department === d)) ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}</select>
       </div>
-      <div class="field"><label>Assigned By</label><input type="text" id="f_by" value="${escapeHtml(editing ? editing.assignedBy || "" : "")}"></div>
+      <div class="field"><label>Assigned By</label><input type="text" id="f_by" value="${escapeHtml(editing ? editing.assignedBy || "" : (requestPrefill ? ((fauth.currentUser || {}).email || "") : ""))}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>Status</label>
-        <select id="f_status">${statuses.map(s => `<option ${(editing ? editing.status === s : s === "Assigned") ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}</select>
+        <select id="f_status">${statuses.map(s => `<option ${s === initialStatus ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}</select>
       </div>
-      <div class="field"><label>Return Date</label><input type="date" id="f_return" value="${editing ? editing.returnDate || "" : ""}"></div>
+      <div class="field"><label>Return Date</label><input type="date" id="f_return" value="${quickReturn ? todayISO() : (editing ? editing.returnDate || "" : "")}"></div>
     </div>
-    <div class="field"><label>Remarks</label><textarea id="f_remarks" rows="2">${escapeHtml(editing ? editing.remarks || "" : "")}</textarea></div>
+    <div class="field-row" id="returnFieldsWrap" style="display:none">
+      <div class="field"><label>Condition on Return</label>
+        <select id="f_returnCondition"><option value="">—</option>${conditions.map(c => `<option ${c === initialCondition ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select>
+      </div>
+      <div class="field"><label>Outcome <span class="muted" style="font-weight:500;">(where it goes now)</span></label>
+        <select id="f_returnOutcome">${outcomes.map(o => `<option ${o === initialOutcome ? "selected" : ""}>${escapeHtml(o)}</option>`).join("")}</select>
+      </div>
+    </div>
+    <div class="field"><label>Remarks${quickReturn ? ` <span class="muted" style="font-weight:500;">(e.g. "screen cracked, not powering on")</span>` : ""}</label><textarea id="f_remarks" rows="2">${escapeHtml(editing ? editing.remarks || "" : "")}</textarea></div>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelBtn">Cancel</button>
-      <button class="btn btn-primary" id="saveBtn">${editing ? "Save Changes" : "Add Assignment"}</button>
+      <button class="btn btn-primary" id="saveBtn">${quickReturn ? "Confirm Return" : (editing ? "Save Changes" : "Add Assignment")}</button>
     </div>
   `, () => {
     // Auto-fill Employee ID + Department when a known employee name is entered/selected.
@@ -1453,6 +1655,28 @@ function openAssignForm(uidVal) {
     empInput.addEventListener("change", autofillFromName);
     if (!editing) autofillFromName();
 
+    // The Condition/Outcome fields only matter once Status is "Returned" — keep
+    // them hidden otherwise so the form doesn't ask irrelevant questions while
+    // an asset is still just being assigned.
+    const statusSel = document.getElementById("f_status");
+    const returnFieldsWrap = document.getElementById("returnFieldsWrap");
+    const conditionSel = document.getElementById("f_returnCondition");
+    const outcomeSel = document.getElementById("f_returnOutcome");
+    const syncReturnFieldsVisibility = () => {
+      returnFieldsWrap.style.display = statusSel.value === "Returned" ? "" : "none";
+    };
+    statusSel.addEventListener("change", syncReturnFieldsVisibility);
+    syncReturnFieldsVisibility();
+    // Suggest an Outcome from the Condition picked, as a starting point the
+    // admin is always free to override manually.
+    let outcomeTouched = !!initialOutcome;
+    outcomeSel.addEventListener("change", () => { outcomeTouched = true; });
+    conditionSel.addEventListener("change", () => {
+      if (outcomeTouched) return;
+      const suggestion = suggestReturnOutcome(conditionSel.value);
+      if ([...outcomeSel.options].some(o => o.value === suggestion)) outcomeSel.value = suggestion;
+    });
+
     if (!editing) {
       document.getElementById("assetSelectAll").onclick = () => {
         document.querySelectorAll(".f_asset_multi").forEach(cb => cb.checked = true);
@@ -1468,24 +1692,36 @@ function openAssignForm(uidVal) {
       if (!empName) { toast("Employee name is required", "err"); return; }
       if (!document.getElementById("f_date").value) { toast("Date is required", "err"); return; }
 
+      const statusVal = document.getElementById("f_status").value;
+      if (statusVal === "Returned" && !document.getElementById("f_return").value) {
+        toast("Return Date is required when Status is Returned", "err"); return;
+      }
       const common = {
         date: document.getElementById("f_date").value,
         employeeName: empName,
         employeeId: document.getElementById("f_empid").value.trim(),
         department: document.getElementById("f_dept").value,
         assignedBy: document.getElementById("f_by").value.trim(),
-        status: document.getElementById("f_status").value,
+        status: statusVal,
         returnDate: document.getElementById("f_return").value,
+        returnCondition: statusVal === "Returned" ? document.getElementById("f_returnCondition").value : "",
+        returnOutcome: statusVal === "Returned" ? document.getElementById("f_returnOutcome").value : "",
         remarks: document.getElementById("f_remarks").value.trim(),
       };
 
       let newRecords = [];
       if (editing) {
+        const wasReturned = editing.status === "Returned";
         const rec = { ...common, assetName: document.getElementById("f_asset").value };
         Object.assign(editing, rec);
         saveRecord("assignments", editing);
-        logAction("Edited assignment", `${rec.assetName} → ${empName}`);
-        toast("Assignment updated");
+        if (!wasReturned && editing.status === "Returned") {
+          applyReturnSideEffects(editing);
+          toast("Asset marked as returned");
+        } else {
+          logAction("Edited assignment", `${rec.assetName} → ${empName}`);
+          toast("Assignment updated");
+        }
       } else {
         const selectedBoxes = [...document.querySelectorAll(".f_asset_multi:checked")];
         if (!selectedBoxes.length) { toast("Select at least one asset", "err"); return; }
@@ -1513,6 +1749,7 @@ function openAssignForm(uidVal) {
               ...common,
               assetName,
               assetTagNo: nextAssetTagNo(assetName),
+              sourceRequestId: requestPrefill ? requestPrefill.requestId : "",
             };
             DB.assignments.push(newRec);
             newRecords.push(newRec);
@@ -1523,9 +1760,17 @@ function openAssignForm(uidVal) {
         newRecords.forEach(r => saveRecord("assignments", r));
         saveMeta(); // persists the updated per-category tag-number counters
         logAction("Added assignment(s)", `${summaryParts.join(", ")} → ${empName}`);
+        // Lets you backfill an asset you never logged an "Assigned" row for at
+        // all — just add it here with Status already set to "Returned" (e.g. an
+        // old phone someone's handing back, 1-2 years after the fact) and it
+        // still gets a proper record + a Master Inventory entry created for it.
+        if (common.status === "Returned") newRecords.forEach(r => applyReturnSideEffects(r));
+        // Approved Asset Request → Assignment linkage (§18): mark the source
+        // request Fulfilled and link it to whichever unit actually got created.
+        if (requestPrefill && newRecords.length) fulfillRequestFromAssignment(requestPrefill, newRecords[0]);
         toast(newRecords.length > 1
           ? `${newRecords.length} assignments added for ${empName}`
-          : "Assignment added");
+          : requestPrefill ? `Request ${requestPrefill.requestId} fulfilled` : "Assignment added");
       }
       closeModal();
       paintAssignTable();
@@ -1552,6 +1797,993 @@ function deleteAssignment(uidVal) {
       if (currentPage === "dashboard") renderDashboard();
     };
   });
+}
+
+/* =========================================================
+   ASSET RETURNS  (dedicated view over assignments where status = "Returned")
+   ========================================================= */
+let returnFilter = { q: "", condition: "", outcome: "", dept: "" };
+
+function getReturnedAssignments() {
+  return DB.assignments.filter(a => a.status === "Returned");
+}
+function returnSortKey(a) {
+  return a.returnDate || a.date || "";
+}
+function sortReturnsNewestFirst(list) {
+  return [...list].sort((a, b) => returnSortKey(b).localeCompare(returnSortKey(a)));
+}
+function computeReturnsSummary(records) {
+  const s = { total: records.length, available: 0, underRepair: 0, faulty: 0, lost: 0, scrap: 0 };
+  records.forEach(a => {
+    const o = a.returnOutcome || "Available";
+    if (o === "Available") s.available++;
+    else if (o === "Under Repair") s.underRepair++;
+    else if (o === "Faulty") s.faulty++;
+    else if (o === "Lost") s.lost++;
+    else if (o === "Scrap") s.scrap++;
+  });
+  return s;
+}
+
+function renderReturns() {
+  const content = document.getElementById("content");
+  const depts = DB.lists.department || [];
+  const conditions = DB.lists.condition || [];
+  const outcomes = (DB.lists.status || []).filter(s => s !== "Assigned");
+  const all = getReturnedAssignments();
+  const summary = computeReturnsSummary(all);
+
+  content.innerHTML = `
+    ${viewerNotice()}
+    <div class="stat-grid" style="margin-bottom:18px">
+      ${[
+        { icon: "↩️", cls: "icon-purple", value: summary.total, label: "Total Returns" },
+        { icon: "✅", cls: "icon-blue", value: summary.available, label: "Back to Available" },
+        { icon: "🔧", cls: "icon-amber", value: summary.underRepair, label: "Under Repair" },
+        { icon: "⚠️", cls: "icon-red", value: summary.faulty, label: "Faulty" },
+        { icon: "🗑️", cls: "icon-grey", value: summary.lost + summary.scrap, label: "Lost / Scrap" },
+      ].map(c => `
+        <div class="stat-card">
+          <div class="stat-top">
+            <div class="stat-icon ${c.cls}">${c.icon}</div>
+            <div class="stat-label">${c.label}</div>
+          </div>
+          <div class="stat-value">${c.value}</div>
+        </div>
+      `).join("")}
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div><h2>Asset Returns</h2><div class="sub" id="returnCountSub">${all.length} returned record${all.length === 1 ? "" : "s"}</div></div>
+        <button class="btn btn-secondary btn-sm" id="exportReturnsBtn">⬇ Export Returns</button>
+      </div>
+      <div class="toolbar">
+        <div class="search-box"><input type="text" id="returnSearch" placeholder="Search employee, asset, remarks..." value="${escapeHtml(returnFilter.q)}" /></div>
+        <select class="filter-select" id="returnConditionFilter">
+          <option value="">All conditions</option>
+          ${conditions.map(c => `<option value="${escapeHtml(c)}" ${returnFilter.condition === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+        </select>
+        <select class="filter-select" id="returnOutcomeFilter">
+          <option value="">All outcomes</option>
+          ${outcomes.map(o => `<option value="${escapeHtml(o)}" ${returnFilter.outcome === o ? "selected" : ""}>${escapeHtml(o)}</option>`).join("")}
+        </select>
+        <select class="filter-select" id="returnDeptFilter">
+          <option value="">All departments</option>
+          ${depts.map(d => `<option value="${escapeHtml(d)}" ${returnFilter.dept === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}
+        </select>
+        <button class="btn btn-secondary btn-sm" id="returnClearFiltersBtn" style="display:none">Clear filters</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Return Date</th><th>Asset</th><th>Asset Tag</th><th>Returned By</th><th>Dept</th>
+          <th>Condition</th><th>Outcome</th><th>Remarks</th><th></th>
+        </tr></thead>
+        <tbody id="returnTbody"></tbody>
+      </table></div>
+    </div>
+  `;
+
+  document.getElementById("returnSearch").oninput = (e) => { returnFilter.q = e.target.value.toLowerCase(); paintReturnsTable(); };
+  document.getElementById("returnConditionFilter").onchange = (e) => { returnFilter.condition = e.target.value; paintReturnsTable(); };
+  document.getElementById("returnOutcomeFilter").onchange = (e) => { returnFilter.outcome = e.target.value; paintReturnsTable(); };
+  document.getElementById("returnDeptFilter").onchange = (e) => { returnFilter.dept = e.target.value; paintReturnsTable(); };
+  document.getElementById("returnClearFiltersBtn").onclick = () => {
+    returnFilter = { q: "", condition: "", outcome: "", dept: "" };
+    document.getElementById("returnSearch").value = "";
+    document.getElementById("returnConditionFilter").value = "";
+    document.getElementById("returnOutcomeFilter").value = "";
+    document.getElementById("returnDeptFilter").value = "";
+    paintReturnsTable();
+  };
+  document.getElementById("exportReturnsBtn").onclick = () => exportSheet("asset_returns", "Asset Returns", reportRows("returns"));
+
+  paintReturnsTable();
+}
+
+function getFilteredReturns() {
+  let rows = sortReturnsNewestFirst(getReturnedAssignments());
+  if (returnFilter.q) {
+    rows = rows.filter(a => [a.employeeName, a.assetName, a.remarks].join(" ").toLowerCase().includes(returnFilter.q));
+  }
+  if (returnFilter.condition) rows = rows.filter(a => a.returnCondition === returnFilter.condition);
+  if (returnFilter.outcome) rows = rows.filter(a => (a.returnOutcome || "Available") === returnFilter.outcome);
+  if (returnFilter.dept) rows = rows.filter(a => a.department === returnFilter.dept);
+  return rows;
+}
+
+function paintReturnsTable() {
+  const tbody = document.getElementById("returnTbody");
+  if (!tbody) return;
+  const rows = getFilteredReturns();
+  const admin = isAdmin();
+  const filterActive = !!(returnFilter.q || returnFilter.condition || returnFilter.outcome || returnFilter.dept);
+  const all = getReturnedAssignments();
+
+  const countSub = document.getElementById("returnCountSub");
+  if (countSub) {
+    countSub.textContent = filterActive
+      ? `${rows.length} of ${all.length} returned records (filtered)`
+      : `${all.length} returned record${all.length === 1 ? "" : "s"}`;
+  }
+  const clearBtn = document.getElementById("returnClearFiltersBtn");
+  if (clearBtn) clearBtn.style.display = filterActive ? "" : "none";
+
+  tbody.innerHTML = rows.length ? rows.map(a => `
+    <tr>
+      <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}</td>
+      <td>${escapeHtml(a.assetName)}</td>
+      <td>${a.assetTagNo ? `<span class="badge badge-grey">${escapeHtml(a.assetTagNo)}</span>` : "—"}</td>
+      <td>${escapeHtml(a.employeeName)}</td>
+      <td>${escapeHtml(a.department || "—")}</td>
+      <td>${a.returnCondition ? conditionBadge(a.returnCondition) : "—"}</td>
+      <td>${statusBadge(a.returnOutcome || "Available")}</td>
+      <td>${escapeHtml(a.remarks || "—")}</td>
+      <td>
+        <div class="row-actions">
+          <button class="btn btn-secondary btn-sm btn-icon" title="Handover Slip (PDF)" aria-label="Generate handover slip for ${escapeHtml(a.employeeName)}" onclick="openHandoverSlip('${a.uid}')">📄</button>
+          ${admin ? `
+          <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit return for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
+          <button class="btn btn-danger btn-sm btn-icon" title="Delete" aria-label="Delete return for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>
+          ` : ""}
+        </div>
+      </td>
+    </tr>
+  `).join("") : `<tr class="empty-row"><td colspan="9">${filterActive ? `No returns match your search/filters. <a href="#" id="returnEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No assets have been returned yet — use the ↩ Return button on Asset Assignment, or add a Returned record directly if you're backfilling an old asset."}</td></tr>`;
+
+  const emptyClear = document.getElementById("returnEmptyClear");
+  if (emptyClear) emptyClear.onclick = (e) => { e.preventDefault(); document.getElementById("returnClearFiltersBtn").click(); };
+}
+
+/* =========================================================
+   ASSET REQUESTS
+   Team Leads submit + track their own requests; Admins review, approve/reject,
+   and convert an Approved request straight into a real Assignment (§18 — no
+   separate/duplicate assignment system). Enforcement of who can do what lives
+   in firestore.rules, not just here — this is the UI on top of that.
+   ========================================================= */
+const REQUEST_TYPES = [
+  { value: "New Asset", icon: "🆕", desc: "A brand-new asset for an existing employee." },
+  { value: "Asset Replacement", icon: "🔁", desc: "Swap out something damaged, faulty, or due for an upgrade." },
+  { value: "New Employee – First-Time Asset Assignment", icon: "👋", desc: "First-time setup for someone who just joined." },
+];
+const REPLACEMENT_REASONS = ["Damaged", "Not Working", "Performance Issue", "Lost", "End of Life", "Upgrade Required", "Other"];
+
+function getMyRequests() {
+  const email = (fauth.currentUser || {}).email || "";
+  return (DB.requests || []).filter(r => r.requestedBy === email);
+}
+function requestSortKey(r) { return r.updatedAt || r.createdAt || ""; }
+function sortRequestsNewestFirst(list) {
+  return [...list].sort((a, b) => requestSortKey(b).localeCompare(requestSortKey(a)));
+}
+function computeRequestsSummary(records) {
+  const s = { total: records.length, pending: 0, approved: 0, rejected: 0, fulfilled: 0, urgent: 0 };
+  records.forEach(r => {
+    if (r.status === "Submitted" || r.status === "Under Review") s.pending++;
+    else if (r.status === "Approved") s.approved++;
+    else if (r.status === "Rejected") s.rejected++;
+    else if (r.status === "Fulfilled") s.fulfilled++;
+    if (r.priority === "Urgent" && REQUEST_ACTIVE_STATUSES.includes(r.status)) s.urgent++;
+  });
+  return s;
+}
+function requestStatCards(summary) {
+  return [
+    { icon: "📋", cls: "icon-blue", value: summary.total, label: "Total Requests" },
+    { icon: "⏳", cls: "icon-amber", value: summary.pending, label: "Pending Review" },
+    { icon: "✅", cls: "icon-purple", value: summary.approved, label: "Approved" },
+    { icon: "✖️", cls: "icon-red", value: summary.rejected, label: "Rejected" },
+    { icon: "🏁", cls: "icon-teal", value: summary.fulfilled, label: "Fulfilled" },
+    { icon: "🔥", cls: "icon-grey", value: summary.urgent, label: "Urgent Requests" },
+  ];
+}
+function renderStatGrid(cards) {
+  return `<div class="stat-grid" style="margin-bottom:18px">${cards.map(c => `
+    <div class="stat-card">
+      <div class="stat-top"><div class="stat-icon ${c.cls}">${c.icon}</div><div class="stat-label">${c.label}</div></div>
+      <div class="stat-value">${c.value}</div>
+    </div>
+  `).join("")}</div>`;
+}
+
+function renderAssetRequests() {
+  if (!canOpenAssetRequests()) { goto("dashboard"); return; }
+  if (isTeamLead()) return renderMyAssetRequests();
+  return renderAdminAssetRequests();
+}
+
+/* ---------- Team Lead view: their own requests only ---------- */
+function renderMyAssetRequests() {
+  const content = document.getElementById("content");
+  const mine = sortRequestsNewestFirst(getMyRequests());
+  const summary = computeRequestsSummary(mine);
+
+  content.innerHTML = `
+    ${renderStatGrid(requestStatCards(summary))}
+    <div class="card">
+      <div class="card-header">
+        <div><h2>My Asset Requests</h2><div class="sub" id="reqCountSub">${mine.length} request${mine.length === 1 ? "" : "s"}</div></div>
+        <button class="btn btn-primary" id="newReqBtn">+ New Asset Request</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Request ID</th><th>Employee</th><th>Asset</th><th>Type</th><th>Priority</th><th>Status</th><th>Last Updated</th><th></th>
+        </tr></thead>
+        <tbody id="reqTbody"></tbody>
+      </table></div>
+    </div>
+  `;
+  document.getElementById("newReqBtn").onclick = () => openRequestForm();
+  paintMyRequestsTable(mine);
+}
+function paintMyRequestsTable(mine) {
+  const tbody = document.getElementById("reqTbody");
+  if (!tbody) return;
+  tbody.innerHTML = mine.length ? mine.map(r => `
+    <tr>
+      <td>${r.requestId ? `<span class="badge badge-grey">${escapeHtml(r.requestId)}</span>` : `<span class="muted">Draft</span>`}</td>
+      <td>${escapeHtml(r.employeeName || "—")}</td>
+      <td>${escapeHtml(r.assetType === "Other" ? (r.otherAssetType || "Other") : (r.assetType || "—"))}</td>
+      <td>${escapeHtml(r.requestType || "—")}</td>
+      <td>${priorityBadge(r.priority)}</td>
+      <td>${requestStatusBadge(r.status)}</td>
+      <td>${fmtDate((r.updatedAt || r.createdAt || "").slice(0, 10))}</td>
+      <td>
+        <div class="row-actions">
+          <button class="btn btn-secondary btn-sm btn-icon" title="View" aria-label="View request ${escapeHtml(r.requestId || "")}" onclick="openRequestDetail('${r.uid}')">👁️</button>
+          ${["Draft", "Submitted"].includes(r.status) ? `<button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit request ${escapeHtml(r.requestId || "")}" onclick="openRequestForm('${r.uid}')">✏️</button>` : ""}
+        </div>
+      </td>
+    </tr>
+  `).join("") : `<tr class="empty-row"><td colspan="8">No asset requests yet — click "+ New Asset Request" to submit one for your team.</td></tr>`;
+}
+
+/* ---------- Admin / Super Admin view: the full queue ---------- */
+let requestFilter = { q: "", status: "", type: "", dept: "", assetType: "", priority: "", requestedBy: "", from: "", to: "" };
+function getFilteredRequests() {
+  let rows = sortRequestsNewestFirst(DB.requests || []);
+  if (requestFilter.q) {
+    const q = requestFilter.q;
+    rows = rows.filter(r => [r.requestId, r.employeeName, r.employeeCode, r.assetType, r.businessJustification].join(" ").toLowerCase().includes(q));
+  }
+  if (requestFilter.status) rows = rows.filter(r => r.status === requestFilter.status);
+  if (requestFilter.type) rows = rows.filter(r => r.requestType === requestFilter.type);
+  if (requestFilter.dept) rows = rows.filter(r => r.department === requestFilter.dept);
+  if (requestFilter.assetType) rows = rows.filter(r => r.assetType === requestFilter.assetType);
+  if (requestFilter.priority) rows = rows.filter(r => r.priority === requestFilter.priority);
+  if (requestFilter.requestedBy) rows = rows.filter(r => r.requestedBy === requestFilter.requestedBy);
+  if (requestFilter.from) rows = rows.filter(r => (r.createdAt || "").slice(0, 10) >= requestFilter.from);
+  if (requestFilter.to) rows = rows.filter(r => (r.createdAt || "").slice(0, 10) <= requestFilter.to);
+  return rows;
+}
+function renderAdminAssetRequests() {
+  const content = document.getElementById("content");
+  const all = DB.requests || [];
+  const summary = computeRequestsSummary(all);
+  const depts = DB.lists.department || [];
+  const cats = DB.categories.map(c => c.name);
+  const requesters = [...new Set(all.map(r => r.requestedBy).filter(Boolean))].sort();
+  const statuses = ["Draft", "Submitted", "Under Review", "Approved", "Rejected", "Fulfilled", "Cancelled"];
+
+  content.innerHTML = `
+    ${viewerNotice()}
+    ${renderStatGrid(requestStatCards(summary))}
+    <div class="card">
+      <div class="card-header">
+        <div><h2>Asset Requests</h2><div class="sub" id="reqCountSub">${all.length} request${all.length === 1 ? "" : "s"}</div></div>
+        <button class="btn btn-secondary btn-sm" id="exportReqBtn">⬇ Export Requests</button>
+      </div>
+      <div class="toolbar">
+        <div class="search-box"><input type="text" id="reqSearch" placeholder="Search request ID, employee, asset..." value="${escapeHtml(requestFilter.q)}"/></div>
+        <select class="filter-select" id="reqStatusFilter"><option value="">All statuses</option>${statuses.map(s => `<option value="${escapeHtml(s)}" ${requestFilter.status === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}</select>
+        <select class="filter-select" id="reqTypeFilter"><option value="">All request types</option>${REQUEST_TYPES.map(t => `<option value="${escapeHtml(t.value)}" ${requestFilter.type === t.value ? "selected" : ""}>${escapeHtml(t.value)}</option>`).join("")}</select>
+        <select class="filter-select" id="reqDeptFilter"><option value="">All departments</option>${depts.map(d => `<option value="${escapeHtml(d)}" ${requestFilter.dept === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}</select>
+        <select class="filter-select" id="reqAssetTypeFilter"><option value="">All asset types</option>${cats.map(c => `<option value="${escapeHtml(c)}" ${requestFilter.assetType === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select>
+        <select class="filter-select" id="reqPriorityFilter"><option value="">All priorities</option>${["Normal", "High", "Urgent"].map(p => `<option value="${p}" ${requestFilter.priority === p ? "selected" : ""}>${p}</option>`).join("")}</select>
+        <select class="filter-select" id="reqRequesterFilter"><option value="">All team leads</option>${requesters.map(e => `<option value="${escapeHtml(e)}" ${requestFilter.requestedBy === e ? "selected" : ""}>${escapeHtml(e)}</option>`).join("")}</select>
+        <input type="date" class="filter-select" id="reqFromFilter" title="Created from" value="${escapeHtml(requestFilter.from)}">
+        <input type="date" class="filter-select" id="reqToFilter" title="Created to" value="${escapeHtml(requestFilter.to)}">
+        <button class="btn btn-secondary btn-sm" id="reqClearFiltersBtn" style="display:none">Clear filters</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th>Request ID</th><th>Requested By</th><th>Department</th><th>Employee</th><th>Employee Code</th>
+          <th>Asset</th><th>Type</th><th>Priority</th><th>Requested</th><th>Status</th><th>Last Updated</th><th></th>
+        </tr></thead>
+        <tbody id="reqTbody"></tbody>
+      </table></div>
+    </div>
+  `;
+
+  document.getElementById("reqSearch").oninput = (e) => { requestFilter.q = e.target.value.toLowerCase(); paintAdminRequestsTable(); };
+  document.getElementById("reqStatusFilter").onchange = (e) => { requestFilter.status = e.target.value; paintAdminRequestsTable(); };
+  document.getElementById("reqTypeFilter").onchange = (e) => { requestFilter.type = e.target.value; paintAdminRequestsTable(); };
+  document.getElementById("reqDeptFilter").onchange = (e) => { requestFilter.dept = e.target.value; paintAdminRequestsTable(); };
+  document.getElementById("reqAssetTypeFilter").onchange = (e) => { requestFilter.assetType = e.target.value; paintAdminRequestsTable(); };
+  document.getElementById("reqPriorityFilter").onchange = (e) => { requestFilter.priority = e.target.value; paintAdminRequestsTable(); };
+  document.getElementById("reqRequesterFilter").onchange = (e) => { requestFilter.requestedBy = e.target.value; paintAdminRequestsTable(); };
+  document.getElementById("reqFromFilter").onchange = (e) => { requestFilter.from = e.target.value; paintAdminRequestsTable(); };
+  document.getElementById("reqToFilter").onchange = (e) => { requestFilter.to = e.target.value; paintAdminRequestsTable(); };
+  document.getElementById("reqClearFiltersBtn").onclick = () => {
+    requestFilter = { q: "", status: "", type: "", dept: "", assetType: "", priority: "", requestedBy: "", from: "", to: "" };
+    renderAdminAssetRequests();
+  };
+  document.getElementById("exportReqBtn").onclick = () => exportSheet("asset_requests", "Asset Requests", reportRows("requests"));
+
+  paintAdminRequestsTable();
+}
+function paintAdminRequestsTable() {
+  const tbody = document.getElementById("reqTbody");
+  if (!tbody) return;
+  const rows = getFilteredRequests();
+  const all = DB.requests || [];
+  const filterActive = Object.values(requestFilter).some(Boolean);
+
+  const countSub = document.getElementById("reqCountSub");
+  if (countSub) countSub.textContent = filterActive ? `${rows.length} of ${all.length} requests (filtered)` : `${all.length} request${all.length === 1 ? "" : "s"}`;
+  const clearBtn = document.getElementById("reqClearFiltersBtn");
+  if (clearBtn) clearBtn.style.display = filterActive ? "" : "none";
+
+  tbody.innerHTML = rows.length ? rows.map(r => `
+    <tr>
+      <td>${r.requestId ? `<span class="badge badge-grey">${escapeHtml(r.requestId)}</span>` : `<span class="muted">Draft</span>`}</td>
+      <td>${escapeHtml(r.requestedBy || "—")}</td>
+      <td>${escapeHtml(r.department || "—")}</td>
+      <td>${escapeHtml(r.employeeName || "—")}${r.isNewEmployee ? ` <span class="badge badge-purple" style="margin-left:4px;">New</span>` : ""}</td>
+      <td>${escapeHtml(r.employeeCode || "—")}</td>
+      <td>${escapeHtml(r.assetType === "Other" ? (r.otherAssetType || "Other") : (r.assetType || "—"))}${r.quantity > 1 ? ` × ${r.quantity}` : ""}</td>
+      <td>${escapeHtml(r.requestType || "—")}</td>
+      <td>${priorityBadge(r.priority)}</td>
+      <td>${fmtDate((r.createdAt || "").slice(0, 10))}</td>
+      <td>${requestStatusBadge(r.status)}</td>
+      <td>${fmtDate((r.updatedAt || r.createdAt || "").slice(0, 10))}</td>
+      <td><div class="row-actions">
+        <button class="btn btn-secondary btn-sm btn-icon" title="View / Review" aria-label="Review request ${escapeHtml(r.requestId || "")}" onclick="openRequestDetail('${r.uid}')">👁️</button>
+      </div></td>
+    </tr>
+  `).join("") : `<tr class="empty-row"><td colspan="12">${filterActive ? `No requests match your filters. <a href="#" id="reqEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No asset requests submitted yet."}</td></tr>`;
+
+  const emptyClear = document.getElementById("reqEmptyClear");
+  if (emptyClear) emptyClear.onclick = (e) => { e.preventDefault(); document.getElementById("reqClearFiltersBtn").click(); };
+}
+
+/* ---------- New / Edit Request form (progressive disclosure + review step) ---------- */
+function openRequestForm(uidVal) {
+  if (!canOpenAssetRequests()) { toast("Only Team Leads and Admins can do this", "err"); return; }
+  const editing = uidVal ? DB.requests.find(r => r.uid === uidVal) : null;
+  const myEmail = (fauth.currentUser || {}).email || "";
+  if (editing && !isAdmin() && editing.requestedBy !== myEmail) { toast("You can only edit your own requests", "err"); return; }
+  if (editing && !isAdmin() && !["Draft", "Submitted"].includes(editing.status)) { toast("This request can no longer be edited", "err"); return; }
+
+  const vals = editing ? { ...editing } : {
+    department: "", isNewEmployee: false, employeeName: "", employeeCode: "", designation: "", team: "", location: "",
+    requestType: "New Asset", assetType: "", otherAssetType: "",
+    quantity: 1, quantityReason: "", priority: "Normal", urgentReason: "",
+    requiredBy: "", businessJustification: "", additionalInstructions: "", supportingNote: "",
+    existingAssetId: "", existingAssetTag: "", existingAssetSerial: "",
+    replacementReason: "", replacementReasonOther: "", currentCondition: "", issueDescription: "",
+    joiningDate: "", expectedRequirementDate: "",
+  };
+  showRequestFormStep(vals, editing);
+}
+
+function showRequestFormStep(vals, editing) {
+  openModal(editing ? `Edit Request${editing.requestId ? " — " + editing.requestId : ""}` : "New Asset Request",
+    buildRequestFormHtml(vals, editing),
+    () => wireRequestForm(vals, editing));
+}
+
+function buildRequestFormHtml(vals, editing) {
+  const depts = DB.lists.department || [];
+  const cats = DB.categories.map(c => c.name);
+  const conditions = DB.lists.condition || [];
+  const isReplacement = vals.requestType === "Asset Replacement";
+  const isNewEmpType = vals.requestType === "New Employee – First-Time Asset Assignment";
+
+  return `
+    <div class="field"><label class="required">Team Lead Department</label>
+      <select id="rf_dept"><option value="">—</option>${depts.map(d => `<option ${vals.department === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}</select>
+    </div>
+
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px;font-weight:600;cursor:pointer;">
+        <input type="checkbox" id="rf_newEmp" ${vals.isNewEmployee ? "checked" : ""}> This is a new employee not yet added to the system
+      </label>
+    </div>
+    <div class="field-row">
+      <div class="field"><label class="required">Employee Name</label>
+        <input type="text" id="rf_emp" list="reqEmpList" value="${escapeHtml(vals.employeeName)}" placeholder="Start typing a name...">
+        <datalist id="reqEmpList">${DB.employees.map(e => `<option value="${escapeHtml(e.name)}">`).join("")}</datalist>
+      </div>
+      <div class="field"><label>Employee Code</label><input type="text" id="rf_empCode" value="${escapeHtml(vals.employeeCode)}"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Designation</label><input type="text" id="rf_designation" value="${escapeHtml(vals.designation)}"></div>
+      <div class="field"><label>Team</label><input type="text" id="rf_team" value="${escapeHtml(vals.team)}"></div>
+    </div>
+    <div class="field"><label>Location</label><input type="text" id="rf_location" value="${escapeHtml(vals.location)}"></div>
+
+    <div class="field"><label class="required">What is the requirement?</label>
+      <div class="request-type-cards" id="rf_typeCards">
+        ${REQUEST_TYPES.map(t => `
+          <label class="request-type-card ${vals.requestType === t.value ? "active" : ""}">
+            <input type="radio" name="rf_type_radio" value="${escapeHtml(t.value)}" ${vals.requestType === t.value ? "checked" : ""}>
+            <span class="request-type-card-icon">${t.icon}</span>
+            <span class="request-type-card-title">${escapeHtml(t.value)}</span>
+            <span class="request-type-card-desc">${escapeHtml(t.desc)}</span>
+          </label>
+        `).join("")}
+      </div>
+      <input type="hidden" id="rf_type" value="${escapeHtml(vals.requestType)}">
+    </div>
+
+    <div class="field-row">
+      <div class="field"><label class="required">Asset Requirement</label>
+        <select id="rf_assetType">
+          <option value="">—</option>
+          ${cats.map(c => `<option ${vals.assetType === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+          <option value="Other" ${vals.assetType === "Other" ? "selected" : ""}>Other</option>
+        </select>
+      </div>
+      <div class="field" id="rf_otherAssetTypeWrap" style="display:none"><label class="required">Describe the asset needed</label><input type="text" id="rf_otherAssetType" value="${escapeHtml(vals.otherAssetType)}"></div>
+    </div>
+
+    <div class="field-row">
+      <div class="field"><label class="required">Quantity Required</label><input type="number" id="rf_qty" min="1" max="10" step="1" value="${vals.quantity || 1}"></div>
+      <div class="field"><label class="required">Priority</label>
+        <select id="rf_priority">${["Normal", "High", "Urgent"].map(p => `<option ${vals.priority === p ? "selected" : ""}>${p}</option>`).join("")}</select>
+      </div>
+    </div>
+    <div class="field" id="rf_qtyReasonWrap" style="display:none"><label class="required">Why more than one?</label><textarea id="rf_qtyReason" rows="2">${escapeHtml(vals.quantityReason)}</textarea></div>
+    <div class="field" id="rf_urgentReasonWrap" style="display:none"><label class="required">Why is this urgent?</label><textarea id="rf_urgentReason" rows="2">${escapeHtml(vals.urgentReason)}</textarea></div>
+
+    <div class="field"><label class="required">Required By</label><input type="date" id="rf_requiredBy" min="${todayISO()}" value="${escapeHtml(vals.requiredBy)}"></div>
+
+    <div class="field-row" id="rf_replacementBlock" style="display:${isReplacement ? "" : "none"}">
+      <div class="field"><label class="required">Existing Asset ID</label><input type="text" id="rf_exAssetId" value="${escapeHtml(vals.existingAssetId)}"></div>
+      <div class="field"><label>Existing Serial / Asset Tag</label><input type="text" id="rf_exAssetTag" value="${escapeHtml(vals.existingAssetTag)}"></div>
+    </div>
+    <div class="field-row" id="rf_replacementBlock2" style="display:${isReplacement ? "" : "none"}">
+      <div class="field"><label class="required">Reason for Replacement</label>
+        <select id="rf_replReason"><option value="">—</option>${REPLACEMENT_REASONS.map(r => `<option ${vals.replacementReason === r ? "selected" : ""}>${r}</option>`).join("")}</select>
+      </div>
+      <div class="field"><label>Current Condition</label>
+        <select id="rf_currentCondition"><option value="">—</option>${conditions.map(c => `<option ${vals.currentCondition === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select>
+      </div>
+    </div>
+    <div class="field" id="rf_replReasonOtherWrap" style="display:none">
+      <label class="required">Describe the reason</label><input type="text" id="rf_replReasonOther" value="${escapeHtml(vals.replacementReasonOther)}">
+    </div>
+    <div class="field" id="rf_issueDescWrap" style="display:${isReplacement ? "" : "none"}">
+      <label class="required">Issue Description</label><textarea id="rf_issueDesc" rows="2">${escapeHtml(vals.issueDescription)}</textarea>
+    </div>
+
+    <div class="field-row" id="rf_newEmpBlock" style="display:${isNewEmpType ? "" : "none"}">
+      <div class="field"><label class="required">Joining Date</label><input type="date" id="rf_joiningDate" value="${escapeHtml(vals.joiningDate)}"></div>
+      <div class="field"><label>Expected Requirement Date</label><input type="date" id="rf_expectedDate" min="${todayISO()}" value="${escapeHtml(vals.expectedRequirementDate)}"></div>
+    </div>
+
+    <div class="field"><label class="required">Requirement Details / Business Justification</label>
+      <div class="muted" style="margin-bottom:6px;font-weight:500;">Please provide complete details explaining why this asset is required. Include any specific configuration, business requirement, replacement reason, or other information that may help Admin process the request.</div>
+      <textarea id="rf_justification" rows="3">${escapeHtml(vals.businessJustification)}</textarea>
+    </div>
+    <div class="field"><label>Additional Instructions / Special Requirement</label><textarea id="rf_instructions" rows="2">${escapeHtml(vals.additionalInstructions)}</textarea></div>
+    <div class="field"><label>Supporting Evidence <span class="muted" style="font-weight:500;">(describe or link a photo/document — direct file upload isn't available yet)</span></label><textarea id="rf_supportNote" rows="2">${escapeHtml(vals.supportingNote)}</textarea></div>
+
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="rf_cancelBtn">Cancel</button>
+      ${!editing || editing.status === "Draft" ? `<button class="btn btn-secondary" id="rf_draftBtn">Save as Draft</button>` : ""}
+      <button class="btn btn-primary" id="rf_reviewBtn">Continue to Review</button>
+    </div>
+  `;
+}
+
+function readRequestFormValues(vals) {
+  const g = id => document.getElementById(id);
+  vals.department = g("rf_dept").value;
+  vals.isNewEmployee = g("rf_newEmp").checked;
+  vals.employeeName = g("rf_emp").value.trim();
+  vals.employeeCode = vals.isNewEmployee ? "" : g("rf_empCode").value.trim();
+  vals.designation = g("rf_designation").value.trim();
+  vals.team = g("rf_team").value.trim();
+  vals.location = g("rf_location").value.trim();
+  vals.requestType = g("rf_type").value;
+  vals.assetType = g("rf_assetType").value;
+  vals.otherAssetType = g("rf_otherAssetType").value.trim();
+  vals.quantity = Math.max(1, Math.min(10, Math.floor(Number(g("rf_qty").value) || 1)));
+  vals.quantityReason = g("rf_qtyReason").value.trim();
+  vals.priority = g("rf_priority").value;
+  vals.urgentReason = g("rf_urgentReason").value.trim();
+  vals.requiredBy = g("rf_requiredBy").value;
+  vals.businessJustification = g("rf_justification").value.trim();
+  vals.additionalInstructions = g("rf_instructions").value.trim();
+  vals.supportingNote = g("rf_supportNote").value.trim();
+  vals.existingAssetId = g("rf_exAssetId").value.trim();
+  vals.existingAssetTag = g("rf_exAssetTag").value.trim();
+  vals.existingAssetSerial = "";
+  vals.replacementReason = g("rf_replReason").value;
+  vals.replacementReasonOther = g("rf_replReasonOther").value.trim();
+  vals.currentCondition = g("rf_currentCondition").value;
+  vals.issueDescription = g("rf_issueDesc").value.trim();
+  vals.joiningDate = g("rf_joiningDate").value;
+  vals.expectedRequirementDate = g("rf_expectedDate").value;
+  return vals;
+}
+
+function validateRequestForm(vals) {
+  if (!vals.department) return "Team Lead Department is required";
+  if (!vals.employeeName) return "Employee Name is required";
+  if (!vals.requestType) return "Select what the requirement is";
+  if (!vals.assetType) return "Asset Requirement is required";
+  if (vals.assetType === "Other" && !vals.otherAssetType) return "Describe the asset needed";
+  if (!vals.quantity || vals.quantity < 1) return "Quantity must be at least 1";
+  if (vals.quantity > 1 && !vals.quantityReason) return "Explain why more than one is needed";
+  if (!vals.priority) return "Priority is required";
+  if (vals.priority === "Urgent" && !vals.urgentReason) return "Explain why this is urgent";
+  if (!vals.requiredBy) return "Required By date is required";
+  if (vals.requestType === "Asset Replacement") {
+    if (!vals.existingAssetId) return "Existing Asset ID is required for a replacement";
+    if (!vals.replacementReason) return "Reason for Replacement is required";
+    if (vals.replacementReason === "Other" && !vals.replacementReasonOther) return "Describe the replacement reason";
+    if (!vals.issueDescription) return "Issue Description is required for a replacement";
+  }
+  if (vals.requestType === "New Employee – First-Time Asset Assignment" && !vals.joiningDate) return "Joining Date is required";
+  if (!vals.businessJustification) return "Business Justification is required";
+  return null;
+}
+
+function wireRequestForm(vals, editing) {
+  const g = id => document.getElementById(id);
+  document.getElementById("modal").classList.add("modal-wide");
+
+  const newEmpCk = g("rf_newEmp");
+  const empInput = g("rf_emp");
+  const empCodeInput = g("rf_empCode");
+  const syncNewEmpMode = () => {
+    if (newEmpCk.checked) {
+      empInput.removeAttribute("list");
+      empCodeInput.value = "";
+      empCodeInput.disabled = true;
+      empCodeInput.placeholder = "Not yet assigned";
+    } else {
+      empInput.setAttribute("list", "reqEmpList");
+      empCodeInput.disabled = false;
+      empCodeInput.placeholder = "";
+    }
+  };
+  newEmpCk.addEventListener("change", syncNewEmpMode);
+  syncNewEmpMode();
+
+  // Autofill Employee Code / Department from a matched Employee record — same
+  // "touched" pattern as the Assignment form (js/app.js openAssignForm), so it
+  // never clobbers something the Team Lead already typed themselves.
+  const deptSel = g("rf_dept");
+  let empCodeTouched = !!empCodeInput.value.trim();
+  let deptTouched = !!deptSel.value;
+  empCodeInput.addEventListener("input", () => { empCodeTouched = true; });
+  deptSel.addEventListener("change", () => { deptTouched = true; });
+  const autofillFromEmployee = () => {
+    if (newEmpCk.checked) return;
+    const typed = empInput.value.trim().toLowerCase();
+    if (!typed) return;
+    const match = DB.employees.find(e => (e.name || "").trim().toLowerCase() === typed);
+    if (!match) return;
+    if (!empCodeTouched && match.id) empCodeInput.value = match.id;
+    if (!deptTouched && match.department && [...deptSel.options].some(o => o.value === match.department)) {
+      deptSel.value = match.department;
+    }
+  };
+  empInput.addEventListener("input", autofillFromEmployee);
+  empInput.addEventListener("change", autofillFromEmployee);
+  if (!editing) autofillFromEmployee();
+
+  const typeCards = [...document.querySelectorAll("#rf_typeCards .request-type-card")];
+  const typeHidden = g("rf_type");
+  const replReasonSel = g("rf_replReason");
+  const syncReplReasonOther = () => {
+    const wrap = g("rf_replReasonOtherWrap");
+    wrap.style.display = (typeHidden.value === "Asset Replacement" && replReasonSel.value === "Other") ? "" : "none";
+  };
+  const syncTypeBlocks = () => {
+    const t = typeHidden.value;
+    typeCards.forEach(card => card.classList.toggle("active", card.querySelector("input").value === t));
+    const isReplacement = t === "Asset Replacement";
+    const isNewEmpType = t === "New Employee – First-Time Asset Assignment";
+    g("rf_replacementBlock").style.display = isReplacement ? "" : "none";
+    g("rf_replacementBlock2").style.display = isReplacement ? "" : "none";
+    g("rf_issueDescWrap").style.display = isReplacement ? "" : "none";
+    g("rf_newEmpBlock").style.display = isNewEmpType ? "" : "none";
+    syncReplReasonOther();
+  };
+  typeCards.forEach(card => {
+    const radio = card.querySelector("input");
+    radio.addEventListener("change", () => { typeHidden.value = radio.value; syncTypeBlocks(); });
+  });
+  replReasonSel.addEventListener("change", syncReplReasonOther);
+  syncTypeBlocks();
+
+  const assetTypeSel = g("rf_assetType");
+  const otherWrap = g("rf_otherAssetTypeWrap");
+  const syncAssetType = () => { otherWrap.style.display = assetTypeSel.value === "Other" ? "" : "none"; };
+  assetTypeSel.addEventListener("change", syncAssetType);
+  syncAssetType();
+
+  const qtyInput = g("rf_qty");
+  const qtyReasonWrap = g("rf_qtyReasonWrap");
+  const syncQty = () => { qtyReasonWrap.style.display = Number(qtyInput.value) > 1 ? "" : "none"; };
+  qtyInput.addEventListener("input", syncQty);
+  syncQty();
+
+  const prioritySel = g("rf_priority");
+  const urgentWrap = g("rf_urgentReasonWrap");
+  const syncPriority = () => { urgentWrap.style.display = prioritySel.value === "Urgent" ? "" : "none"; };
+  prioritySel.addEventListener("change", syncPriority);
+  syncPriority();
+
+  g("rf_cancelBtn").onclick = closeModal;
+  const draftBtn = g("rf_draftBtn");
+  if (draftBtn) draftBtn.onclick = () => {
+    readRequestFormValues(vals);
+    if (!vals.employeeName) { toast("Employee Name is required, even for a draft", "err"); return; }
+    submitRequestForm(vals, editing, "Draft");
+  };
+  g("rf_reviewBtn").onclick = () => {
+    readRequestFormValues(vals);
+    const err = validateRequestForm(vals);
+    if (err) { toast(err, "err"); return; }
+    showRequestReviewStep(vals, editing);
+  };
+}
+
+/* ---------- Duplicate-request detection (§19) ---------- */
+function findActiveDuplicateRequest(employeeName, assetType, excludeUid) {
+  const name = (employeeName || "").trim().toLowerCase();
+  if (!name || !assetType) return null;
+  return (DB.requests || []).find(r => r.uid !== excludeUid && REQUEST_ACTIVE_STATUSES.includes(r.status)
+    && (r.employeeName || "").trim().toLowerCase() === name && r.assetType === assetType) || null;
+}
+function findActiveAssetOfType(employeeName, assetType) {
+  const name = (employeeName || "").trim().toLowerCase();
+  if (!name || !assetType) return null;
+  return DB.assignments.find(a => a.status === "Assigned" && (a.employeeName || "").trim().toLowerCase() === name && a.assetName === assetType) || null;
+}
+
+function showRequestReviewStep(vals, editing) {
+  const dup = findActiveDuplicateRequest(vals.employeeName, vals.assetType, editing ? editing.uid : null);
+  const dupAsset = vals.requestType !== "Asset Replacement" ? findActiveAssetOfType(vals.employeeName, vals.assetType) : null;
+  const warn = dup
+    ? `An active request for ${escapeHtml(vals.employeeName)} — ${escapeHtml(vals.assetType)} already exists (${dup.requestId ? escapeHtml(dup.requestId) : "Draft"}, ${requestStatusBadge(dup.status)}).`
+    : (dupAsset ? `${escapeHtml(vals.employeeName)} already has an active ${escapeHtml(vals.assetType)} assignment${dupAsset.assetTagNo ? ` (${escapeHtml(dupAsset.assetTagNo)})` : ""}.` : "");
+  const blockForNonAdmin = !!warn && !isAdmin();
+
+  document.getElementById("modalTitle").textContent = "Review Your Request";
+  document.getElementById("modalBody").innerHTML = `
+    ${warn ? `
+      <div class="viewer-note" style="align-items:flex-start;border-color:var(--red);background:var(--red-light);">
+        <span style="font-size:16px;">⚠️</span>
+        <div>
+          <strong>Possible duplicate</strong>
+          <div style="margin-top:2px;">${warn}</div>
+          ${isAdmin()
+            ? `<label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-weight:600;cursor:pointer;"><input type="checkbox" id="rf_dupOverride"> Submit anyway</label>`
+            : `<div class="muted" style="margin-top:6px;">Resolve or cancel the existing request before submitting a new one.</div>`}
+        </div>
+      </div>
+    ` : ""}
+    <div class="table-wrap"><table>
+      <tbody>
+        <tr><th>Employee</th><td>${escapeHtml(vals.employeeName)}${vals.isNewEmployee ? ` <span class="badge badge-purple">New Employee</span>` : ""}</td></tr>
+        <tr><th>Employee Code</th><td>${escapeHtml(vals.employeeCode || "—")}</td></tr>
+        <tr><th>Department</th><td>${escapeHtml(vals.department)}</td></tr>
+        <tr><th>Asset Required</th><td>${escapeHtml(vals.assetType === "Other" ? vals.otherAssetType : vals.assetType)}</td></tr>
+        <tr><th>Request Type</th><td>${escapeHtml(vals.requestType)}</td></tr>
+        <tr><th>Quantity</th><td>${vals.quantity}${vals.quantityReason ? ` — ${escapeHtml(vals.quantityReason)}` : ""}</td></tr>
+        <tr><th>Priority</th><td>${priorityBadge(vals.priority)}${vals.urgentReason ? ` — ${escapeHtml(vals.urgentReason)}` : ""}</td></tr>
+        <tr><th>Required By</th><td>${fmtDate(vals.requiredBy)}</td></tr>
+        ${vals.requestType === "Asset Replacement" ? `
+        <tr><th>Existing Asset</th><td>${escapeHtml(vals.existingAssetId)}${vals.existingAssetTag ? ` (${escapeHtml(vals.existingAssetTag)})` : ""}</td></tr>
+        <tr><th>Reason</th><td>${escapeHtml(vals.replacementReason === "Other" ? vals.replacementReasonOther : vals.replacementReason)} — ${escapeHtml(vals.issueDescription)}</td></tr>
+        ` : ""}
+        ${vals.requestType === "New Employee – First-Time Asset Assignment" ? `<tr><th>Joining Date</th><td>${fmtDate(vals.joiningDate)}</td></tr>` : ""}
+        <tr><th>Justification</th><td>${escapeHtml(vals.businessJustification)}</td></tr>
+        ${vals.additionalInstructions ? `<tr><th>Additional Instructions</th><td>${escapeHtml(vals.additionalInstructions)}</td></tr>` : ""}
+      </tbody>
+    </table></div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="rf_backBtn">Back to Edit</button>
+      <button class="btn btn-primary" id="rf_submitBtn" ${blockForNonAdmin ? "disabled" : ""}>Submit Request</button>
+    </div>
+  `;
+  document.getElementById("modal").classList.add("modal-wide");
+  document.getElementById("rf_backBtn").onclick = () => showRequestFormStep(vals, editing);
+  const submitBtn = document.getElementById("rf_submitBtn");
+  const overrideCk = document.getElementById("rf_dupOverride");
+  if (overrideCk) overrideCk.addEventListener("change", () => { submitBtn.disabled = !!warn && !overrideCk.checked; });
+  submitBtn.onclick = () => submitRequestForm(vals, editing, "Submitted");
+}
+
+async function submitRequestForm(vals, editing, targetStatus) {
+  const myEmail = (fauth.currentUser || {}).email || "";
+  const nowIso = nowISO();
+  const isNewRecord = !editing;
+  const rec = editing ? editing : {
+    uid: uid(), requestId: "", requestedBy: myEmail,
+    requestedByRole: isAdmin() ? "admin" : "teamlead",
+    createdAt: nowIso, history: [],
+  };
+  const wasStatus = rec.status || null;
+
+  Object.assign(rec, {
+    department: vals.department,
+    isNewEmployee: !!vals.isNewEmployee,
+    employeeName: vals.employeeName,
+    employeeCode: vals.isNewEmployee ? "" : vals.employeeCode,
+    designation: vals.designation, team: vals.team, location: vals.location,
+    requestType: vals.requestType,
+    assetType: vals.assetType, otherAssetType: vals.assetType === "Other" ? vals.otherAssetType : "",
+    quantity: vals.quantity, quantityReason: vals.quantity > 1 ? vals.quantityReason : "",
+    priority: vals.priority, urgentReason: vals.priority === "Urgent" ? vals.urgentReason : "",
+    requiredBy: vals.requiredBy,
+    businessJustification: vals.businessJustification,
+    additionalInstructions: vals.additionalInstructions,
+    supportingNote: vals.supportingNote,
+    existingAssetId: vals.requestType === "Asset Replacement" ? vals.existingAssetId : "",
+    existingAssetTag: vals.requestType === "Asset Replacement" ? vals.existingAssetTag : "",
+    existingAssetSerial: "",
+    replacementReason: vals.requestType === "Asset Replacement" ? vals.replacementReason : "",
+    replacementReasonOther: (vals.requestType === "Asset Replacement" && vals.replacementReason === "Other") ? vals.replacementReasonOther : "",
+    currentCondition: vals.requestType === "Asset Replacement" ? vals.currentCondition : "",
+    issueDescription: vals.requestType === "Asset Replacement" ? vals.issueDescription : "",
+    joiningDate: vals.requestType === "New Employee – First-Time Asset Assignment" ? vals.joiningDate : "",
+    expectedRequirementDate: vals.requestType === "New Employee – First-Time Asset Assignment" ? vals.expectedRequirementDate : "",
+    updatedAt: nowIso,
+  });
+  rec.status = targetStatus;
+
+  if (targetStatus === "Submitted" && !rec.requestId) {
+    try {
+      rec.requestId = await nextRequestId();
+    } catch (err) {
+      console.error(err);
+      toast("Couldn't reserve a Request ID — check your connection and try again", "err");
+      return;
+    }
+  }
+
+  rec.history = [...(rec.history || []), {
+    ts: nowIso, email: myEmail, role: isAdmin() ? "admin" : "teamlead",
+    action: targetStatus === "Draft" ? (isNewRecord ? "Created draft" : "Updated draft") : "Submitted",
+    fromStatus: wasStatus, toStatus: targetStatus, comment: "",
+  }];
+
+  if (isNewRecord) DB.requests.push(rec);
+  saveRecord("requests", rec);
+  logAction(targetStatus === "Draft" ? "Saved asset request draft" : "Submitted asset request",
+    `${rec.requestId || "(draft)"} — ${rec.assetType === "Other" ? rec.otherAssetType : rec.assetType} for ${rec.employeeName}`);
+  closeModal();
+  toast(targetStatus === "Draft" ? "Draft saved" : `Request ${rec.requestId} submitted`);
+  if (currentPage === "assetRequests") renderAssetRequests();
+  if (currentPage === "dashboard") renderDashboard();
+}
+
+/* ---------- Admin review workflow (also used by Team Leads to view their own) ---------- */
+function openRequestDetail(uidVal) {
+  const rec = DB.requests.find(r => r.uid === uidVal);
+  if (!rec) { toast("Request not found", "err"); return; }
+  const myEmail = (fauth.currentUser || {}).email || "";
+  const mine = rec.requestedBy === myEmail;
+  if (!isAdmin() && !mine) { toast("You can only view your own requests", "err"); return; }
+  const admin = isAdmin();
+  const history = rec.history || [];
+
+  const actionButtons = [];
+  if (admin) {
+    if (["Submitted", "Draft"].includes(rec.status)) actionButtons.push(`<button class="btn btn-secondary" id="rd_reviewBtn">Start Review</button>`);
+    if (["Submitted", "Under Review", "Draft"].includes(rec.status)) {
+      actionButtons.push(`<button class="btn btn-danger" id="rd_rejectBtn">Reject</button>`);
+      actionButtons.push(`<button class="btn btn-primary" id="rd_approveBtn">Approve</button>`);
+    }
+    if (rec.status === "Approved") actionButtons.push(`<button class="btn btn-primary" id="rd_assignBtn">Assign Asset</button>`);
+  }
+  if (REQUEST_ACTIVE_STATUSES.includes(rec.status) && (admin || (mine && ["Draft", "Submitted"].includes(rec.status)))) {
+    actionButtons.push(`<button class="btn btn-secondary" id="rd_cancelBtn">Cancel Request</button>`);
+  }
+
+  openModal(rec.requestId ? `Request ${rec.requestId}` : "Request (Draft)", `
+    <div class="req-detail-head">
+      <div>${requestStatusBadge(rec.status)} ${priorityBadge(rec.priority)}</div>
+      <div class="muted">${escapeHtml(rec.requestedBy)} · ${fmtDateTime(rec.createdAt)}</div>
+    </div>
+    <div class="table-wrap"><table>
+      <tbody>
+        <tr><th>Employee</th><td>${escapeHtml(rec.employeeName)}${rec.isNewEmployee ? ` <span class="badge badge-purple">New Employee</span>` : ""}</td></tr>
+        <tr><th>Employee Code</th><td>${escapeHtml(rec.employeeCode || "—")}</td></tr>
+        <tr><th>Department</th><td>${escapeHtml(rec.department || "—")}</td></tr>
+        <tr><th>Designation / Team / Location</th><td>${escapeHtml([rec.designation, rec.team, rec.location].filter(Boolean).join(" · ") || "—")}</td></tr>
+        <tr><th>Asset Required</th><td>${escapeHtml(rec.assetType === "Other" ? rec.otherAssetType : rec.assetType)} × ${rec.quantity || 1}</td></tr>
+        <tr><th>Request Type</th><td>${escapeHtml(rec.requestType)}</td></tr>
+        <tr><th>Required By</th><td>${fmtDate(rec.requiredBy)}</td></tr>
+        ${rec.requestType === "Asset Replacement" ? `
+        <tr><th>Existing Asset</th><td>${escapeHtml(rec.existingAssetId)}${rec.existingAssetTag ? ` (${escapeHtml(rec.existingAssetTag)})` : ""}</td></tr>
+        <tr><th>Replacement Reason</th><td>${escapeHtml(rec.replacementReason === "Other" ? rec.replacementReasonOther : rec.replacementReason)}</td></tr>
+        <tr><th>Issue</th><td>${escapeHtml(rec.issueDescription || "—")}</td></tr>
+        ` : ""}
+        ${rec.requestType === "New Employee – First-Time Asset Assignment" ? `<tr><th>Joining Date</th><td>${fmtDate(rec.joiningDate)}</td></tr>` : ""}
+        <tr><th>Justification</th><td>${escapeHtml(rec.businessJustification || "—")}</td></tr>
+        ${rec.additionalInstructions ? `<tr><th>Additional Instructions</th><td>${escapeHtml(rec.additionalInstructions)}</td></tr>` : ""}
+        ${rec.supportingNote ? `<tr><th>Supporting Evidence</th><td>${escapeHtml(rec.supportingNote)}</td></tr>` : ""}
+        ${rec.adminComment ? `<tr><th>Admin Comment</th><td>${escapeHtml(rec.adminComment)}</td></tr>` : ""}
+        ${rec.rejectionReason ? `<tr><th>Rejection Reason</th><td>${escapeHtml(rec.rejectionReason)}</td></tr>` : ""}
+        ${rec.assignedAssetTagNo ? `<tr><th>Assigned Asset</th><td><span class="badge badge-grey">${escapeHtml(rec.assignedAssetTagNo)}</span></td></tr>` : ""}
+      </tbody>
+    </table></div>
+
+    <h3 style="margin:18px 0 8px;font-size:13px;">Timeline</h3>
+    <div class="req-timeline">
+      ${history.length ? history.map(h => `
+        <div class="req-timeline-item">
+          <div class="req-timeline-dot"></div>
+          <div class="req-timeline-body">
+            <div class="req-timeline-action">${escapeHtml(h.action)}${h.toStatus ? ` → ${requestStatusBadge(h.toStatus)}` : ""}</div>
+            <div class="muted" style="font-size:11.5px;">${escapeHtml(h.email)} · ${fmtDateTime(h.ts)}${h.comment ? ` — ${escapeHtml(h.comment)}` : ""}</div>
+          </div>
+        </div>
+      `).join("") : `<div class="muted">No history yet.</div>`}
+    </div>
+
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="rd_closeBtn">Close</button>
+      ${actionButtons.join("")}
+    </div>
+  `, () => {
+    document.getElementById("modal").classList.add("modal-wide");
+    document.getElementById("rd_closeBtn").onclick = closeModal;
+
+    const pushHistory = (action, fromStatus, toStatus, comment) => {
+      rec.history = [...(rec.history || []), { ts: nowISO(), email: myEmail, role: admin ? "admin" : "teamlead", action, fromStatus, toStatus, comment: comment || "" }];
+    };
+    const persist = (label, detail) => {
+      rec.updatedAt = nowISO();
+      saveRecord("requests", rec);
+      logAction(label, detail);
+      closeModal();
+      toast(label);
+      if (currentPage === "assetRequests") renderAssetRequests();
+      if (currentPage === "dashboard") renderDashboard();
+    };
+
+    const reviewBtn = document.getElementById("rd_reviewBtn");
+    if (reviewBtn) reviewBtn.onclick = () => {
+      const from = rec.status;
+      rec.status = "Under Review";
+      pushHistory("Started review", from, "Under Review");
+      persist("Request moved to Under Review", `${rec.requestId || rec.uid} — Under Review`);
+    };
+
+    const approveBtn = document.getElementById("rd_approveBtn");
+    if (approveBtn) approveBtn.onclick = () => {
+      openModal("Approve Request", `
+        <div class="field"><label>Admin Comment <span class="muted" style="font-weight:500;">(optional)</span></label>
+          <textarea id="rd_approveComment" rows="3" placeholder='e.g. "Approved. Laptop will be issued from Mount Road available stock."'></textarea>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-secondary" id="rd_approveCancel">Back</button>
+          <button class="btn btn-primary" id="rd_approveConfirm">Approve</button>
+        </div>
+      `, () => {
+        document.getElementById("modal").classList.add("modal-wide");
+        document.getElementById("rd_approveCancel").onclick = () => openRequestDetail(rec.uid);
+        document.getElementById("rd_approveConfirm").onclick = () => {
+          const comment = document.getElementById("rd_approveComment").value.trim();
+          const from = rec.status;
+          rec.status = "Approved";
+          rec.adminComment = comment;
+          rec.reviewedAt = nowISO();
+          pushHistory("Approved", from, "Approved", comment);
+          persist("Request approved", `${rec.requestId || rec.uid} approved`);
+        };
+      });
+    };
+
+    const rejectBtn = document.getElementById("rd_rejectBtn");
+    if (rejectBtn) rejectBtn.onclick = () => {
+      openModal("Reject Request", `
+        <div class="field"><label class="required">Rejection Reason</label>
+          <textarea id="rd_rejectReason" rows="3" placeholder="Explain why this request is being rejected — required"></textarea>
+        </div>
+        <p id="rd_rejectErr" class="signin-error" style="display:none;">A rejection reason is required.</p>
+        <div class="form-actions">
+          <button class="btn btn-secondary" id="rd_rejectCancel">Back</button>
+          <button class="btn btn-danger" id="rd_rejectConfirm">Reject</button>
+        </div>
+      `, () => {
+        document.getElementById("modal").classList.add("modal-wide");
+        document.getElementById("rd_rejectCancel").onclick = () => openRequestDetail(rec.uid);
+        document.getElementById("rd_rejectConfirm").onclick = () => {
+          const reason = document.getElementById("rd_rejectReason").value.trim();
+          if (!reason) { document.getElementById("rd_rejectErr").style.display = "block"; return; }
+          const from = rec.status;
+          rec.status = "Rejected";
+          rec.rejectionReason = reason;
+          rec.reviewedAt = nowISO();
+          pushHistory("Rejected", from, "Rejected", reason);
+          persist("Request rejected", `${rec.requestId || rec.uid} rejected — ${reason}`);
+        };
+      });
+    };
+
+    const assignBtn = document.getElementById("rd_assignBtn");
+    if (assignBtn) assignBtn.onclick = () => {
+      closeModal();
+      openAssignForm(null, false, {
+        requestUid: rec.uid, requestId: rec.requestId, employeeName: rec.employeeName,
+        employeeCode: rec.employeeCode, department: rec.department,
+        assetType: rec.assetType === "Other" ? "" : rec.assetType,
+        quantity: rec.quantity || 1,
+      });
+    };
+
+    const cancelBtn = document.getElementById("rd_cancelBtn");
+    if (cancelBtn) cancelBtn.onclick = () => {
+      openModal("Cancel this request?", `
+        <p class="muted" style="margin-top:0">This can't be undone. The request will be marked Cancelled.</p>
+        <div class="form-actions">
+          <button class="btn btn-secondary" id="rd_cancelBack">Back</button>
+          <button class="btn btn-danger" id="rd_cancelConfirm">Cancel Request</button>
+        </div>
+      `, () => {
+        document.getElementById("rd_cancelBack").onclick = () => openRequestDetail(rec.uid);
+        document.getElementById("rd_cancelConfirm").onclick = () => {
+          const from = rec.status;
+          rec.status = "Cancelled";
+          pushHistory("Cancelled", from, "Cancelled");
+          persist("Request cancelled", `${rec.requestId || rec.uid} cancelled`);
+        };
+      });
+    };
+  });
+}
+
+// Called once an Approved request's asset has actually been handed over via
+// openAssignForm (see its `requestPrefill` param) — flips the request to
+// Fulfilled and links it to the concrete assignment record that was created.
+function fulfillRequestFromAssignment(requestPrefill, assignmentRec) {
+  const rec = DB.requests.find(r => r.uid === requestPrefill.requestUid);
+  if (!rec) return;
+  const from = rec.status;
+  rec.status = "Fulfilled";
+  rec.assignedAssetUid = assignmentRec.uid;
+  rec.assignedAssetTagNo = assignmentRec.assetTagNo || "";
+  rec.fulfilledAt = nowISO();
+  rec.updatedAt = nowISO();
+  rec.history = [...(rec.history || []), {
+    ts: nowISO(), email: (fauth.currentUser || {}).email || "", role: isAdmin() ? "admin" : "teamlead",
+    action: "Asset assigned", fromStatus: from, toStatus: "Fulfilled",
+    comment: assignmentRec.assetTagNo ? `Assigned ${assignmentRec.assetTagNo}` : "",
+  }];
+  saveRecord("requests", rec);
+  logAction("Fulfilled asset request", `${rec.requestId || rec.uid} — ${assignmentRec.assetName}${assignmentRec.assetTagNo ? ` (${assignmentRec.assetTagNo})` : ""} → ${rec.employeeName}`);
 }
 
 /* =========================================================
@@ -2153,7 +3385,7 @@ function openEmpHistoryModal(empUid) {
               <td>${a.assetTagNo ? escapeHtml(a.assetTagNo) : "—"}</td>
               <td>${statusBadge(a.status)}</td>
               <td>${escapeHtml(a.assignedBy || "—")}</td>
-              <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}</td>
+              <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}${a.returnCondition ? `<br>${conditionBadge(a.returnCondition)}` : ""}</td>
               <td>${escapeHtml(a.remarks || "—")}</td>
             </tr>`).join("") : `<tr class="empty-row"><td colspan="7">No assets have been issued to this employee yet</td></tr>`}
         </tbody>
@@ -2631,12 +3863,19 @@ function reportRows(kind) {
   const stock = kind === "stock" ? computeStockSummary() : null;
   switch (kind) {
     case "employees": return DB.employees.map(e => ({ "Employee ID": e.id || "", "Name": e.name || "", "Department": e.department || "", "Email": e.email || "", "Phone": e.phone || "" }));
-    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Remarks": a.remarks || "" }));
+    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "" }));
+    case "returns": return getReturnedAssignments().map(a => ({ "Return Date": a.returnDate || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Returned By": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "" }));
     case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
     case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
     case "refill": return DB.refills.map(r => ({ "Date": r.date || "", "Category": r.category || "", "Quantity Added": r.quantity || 0, "Added By": r.addedBy || "", "Source / Remarks": r.source || "" }));
     case "categories": return DB.categories.map(c => ({ "Category": c.name || "", "Notes": c.notes || "" }));
     case "activityLog": return activityLogCache.map(l => ({ "When": fmtDateTime(l.ts), "User": l.email || "", "Action": l.action || "", "Details": l.details || "" }));
+    case "requests": return (DB.requests || []).map(r => ({
+      "Request ID": r.requestId || "(draft)", "Requested By": r.requestedBy || "", "Department": r.department || "",
+      "Employee": r.employeeName || "", "Employee Code": r.employeeCode || "", "Asset Type": r.assetType === "Other" ? (r.otherAssetType || "Other") : (r.assetType || ""),
+      "Request Type": r.requestType || "", "Quantity": r.quantity || 1, "Priority": r.priority || "",
+      "Status": r.status || "", "Required By": r.requiredBy || "", "Created": fmtDateTime(r.createdAt),
+    }));
     default: return [];
   }
 }
@@ -2647,6 +3886,8 @@ function renderReports() {
   const modules = [
     { kind: "employees", label: "Employees", sheet: "Employees", icon: "👥" },
     { kind: "assignment", label: "Asset Assignment", sheet: "Asset Assignment", icon: "🗂️" },
+    { kind: "returns", label: "Asset Returns", sheet: "Asset Returns", icon: "↩️" },
+    { kind: "requests", label: "Asset Requests", sheet: "Asset Requests", icon: "📋" },
     { kind: "inventory", label: "Master Inventory", sheet: "Master Inventory", icon: "💻" },
     { kind: "stock", label: "Stock Summary", sheet: "Stock Summary", icon: "📦" },
     { kind: "refill", label: "Stock Refill Log", sheet: "Stock Refill Log", icon: "➕" },
@@ -2781,6 +4022,7 @@ function renderSettings() {
     <div class="card">
       <div class="card-header"><div><h2>How access works</h2></div></div>
       <p class="muted" style="margin-top:0"><strong>Viewer</strong>: signs in, can browse and search every office, no edits.
+      <strong>Team Lead</strong>: can submit and track their own Asset Requests for one office — nothing else (granted in "Office Access" above).
       <strong>Office Admin</strong>: can edit one specific office (granted in "Office Access" above).
       <strong>Super Admin</strong>: can edit every office and manage who has access to what.</p>
       <p class="muted">Everything is stored in your Cloud Firestore database and synced live to everyone in the same office. Use <strong>Reset Data</strong> in the sidebar to restore the original sheet contents for everyone at any time.</p>
@@ -2840,12 +4082,20 @@ async function loadRolesList() {
         <td><span class="badge ${r.role === "admin" ? "badge-blue" : "badge-grey"}">${r.role === "admin" ? "Admin" : "Viewer"}</span></td>
         <td>
           <div class="row-actions">
-            <button class="btn btn-secondary btn-sm btn-icon" title="Change role" onclick="openRoleForm('${escapeHtml(r.email)}','${r.role}')">✏️</button>
-            <button class="btn btn-danger btn-sm btn-icon" title="Remove access" onclick="removeRole('${escapeHtml(r.email)}')">🗑️</button>
+            <button class="btn btn-secondary btn-sm btn-icon role-edit-btn" title="Change role" data-email="${escapeHtml(r.email)}" data-role="${escapeHtml(r.role)}">✏️</button>
+            <button class="btn btn-danger btn-sm btn-icon role-del-btn" title="Remove access" data-email="${escapeHtml(r.email)}">🗑️</button>
           </div>
         </td>
       </tr>
     `).join("") : `<tr class="empty-row"><td colspan="3">Nobody's been granted access yet — add someone above (must match a Firebase Authentication login exactly).</td></tr>`;
+    // Wired via data-attributes + addEventListener (not inline onclick="...('${email}')") so an
+    // email containing a stray quote can never break out of a hand-built JS string in the HTML.
+    tbody.querySelectorAll(".role-edit-btn").forEach(btn => {
+      btn.onclick = () => openRoleForm(btn.dataset.email, btn.dataset.role);
+    });
+    tbody.querySelectorAll(".role-del-btn").forEach(btn => {
+      btn.onclick = () => removeRole(btn.dataset.email);
+    });
   } catch (err) {
     console.error(err);
     tbody.innerHTML = `<tr class="empty-row"><td colspan="3">Couldn't load the team list.</td></tr>`;
@@ -2918,6 +4168,14 @@ function removeRole(email) {
 }
 
 /* ---------------- Office Access (per-office Admin/Viewer grants) ---------------- */
+// Labels/badges shared by the office-access list and the office picker's role chip.
+function officeRoleLabel(role) {
+  return role === "admin" ? "Admin" : role === "teamlead" ? "Team Lead" : "Viewer";
+}
+function officeRoleBadgeClass(role) {
+  return role === "admin" ? "badge-blue" : role === "teamlead" ? "badge-purple" : "badge-grey";
+}
+
 async function loadOfficeAccessList() {
   const tbody = document.getElementById("officeAccessTbody");
   if (!tbody) return;
@@ -2929,15 +4187,21 @@ async function loadOfficeAccessList() {
     tbody.innerHTML = rows.length ? rows.map(r => `
       <tr>
         <td>${escapeHtml(r.email)}</td>
-        <td><span class="badge ${r.role === "admin" ? "badge-blue" : "badge-grey"}">${r.role === "admin" ? "Admin" : "Viewer"}</span></td>
+        <td><span class="badge ${officeRoleBadgeClass(r.role)}">${officeRoleLabel(r.role)}</span></td>
         <td>
           <div class="row-actions">
-            <button class="btn btn-secondary btn-sm btn-icon" title="Change role" onclick="openOfficeAccessForm('${escapeHtml(r.email)}','${r.role}')">✏️</button>
-            <button class="btn btn-danger btn-sm btn-icon" title="Remove access" onclick="removeOfficeAccess('${escapeHtml(r.email)}')">🗑️</button>
+            <button class="btn btn-secondary btn-sm btn-icon oa-edit-btn" title="Change role" data-email="${escapeHtml(r.email)}" data-role="${escapeHtml(r.role)}">✏️</button>
+            <button class="btn btn-danger btn-sm btn-icon oa-del-btn" title="Remove access" data-email="${escapeHtml(r.email)}">🗑️</button>
           </div>
         </td>
       </tr>
     `).join("") : `<tr class="empty-row"><td colspan="3">Nobody has office-specific access yet — Super Admins can already edit here.</td></tr>`;
+    tbody.querySelectorAll(".oa-edit-btn").forEach(btn => {
+      btn.onclick = () => openOfficeAccessForm(btn.dataset.email, btn.dataset.role);
+    });
+    tbody.querySelectorAll(".oa-del-btn").forEach(btn => {
+      btn.onclick = () => removeOfficeAccess(btn.dataset.email);
+    });
   } catch (err) {
     console.error(err);
     tbody.innerHTML = `<tr class="empty-row"><td colspan="3">Couldn't load access list.</td></tr>`;
@@ -2954,6 +4218,7 @@ function openOfficeAccessForm(existingEmail, existingRole) {
     <div class="field"><label>Role</label>
       <select id="f_oaRole">
         <option value="viewer" ${existingRole === "viewer" ? "selected" : ""}>Viewer — view only</option>
+        <option value="teamlead" ${existingRole === "teamlead" ? "selected" : ""}>Team Lead — submit &amp; track their own Asset Requests</option>
         <option value="admin" ${existingRole === "admin" ? "selected" : ""}>Admin — can edit this office</option>
       </select>
     </div>
@@ -2970,7 +4235,7 @@ function openOfficeAccessForm(existingEmail, existingRole) {
       if (!email) { toast("Enter an email", "err"); return; }
       try {
         await docRef().collection("access").doc(email).set({ email, role, updatedAt: new Date().toISOString() }, { merge: true });
-        logAction(editing ? "Changed office access" : "Granted office access", `${email} → ${role === "admin" ? "Admin" : "Viewer"}`);
+        logAction(editing ? "Changed office access" : "Granted office access", `${email} → ${officeRoleLabel(role)}`);
         closeModal();
         toast(editing ? "Access updated" : "Access granted");
         loadOfficeAccessList();
@@ -3013,13 +4278,17 @@ function paintChips(key) {
   const items = DB.lists[key] || [];
   const admin = isAdmin();
   el.innerHTML = items.length ? items.map(v => `
-    <span class="tag-chip">${escapeHtml(v)} ${admin ? `<span style="cursor:pointer;color:var(--red)" onclick="removeListItem('${key}','${encodeURIComponent(v)}')">✕</span>` : ""}</span>
+    <span class="tag-chip">${escapeHtml(v)} ${admin ? `<span class="chip-remove" style="cursor:pointer;color:var(--red)" data-key="${escapeHtml(key)}" data-val="${escapeHtml(v)}">✕</span>` : ""}</span>
   `).join("") : `<p class="muted" style="font-size:12.5px">No values yet</p>`;
+  // data-attributes + addEventListener, not an inline onclick built from the value itself —
+  // a list value containing a quote (or anything) can't break out of a hand-built JS string.
+  el.querySelectorAll(".chip-remove").forEach(chip => {
+    chip.onclick = () => removeListItem(chip.dataset.key, chip.dataset.val);
+  });
 }
 
-function removeListItem(key, encodedVal) {
+function removeListItem(key, val) {
   if (!requireAdminOrWarn()) return;
-  const val = decodeURIComponent(encodedVal);
   DB.lists[key] = (DB.lists[key] || []).filter(v => v !== val);
   saveMeta();
   logAction("Removed list option", `${key}: "${val}"`);
@@ -3091,7 +4360,7 @@ function renderOfficeCards() {
     const role = isSuperAdminUser ? "admin" : (officeRoleMap[o.id] || "viewer");
     const roleBadge = isSuperAdminUser
       ? `<span class="office-role-badge admin">Super Admin</span>`
-      : `<span class="office-role-badge ${role}">${role === "admin" ? "Admin" : "Viewer"}</span>`;
+      : `<span class="office-role-badge ${role}">${officeRoleLabel(role)}</span>`;
     return `
     <div class="office-card" data-id="${escapeHtml(o.id)}">
       ${admin ? `<div class="office-card-actions">
@@ -3120,6 +4389,14 @@ async function openOffice(officeId) {
   } catch (err) {
     console.error(err);
     hideLoadingScreen();
+    if (err && err.code === "permission-denied") {
+      // A real access boundary, not a setup problem — send them back to pick
+      // a different office instead of the developer-facing "connect Firebase" screen.
+      currentOfficeId = null;
+      toast("You don't have access to that office — ask an Admin to grant it", "err");
+      showOfficeSelectScreen();
+      return;
+    }
     showFirebaseSetupScreen(true, err && err.message);
     return;
   }

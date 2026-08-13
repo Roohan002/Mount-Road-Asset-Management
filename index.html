@@ -28,6 +28,12 @@
         <button class="nav-item" data-page="assignment">
           <span class="nav-icon">🗂️</span><span>Asset Assignment</span>
         </button>
+        <button class="nav-item" data-page="returns">
+          <span class="nav-icon">↩️</span><span>Asset Returns</span>
+        </button>
+        <button class="nav-item" data-page="assetRequests">
+          <span class="nav-icon">📋</span><span>Asset Requests</span>
+        </button>
         <button class="nav-item" data-page="inventory">
           <span class="nav-icon">💻</span><span>Master Inventory</span>
         </button>
@@ -180,12 +186,15 @@
     </div>
   </div>
 
-  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <!-- Subresource Integrity pinned on every CDN script: if gstatic/cdnjs ever served something
+       different from what we reviewed at this exact version, the browser refuses to run it
+       instead of silently executing whatever came back. -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js" integrity="sha384-AQ3POAMqIhwS81FrUH95ekxqBZHeP5tG2JfEL3+7GuTtfRLWnrRh32UxwzM+//A9" crossorigin="anonymous"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js" integrity="sha384-qn4Jh88HhJA8dplNQyGjOh9OGI4izVhrfj/qIFgaKcdgOE06pXqIKGlsCILZcLAC" crossorigin="anonymous"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js" integrity="sha384-TnlRYaR4JYz/lpaGuaiU61PjNberSA4vjLjtF+oRC/IkohkJqnWxw5EmDSOt1vA1" crossorigin="anonymous"></script>
   <script src="js/firebase-config.js"></script>
   <script src="js/xlsx.full.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" integrity="sha384-JcnsjUPPylna1s1fvi1u12X5qjY5OL56iySh75FdtrwhO/SWXgMjoVqcKyIIWOLk" crossorigin="anonymous"></script>
   <script src="js/data.js"></script>
   <script src="js/app.js"></script>
 </body>
