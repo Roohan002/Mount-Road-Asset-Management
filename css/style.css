@@ -331,7 +331,7 @@ tbody tr:hover{ background: var(--surface-2); }
 }
 .asset-check-row:hover{ background:#fff; }
 .asset-check-row input[type="checkbox"]{ width:15px; height:15px; accent-color: var(--primary); cursor:pointer; }
-.asset-check-row .f_asset_qty{
+.asset-check-row .f_asset_qty, .asset-check-row .rf_asset_qty{
   margin-left:auto; width:58px; padding:3px 6px; font-size:12.5px; text-align:center;
   border:1.3px solid var(--border); border-radius:6px; cursor:text;
 }

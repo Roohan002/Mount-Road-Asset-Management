@@ -669,7 +669,8 @@ function conditionBadge(cond) {
 function requestStatusBadge(status) {
   const map = {
     "Draft": "badge-grey", "Submitted": "badge-blue", "Under Review": "badge-amber",
-    "Approved": "badge-purple", "Rejected": "badge-red", "Fulfilled": "badge-green", "Cancelled": "badge-grey",
+    "Approved": "badge-purple", "Partially Fulfilled": "badge-amber", "Rejected": "badge-red",
+    "Fulfilled": "badge-green", "Cancelled": "badge-grey",
   };
   return `<span class="badge ${map[status] || "badge-grey"}">${escapeHtml(status)}</span>`;
 }
@@ -677,7 +678,44 @@ function priorityBadge(priority) {
   const map = { "Normal": "badge-grey", "High": "badge-amber", "Urgent": "badge-red" };
   return `<span class="badge ${map[priority] || "badge-grey"}">${escapeHtml(priority)}</span>`;
 }
-const REQUEST_ACTIVE_STATUSES = ["Draft", "Submitted", "Under Review", "Approved"];
+const REQUEST_ACTIVE_STATUSES = ["Draft", "Submitted", "Under Review", "Approved", "Partially Fulfilled"];
+
+/* ---------------- Asset Requests: multi-item helpers ----------------
+   A request can ask for several different assets at once (e.g. a new
+   employee needing a laptop + mouse + headset in one go) instead of one
+   asset type per request. Each item tracks its own requested quantity vs.
+   how much has actually been given out so far, so Admin can hand over
+   whichever items are in stock now and leave the rest Pending until a
+   later Assign Asset pass — see fulfillRequestFromAssignment(). */
+function getRequestItems(rec) {
+  if (Array.isArray(rec.items) && rec.items.length) return rec.items;
+  // Backward-compat: requests created before this existed only ever had
+  // one asset type/quantity at the top level — treat that as a 1-item list.
+  if (rec.assetType) {
+    return [{ assetType: rec.assetType, otherAssetType: rec.otherAssetType || "", quantity: rec.quantity || 1, givenQuantity: rec.status === "Fulfilled" ? (rec.quantity || 1) : 0 }];
+  }
+  return [];
+}
+function requestItemLabel(item) {
+  return item.assetType === "Other" ? (item.otherAssetType || "Other") : item.assetType;
+}
+function requestItemRemaining(item) {
+  return Math.max(0, (item.quantity || 1) - (item.givenQuantity || 0));
+}
+function requestItemStatus(item) {
+  const remaining = requestItemRemaining(item);
+  if (remaining <= 0) return "Given";
+  return (item.givenQuantity || 0) > 0 ? "Partially Given" : "Pending";
+}
+function requestItemStatusBadge(item) {
+  const s = requestItemStatus(item);
+  const cls = s === "Given" ? "badge-green" : s === "Partially Given" ? "badge-amber" : "badge-grey";
+  return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+}
+function requestItemsSummary(rec) {
+  const items = getRequestItems(rec);
+  return items.map(i => `${requestItemLabel(i)}${(i.quantity || 1) > 1 ? ` ×${i.quantity}` : ""}`).join(", ") || "—";
+}
 
 /* ---------------- Asset Returns ---------------- */
 // Maps a return "Outcome" (what happens to the unit once it's back) onto the
@@ -1584,13 +1622,14 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
             <button type="button" class="btn btn-secondary btn-sm" id="assetSelectNone">Clear</button>
           </div>
           ${cats.map(c => {
-            const preChecked = !editing && requestPrefill && requestPrefill.assetType === c;
+            const prefillItem = !editing && requestPrefill && (requestPrefill.items || []).find(i => i.assetType === c);
+            const preChecked = !!prefillItem;
             return `
             <label class="asset-check-row">
               <input type="checkbox" class="f_asset_multi" value="${escapeHtml(c)}" ${preChecked ? "checked" : ""}>
               <span>${escapeHtml(c)}</span>
               <span class="qty-label">Qty</span>
-              <input type="number" class="f_asset_qty" data-cat="${escapeHtml(c)}" min="1" step="1" value="${preChecked ? (requestPrefill.quantity || 1) : 1}" title="How many units of ${escapeHtml(c)} to log">
+              <input type="number" class="f_asset_qty" data-cat="${escapeHtml(c)}" min="1" step="1" value="${preChecked ? prefillItem.remaining : 1}" title="How many units of ${escapeHtml(c)} to log">
             </label>
           `;
           }).join("")}
@@ -1598,7 +1637,7 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
       </div>`;
 
   openModal(quickReturn ? "Return Asset" : (editing ? "Edit Assignment" : (requestPrefill ? `Fulfill Request ${requestPrefill.requestId || ""}` : "New Assignment")), `
-    ${requestPrefill ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📋</span><div>Fulfilling <strong>${escapeHtml(requestPrefill.requestId || "")}</strong> for ${escapeHtml(requestPrefill.employeeName || "")} — pick the actual asset to hand over below.</div></div>` : ""}
+    ${requestPrefill ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📋</span><div>Fulfilling <strong>${escapeHtml(requestPrefill.requestId || "")}</strong> for ${escapeHtml(requestPrefill.employeeName || "")} — tick whichever items you're actually giving now (adjust Qty if only some are in stock); leave the rest unticked and they'll stay Pending until you come back and assign them.</div></div>` : ""}
     ${editing ? `
     <div class="field-row">
       <div class="field"><label>Date</label><input type="date" id="f_date" value="${editing.date || ""}"></div>
@@ -1775,12 +1814,15 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
         // old phone someone's handing back, 1-2 years after the fact) and it
         // still gets a proper record + a Master Inventory entry created for it.
         if (common.status === "Returned") newRecords.forEach(r => applyReturnSideEffects(r));
-        // Approved Asset Request → Assignment linkage (§18): mark the source
-        // request Fulfilled and link it to whichever unit actually got created.
-        if (requestPrefill && newRecords.length) fulfillRequestFromAssignment(requestPrefill, newRecords[0]);
-        toast(newRecords.length > 1
-          ? `${newRecords.length} assignments added for ${empName}`
-          : requestPrefill ? `Request ${requestPrefill.requestId} fulfilled` : "Assignment added");
+        // Approved Asset Request → Assignment linkage (§18): rolls whatever was
+        // actually ticked/given here into the source request's per-item progress
+        // (Fulfilled once everything's given, Partially Fulfilled otherwise) —
+        // fulfillRequestFromAssignment() shows its own toast for this case.
+        if (requestPrefill && newRecords.length) {
+          fulfillRequestFromAssignment(requestPrefill, picks, newRecords);
+        } else {
+          toast(newRecords.length > 1 ? `${newRecords.length} assignments added for ${empName}` : "Assignment added");
+        }
       }
       closeModal();
       paintAssignTable();
@@ -2110,7 +2152,7 @@ function computeRequestsSummary(records) {
   const s = { total: records.length, pending: 0, approved: 0, rejected: 0, fulfilled: 0, urgent: 0 };
   records.forEach(r => {
     if (r.status === "Submitted" || r.status === "Under Review") s.pending++;
-    else if (r.status === "Approved") s.approved++;
+    else if (r.status === "Approved" || r.status === "Partially Fulfilled") s.approved++;
     else if (r.status === "Rejected") s.rejected++;
     else if (r.status === "Fulfilled") s.fulfilled++;
     if (r.priority === "Urgent" && REQUEST_ACTIVE_STATUSES.includes(r.status)) s.urgent++;
@@ -2121,7 +2163,7 @@ function requestStatCards(summary) {
   return [
     { icon: "📋", cls: "icon-blue", value: summary.total, label: "Total Requests" },
     { icon: "⏳", cls: "icon-amber", value: summary.pending, label: "Pending Review" },
-    { icon: "✅", cls: "icon-purple", value: summary.approved, label: "Approved" },
+    { icon: "✅", cls: "icon-purple", value: summary.approved, label: "Approved / Partial" },
     { icon: "✖️", cls: "icon-red", value: summary.rejected, label: "Rejected" },
     { icon: "🏁", cls: "icon-teal", value: summary.fulfilled, label: "Fulfilled" },
     { icon: "🔥", cls: "icon-grey", value: summary.urgent, label: "Urgent Requests" },
@@ -2173,7 +2215,7 @@ function paintMyRequestsTable(mine) {
     <tr>
       <td>${r.requestId ? `<span class="badge badge-grey">${escapeHtml(r.requestId)}</span>` : `<span class="muted">Draft</span>`}</td>
       <td>${escapeHtml(r.employeeName || "—")}</td>
-      <td>${escapeHtml(r.assetType === "Other" ? (r.otherAssetType || "Other") : (r.assetType || "—"))}</td>
+      <td>${escapeHtml(requestItemsSummary(r))}</td>
       <td>${escapeHtml(r.requestType || "—")}</td>
       <td>${priorityBadge(r.priority)}</td>
       <td>${requestStatusBadge(r.status)}</td>
@@ -2194,12 +2236,12 @@ function getFilteredRequests() {
   let rows = sortRequestsNewestFirst(DB.requests || []);
   if (requestFilter.q) {
     const q = requestFilter.q;
-    rows = rows.filter(r => [r.requestId, r.employeeName, r.employeeCode, r.assetType, r.businessJustification].join(" ").toLowerCase().includes(q));
+    rows = rows.filter(r => [r.requestId, r.employeeName, r.employeeCode, requestItemsSummary(r), r.businessJustification].join(" ").toLowerCase().includes(q));
   }
   if (requestFilter.status) rows = rows.filter(r => r.status === requestFilter.status);
   if (requestFilter.type) rows = rows.filter(r => r.requestType === requestFilter.type);
   if (requestFilter.dept) rows = rows.filter(r => r.department === requestFilter.dept);
-  if (requestFilter.assetType) rows = rows.filter(r => r.assetType === requestFilter.assetType);
+  if (requestFilter.assetType) rows = rows.filter(r => getRequestItems(r).some(i => i.assetType === requestFilter.assetType));
   if (requestFilter.priority) rows = rows.filter(r => r.priority === requestFilter.priority);
   if (requestFilter.requestedBy) rows = rows.filter(r => r.requestedBy === requestFilter.requestedBy);
   if (requestFilter.from) rows = rows.filter(r => (r.createdAt || "").slice(0, 10) >= requestFilter.from);
@@ -2213,7 +2255,7 @@ function renderAdminAssetRequests() {
   const depts = DB.lists.department || [];
   const cats = DB.categories.map(c => c.name);
   const requesters = [...new Set(all.map(r => r.requestedBy).filter(Boolean))].sort();
-  const statuses = ["Draft", "Submitted", "Under Review", "Approved", "Rejected", "Fulfilled", "Cancelled"];
+  const statuses = ["Draft", "Submitted", "Under Review", "Approved", "Partially Fulfilled", "Rejected", "Fulfilled", "Cancelled"];
 
   content.innerHTML = `
     ${viewerNotice()}
@@ -2281,7 +2323,7 @@ function paintAdminRequestsTable() {
       <td>${escapeHtml(r.department || "—")}</td>
       <td>${escapeHtml(r.employeeName || "—")}${r.isNewEmployee ? ` <span class="badge badge-purple" style="margin-left:4px;">New</span>` : ""}</td>
       <td>${escapeHtml(r.employeeCode || "—")}</td>
-      <td>${escapeHtml(r.assetType === "Other" ? (r.otherAssetType || "Other") : (r.assetType || "—"))}${r.quantity > 1 ? ` × ${r.quantity}` : ""}</td>
+      <td>${escapeHtml(requestItemsSummary(r))}</td>
       <td>${escapeHtml(r.requestType || "—")}</td>
       <td>${priorityBadge(r.priority)}</td>
       <td>${fmtDate((r.createdAt || "").slice(0, 10))}</td>
@@ -2289,7 +2331,7 @@ function paintAdminRequestsTable() {
       <td>${fmtDate((r.updatedAt || r.createdAt || "").slice(0, 10))}</td>
       <td><div class="row-actions">
         <button class="btn btn-secondary btn-sm btn-icon" title="View / Review" aria-label="Review request ${escapeHtml(r.requestId || "")}" onclick="openRequestDetail('${r.uid}')">👁️</button>
-        ${r.status === "Approved" ? `<button class="btn btn-primary btn-sm btn-icon" title="Assign Asset — creates the Asset Assignment record" aria-label="Assign asset for request ${escapeHtml(r.requestId || "")}" onclick="assignAssetForRequest('${r.uid}')">📦</button>` : ""}
+        ${["Approved", "Partially Fulfilled"].includes(r.status) ? `<button class="btn btn-primary btn-sm btn-icon" title="Assign Asset — creates the Asset Assignment record" aria-label="Assign asset for request ${escapeHtml(r.requestId || "")}" onclick="assignAssetForRequest('${r.uid}')">📦</button>` : ""}
         ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" aria-label="Delete request ${escapeHtml(r.requestId || "")}" onclick="deleteRequest('${r.uid}')">🗑️</button>` : ""}
       </div></td>
     </tr>
@@ -2316,10 +2358,10 @@ function openRequestForm(uidVal) {
   if (editing && !isAdmin() && editing.requestedBy !== myEmail) { toast("You can only edit your own requests", "err"); return; }
   if (editing && !isAdmin() && !["Draft", "Submitted"].includes(editing.status)) { toast("This request can no longer be edited", "err"); return; }
 
-  const vals = editing ? { ...editing } : {
+  const vals = editing ? { ...editing, items: getRequestItems(editing).map(i => ({ ...i })) } : {
     department: "", isNewEmployee: false, employeeName: "", employeeCode: "", team: "", location: currentOfficeLocationLabel(),
-    requestType: "New Asset", assetType: "", otherAssetType: "",
-    quantity: 1, quantityReason: "", priority: "Normal", urgentReason: "",
+    requestType: "New Asset", items: [],
+    quantityReason: "", priority: "Normal", urgentReason: "",
     requiredBy: "", businessJustification: "", additionalInstructions: "", supportingNote: "",
     existingAssetId: "", existingAssetTag: "", existingAssetSerial: "",
     replacementReason: "", replacementReasonOther: "", currentCondition: "", issueDescription: "",
@@ -2379,24 +2421,38 @@ function buildRequestFormHtml(vals, editing) {
       <input type="hidden" id="rf_type" value="${escapeHtml(vals.requestType)}">
     </div>
 
-    <div class="field-row">
-      <div class="field"><label class="required">Asset Requirement</label>
-        <select id="rf_assetType">
-          <option value="">—</option>
-          ${cats.map(c => `<option ${vals.assetType === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
-          <option value="Other" ${vals.assetType === "Other" ? "selected" : ""}>Other</option>
-        </select>
+    <div class="field">
+      <label class="required">Assets Required <span class="muted" style="font-weight:500;">(tick one or more — an employee needing several things can go on the same request; set Qty for more than one of the same asset)</span></label>
+      <div class="asset-multiselect" id="rf_assetMultiSelect">
+        <div class="asset-multiselect-actions">
+          <button type="button" class="btn btn-secondary btn-sm" id="rf_assetSelectAll">Select All</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="rf_assetSelectNone">Clear</button>
+        </div>
+        ${cats.map(c => {
+          const item = (vals.items || []).find(i => i.assetType === c);
+          return `
+          <label class="asset-check-row">
+            <input type="checkbox" class="rf_asset_multi" value="${escapeHtml(c)}" ${item ? "checked" : ""}>
+            <span>${escapeHtml(c)}</span>
+            <span class="qty-label">Qty</span>
+            <input type="number" class="rf_asset_qty" data-cat="${escapeHtml(c)}" min="1" max="10" step="1" value="${item ? item.quantity : 1}">
+          </label>
+        `;
+        }).join("")}
+        <label class="asset-check-row">
+          <input type="checkbox" class="rf_asset_multi" value="Other" id="rf_asset_other_ck" ${(vals.items || []).some(i => i.assetType === "Other") ? "checked" : ""}>
+          <span>Other</span>
+          <span class="qty-label">Qty</span>
+          <input type="number" class="rf_asset_qty" data-cat="Other" min="1" max="10" step="1" value="${((vals.items || []).find(i => i.assetType === "Other") || {}).quantity || 1}">
+        </label>
       </div>
-      <div class="field" id="rf_otherAssetTypeWrap" style="display:none"><label class="required">Describe the asset needed</label><input type="text" id="rf_otherAssetType" value="${escapeHtml(vals.otherAssetType)}"></div>
     </div>
+    <div class="field" id="rf_otherAssetTypeWrap" style="display:none"><label class="required">Describe the "Other" asset needed</label><input type="text" id="rf_otherAssetType" value="${escapeHtml(((vals.items || []).find(i => i.assetType === "Other") || {}).otherAssetType || "")}"></div>
+    <div class="field" id="rf_qtyReasonWrap" style="display:none"><label class="required">Why more than one of the same asset?</label><textarea id="rf_qtyReason" rows="2">${escapeHtml(vals.quantityReason)}</textarea></div>
 
-    <div class="field-row">
-      <div class="field"><label class="required">Quantity Required</label><input type="number" id="rf_qty" min="1" max="10" step="1" value="${vals.quantity || 1}"></div>
-      <div class="field"><label class="required">Priority</label>
-        <select id="rf_priority">${["Normal", "High", "Urgent"].map(p => `<option ${vals.priority === p ? "selected" : ""}>${p}</option>`).join("")}</select>
-      </div>
+    <div class="field"><label class="required">Priority</label>
+      <select id="rf_priority">${["Normal", "High", "Urgent"].map(p => `<option ${vals.priority === p ? "selected" : ""}>${p}</option>`).join("")}</select>
     </div>
-    <div class="field" id="rf_qtyReasonWrap" style="display:none"><label class="required">Why more than one?</label><textarea id="rf_qtyReason" rows="2">${escapeHtml(vals.quantityReason)}</textarea></div>
     <div class="field" id="rf_urgentReasonWrap" style="display:none"><label class="required">Why is this urgent?</label><textarea id="rf_urgentReason" rows="2">${escapeHtml(vals.urgentReason)}</textarea></div>
 
     <div class="field"><label class="required">Required By</label><input type="date" id="rf_requiredBy" min="${todayISO()}" value="${escapeHtml(vals.requiredBy)}"></div>
@@ -2449,9 +2505,12 @@ function readRequestFormValues(vals) {
   vals.team = g("rf_team").value.trim();
   vals.location = g("rf_location").value.trim();
   vals.requestType = g("rf_type").value;
-  vals.assetType = g("rf_assetType").value;
-  vals.otherAssetType = g("rf_otherAssetType").value.trim();
-  vals.quantity = Math.max(1, Math.min(10, Math.floor(Number(g("rf_qty").value) || 1)));
+  const otherDesc = g("rf_otherAssetType").value.trim();
+  vals.items = [...document.querySelectorAll(".rf_asset_multi:checked")].map(cb => {
+    const qtyInput = document.querySelector(`.rf_asset_qty[data-cat="${CSS.escape(cb.value)}"]`);
+    const quantity = Math.max(1, Math.min(10, Math.floor(Number(qtyInput?.value) || 1)));
+    return { assetType: cb.value, otherAssetType: cb.value === "Other" ? otherDesc : "", quantity, givenQuantity: 0 };
+  });
   vals.quantityReason = g("rf_qtyReason").value.trim();
   vals.priority = g("rf_priority").value;
   vals.urgentReason = g("rf_urgentReason").value.trim();
@@ -2475,10 +2534,10 @@ function validateRequestForm(vals) {
   if (!vals.department) return "Team Lead Department is required";
   if (!vals.employeeName) return "Employee Name is required";
   if (!vals.requestType) return "Select what the requirement is";
-  if (!vals.assetType) return "Asset Requirement is required";
-  if (vals.assetType === "Other" && !vals.otherAssetType) return "Describe the asset needed";
-  if (!vals.quantity || vals.quantity < 1) return "Quantity must be at least 1";
-  if (vals.quantity > 1 && !vals.quantityReason) return "Explain why more than one is needed";
+  if (!vals.items || !vals.items.length) return "Tick at least one asset";
+  const otherItem = vals.items.find(i => i.assetType === "Other");
+  if (otherItem && !otherItem.otherAssetType) return 'Describe the "Other" asset needed';
+  if (vals.items.some(i => i.quantity > 1) && !vals.quantityReason) return "Explain why more than one of the same asset is needed";
   if (!vals.priority) return "Priority is required";
   if (vals.priority === "Urgent" && !vals.urgentReason) return "Explain why this is urgent";
   if (!vals.requiredBy) return "Required By date is required";
@@ -2563,17 +2622,30 @@ function wireRequestForm(vals, editing) {
   replReasonSel.addEventListener("change", syncReplReasonOther);
   syncTypeBlocks();
 
-  const assetTypeSel = g("rf_assetType");
+  // Multi-asset checklist — same tick-a-category + per-category Qty pattern as
+  // the Assignment form's own multiselect (openAssignForm), reused here so a
+  // Team Lead can put everything one employee needs (laptop + mouse + bag, say)
+  // on a single request instead of filing one request per asset.
+  const assetChecks = [...document.querySelectorAll(".rf_asset_multi")];
   const otherWrap = g("rf_otherAssetTypeWrap");
-  const syncAssetType = () => { otherWrap.style.display = assetTypeSel.value === "Other" ? "" : "none"; };
-  assetTypeSel.addEventListener("change", syncAssetType);
-  syncAssetType();
-
-  const qtyInput = g("rf_qty");
   const qtyReasonWrap = g("rf_qtyReasonWrap");
-  const syncQty = () => { qtyReasonWrap.style.display = Number(qtyInput.value) > 1 ? "" : "none"; };
-  qtyInput.addEventListener("input", syncQty);
-  syncQty();
+  const syncAssetChecks = () => {
+    const otherCk = g("rf_asset_other_ck");
+    otherWrap.style.display = otherCk.checked ? "" : "none";
+    const anyMultiQty = assetChecks.some(cb => {
+      if (!cb.checked) return false;
+      const qtyInput = document.querySelector(`.rf_asset_qty[data-cat="${CSS.escape(cb.value)}"]`);
+      return Number(qtyInput?.value) > 1;
+    });
+    qtyReasonWrap.style.display = anyMultiQty ? "" : "none";
+  };
+  assetChecks.forEach(cb => cb.addEventListener("change", syncAssetChecks));
+  document.querySelectorAll(".rf_asset_qty").forEach(inp => inp.addEventListener("input", syncAssetChecks));
+  syncAssetChecks();
+  const selAllBtn = g("rf_assetSelectAll");
+  if (selAllBtn) selAllBtn.onclick = () => { assetChecks.forEach(cb => cb.checked = true); syncAssetChecks(); };
+  const selNoneBtn = g("rf_assetSelectNone");
+  if (selNoneBtn) selNoneBtn.onclick = () => { assetChecks.forEach(cb => cb.checked = false); syncAssetChecks(); };
 
   const prioritySel = g("rf_priority");
   const urgentWrap = g("rf_urgentReasonWrap");
@@ -2597,24 +2669,29 @@ function wireRequestForm(vals, editing) {
 }
 
 /* ---------- Duplicate-request detection (§19) ---------- */
-function findActiveDuplicateRequest(employeeName, assetType, excludeUid) {
+// Checks every ticked asset type against every other active request/assignment
+// for the same employee — one match anywhere in the list is enough to warn.
+function findActiveDuplicateRequest(employeeName, items, excludeUid) {
   const name = (employeeName || "").trim().toLowerCase();
-  if (!name || !assetType) return null;
+  const types = new Set((items || []).map(i => i.assetType));
+  if (!name || !types.size) return null;
   return (DB.requests || []).find(r => r.uid !== excludeUid && REQUEST_ACTIVE_STATUSES.includes(r.status)
-    && (r.employeeName || "").trim().toLowerCase() === name && r.assetType === assetType) || null;
+    && (r.employeeName || "").trim().toLowerCase() === name
+    && getRequestItems(r).some(i => types.has(i.assetType))) || null;
 }
-function findActiveAssetOfType(employeeName, assetType) {
+function findActiveAssetOfType(employeeName, items) {
   const name = (employeeName || "").trim().toLowerCase();
-  if (!name || !assetType) return null;
-  return DB.assignments.find(a => a.status === "Assigned" && (a.employeeName || "").trim().toLowerCase() === name && a.assetName === assetType) || null;
+  const types = new Set((items || []).map(i => i.assetType));
+  if (!name || !types.size) return null;
+  return DB.assignments.find(a => a.status === "Assigned" && (a.employeeName || "").trim().toLowerCase() === name && types.has(a.assetName)) || null;
 }
 
 function showRequestReviewStep(vals, editing) {
-  const dup = findActiveDuplicateRequest(vals.employeeName, vals.assetType, editing ? editing.uid : null);
-  const dupAsset = vals.requestType !== "Asset Replacement" ? findActiveAssetOfType(vals.employeeName, vals.assetType) : null;
+  const dup = findActiveDuplicateRequest(vals.employeeName, vals.items, editing ? editing.uid : null);
+  const dupAsset = vals.requestType !== "Asset Replacement" ? findActiveAssetOfType(vals.employeeName, vals.items) : null;
   const warn = dup
-    ? `An active request for ${escapeHtml(vals.employeeName)} — ${escapeHtml(vals.assetType)} already exists (${dup.requestId ? escapeHtml(dup.requestId) : "Draft"}, ${requestStatusBadge(dup.status)}).`
-    : (dupAsset ? `${escapeHtml(vals.employeeName)} already has an active ${escapeHtml(vals.assetType)} assignment${dupAsset.assetTagNo ? ` (${escapeHtml(dupAsset.assetTagNo)})` : ""}.` : "");
+    ? `An active request for ${escapeHtml(vals.employeeName)} already covers one of these asset types (${dup.requestId ? escapeHtml(dup.requestId) : "Draft"}, ${requestStatusBadge(dup.status)}).`
+    : (dupAsset ? `${escapeHtml(vals.employeeName)} already has an active ${escapeHtml(dupAsset.assetName)} assignment${dupAsset.assetTagNo ? ` (${escapeHtml(dupAsset.assetTagNo)})` : ""}.` : "");
   const blockForNonAdmin = !!warn && !isAdmin();
 
   document.getElementById("modalTitle").textContent = "Review Your Request";
@@ -2636,9 +2713,8 @@ function showRequestReviewStep(vals, editing) {
         <tr><th>Employee</th><td>${escapeHtml(vals.employeeName)}${vals.isNewEmployee ? ` <span class="badge badge-purple">New Employee</span>` : ""}</td></tr>
         <tr><th>Employee Code</th><td>${escapeHtml(vals.employeeCode || "—")}</td></tr>
         <tr><th>Department</th><td>${escapeHtml(vals.department)}</td></tr>
-        <tr><th>Asset Required</th><td>${escapeHtml(vals.assetType === "Other" ? vals.otherAssetType : vals.assetType)}</td></tr>
+        <tr><th>Assets Required</th><td>${(vals.items || []).map(i => `${escapeHtml(requestItemLabel(i))}${i.quantity > 1 ? ` × ${i.quantity}` : ""}`).join("<br>") || "—"}${vals.quantityReason ? `<div class="muted" style="margin-top:4px;">${escapeHtml(vals.quantityReason)}</div>` : ""}</td></tr>
         <tr><th>Request Type</th><td>${escapeHtml(vals.requestType)}</td></tr>
-        <tr><th>Quantity</th><td>${vals.quantity}${vals.quantityReason ? ` — ${escapeHtml(vals.quantityReason)}` : ""}</td></tr>
         <tr><th>Priority</th><td>${priorityBadge(vals.priority)}${vals.urgentReason ? ` — ${escapeHtml(vals.urgentReason)}` : ""}</td></tr>
         <tr><th>Required By</th><td>${fmtDate(vals.requiredBy)}</td></tr>
         ${vals.requestType === "Asset Replacement" ? `
@@ -2681,8 +2757,8 @@ async function submitRequestForm(vals, editing, targetStatus) {
     employeeCode: vals.isNewEmployee ? "" : vals.employeeCode,
     team: vals.team, location: vals.location,
     requestType: vals.requestType,
-    assetType: vals.assetType, otherAssetType: vals.assetType === "Other" ? vals.otherAssetType : "",
-    quantity: vals.quantity, quantityReason: vals.quantity > 1 ? vals.quantityReason : "",
+    items: vals.items || [],
+    quantityReason: (vals.items || []).some(i => i.quantity > 1) ? vals.quantityReason : "",
     priority: vals.priority, urgentReason: vals.priority === "Urgent" ? vals.urgentReason : "",
     requiredBy: vals.requiredBy,
     businessJustification: vals.businessJustification,
@@ -2720,7 +2796,7 @@ async function submitRequestForm(vals, editing, targetStatus) {
   if (isNewRecord) DB.requests.push(rec);
   saveRecord("requests", rec);
   logAction(targetStatus === "Draft" ? "Saved asset request draft" : "Submitted asset request",
-    `${rec.requestId || "(draft)"} — ${rec.assetType === "Other" ? rec.otherAssetType : rec.assetType} for ${rec.employeeName}`);
+    `${rec.requestId || "(draft)"} — ${requestItemsSummary(rec)} for ${rec.employeeName}`);
   closeModal();
   toast(targetStatus === "Draft" ? "Draft saved" : `Request ${rec.requestId} submitted`);
   if (currentPage === "assetRequests") renderAssetRequests();
@@ -2744,7 +2820,7 @@ function openRequestDetail(uidVal) {
       actionButtons.push(`<button class="btn btn-danger" id="rd_rejectBtn">Reject</button>`);
       actionButtons.push(`<button class="btn btn-primary" id="rd_approveBtn">Approve</button>`);
     }
-    if (rec.status === "Approved") actionButtons.push(`<button class="btn btn-primary" id="rd_assignBtn">Assign Asset</button>`);
+    if (["Approved", "Partially Fulfilled"].includes(rec.status)) actionButtons.push(`<button class="btn btn-primary" id="rd_assignBtn">Assign Asset</button>`);
   }
   if (REQUEST_ACTIVE_STATUSES.includes(rec.status) && (admin || (mine && ["Draft", "Submitted"].includes(rec.status)))) {
     actionButtons.push(`<button class="btn btn-secondary" id="rd_cancelBtn">Cancel Request</button>`);
@@ -2758,14 +2834,27 @@ function openRequestDetail(uidVal) {
       <div class="muted">${escapeHtml(rec.requestedBy)} · ${fmtDateTime(rec.createdAt)}</div>
     </div>
     ${admin && rec.status === "Approved" ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📦</span><div>This request is approved but <strong>no asset has been handed over yet</strong> — nothing will show up on the Asset Assignment page until you click <strong>Assign Asset</strong> below and complete the handover.</div></div>` : ""}
-    ${rec.status === "Fulfilled" ? `<div class="viewer-note" style="border-color:var(--green,#22c55e);"><span style="font-size:16px;">✅</span><div>Fulfilled — asset ${rec.assignedAssetTagNo ? `<strong>${escapeHtml(rec.assignedAssetTagNo)}</strong> ` : ""}is recorded on the <a href="#" id="rd_gotoAssignment" style="color:var(--primary);font-weight:600;">Asset Assignment page</a>.</div></div>` : ""}
+    ${rec.status === "Partially Fulfilled" ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">⏳</span><div><strong>Partially fulfilled</strong> — ${escapeHtml(getRequestItems(rec).filter(i => requestItemRemaining(i) > 0).map(i => `${requestItemLabel(i)} ×${requestItemRemaining(i)}`).join(", "))} still pending. Click <strong>Assign Asset</strong> once stock is available to give the rest.</div></div>` : ""}
+    ${rec.status === "Fulfilled" ? `<div class="viewer-note" style="border-color:var(--green,#22c55e);"><span style="font-size:16px;">✅</span><div>Fulfilled — everything on this request is recorded on the <a href="#" id="rd_gotoAssignment" style="color:var(--primary);font-weight:600;">Asset Assignment page</a>.</div></div>` : ""}
     <div class="table-wrap"><table>
       <tbody>
         <tr><th>Employee</th><td>${escapeHtml(rec.employeeName)}${rec.isNewEmployee ? ` <span class="badge badge-purple">New Employee</span>` : ""}</td></tr>
         <tr><th>Employee Code</th><td>${escapeHtml(rec.employeeCode || "—")}</td></tr>
         <tr><th>Department</th><td>${escapeHtml(rec.department || "—")}</td></tr>
         <tr><th>Team / Location</th><td>${escapeHtml([rec.team, rec.location].filter(Boolean).join(" · ") || "—")}</td></tr>
-        <tr><th>Asset Required</th><td>${escapeHtml(rec.assetType === "Other" ? rec.otherAssetType : rec.assetType)} × ${rec.quantity || 1}</td></tr>
+        <tr><th>Assets Required</th><td>
+          <div class="table-wrap"><table style="min-width:0;">
+            <thead><tr><th>Asset</th><th>Qty</th><th>Given</th><th>Status</th></tr></thead>
+            <tbody>
+              ${getRequestItems(rec).map(i => `<tr>
+                <td>${escapeHtml(requestItemLabel(i))}</td>
+                <td>${i.quantity || 1}</td>
+                <td>${i.givenQuantity || 0}</td>
+                <td>${requestItemStatusBadge(i)}</td>
+              </tr>`).join("")}
+            </tbody>
+          </table></div>
+        </td></tr>
         <tr><th>Request Type</th><td>${escapeHtml(rec.requestType)}</td></tr>
         <tr><th>Required By</th><td>${fmtDate(rec.requiredBy)}</td></tr>
         ${rec.requestType === "Asset Replacement" ? `
@@ -2946,13 +3035,17 @@ function assignAssetForRequest(uidVal) {
   const rec = (DB.requests || []).find(r => r.uid === uidVal);
   if (!rec) { toast("Request not found", "err"); return; }
   if (!isAdmin()) { toast("Only Admins can assign an asset", "err"); return; }
-  if (rec.status !== "Approved") { toast("Only Approved requests can be assigned", "err"); return; }
+  if (!["Approved", "Partially Fulfilled"].includes(rec.status)) { toast("Only Approved requests can be assigned", "err"); return; }
+  // Only the items (or partial quantities) not already given show up here — an
+  // "Other" item has no real category to pre-check and needs an existing
+  // Category added for it first, same limitation as before.
+  const pendingItems = getRequestItems(rec).filter(i => i.assetType !== "Other" && requestItemRemaining(i) > 0);
+  if (!pendingItems.length) { toast("Everything on this request has already been given (or is an \"Other\" item — assign it manually)", "err"); return; }
   closeModal();
   openAssignForm(null, false, {
     requestUid: rec.uid, requestId: rec.requestId, employeeName: rec.employeeName,
     employeeCode: rec.employeeCode, department: rec.department,
-    assetType: rec.assetType === "Other" ? "" : rec.assetType,
-    quantity: rec.quantity || 1,
+    items: pendingItems.map(i => ({ assetType: i.assetType, remaining: requestItemRemaining(i) })),
   });
 }
 
@@ -2989,25 +3082,45 @@ function ensureEmployeeExists(rec) {
   return newEmp;
 }
 
-// Called once an Approved request's asset has actually been handed over via
-// openAssignForm (see its `requestPrefill` param) — flips the request to
-// Fulfilled and links it to the concrete assignment record that was created.
-function fulfillRequestFromAssignment(requestPrefill, assignmentRec) {
+// Called once some (or all) of an Approved/Partially Fulfilled request's assets
+// have actually been handed over via openAssignForm (see its `requestPrefill`
+// param). `picks` is the same {assetName, qty} list openAssignForm just created
+// real assignment records for — rolled into each item's givenQuantity, capped at
+// what was still outstanding. Items nobody ticked this time (or that stock
+// couldn't cover) simply stay Pending; the request becomes Fulfilled only once
+// every item's full quantity has been given, otherwise Partially Fulfilled —
+// admin can come back and run Assign Asset again later for the rest.
+function fulfillRequestFromAssignment(requestPrefill, picks, newRecords) {
   const rec = DB.requests.find(r => r.uid === requestPrefill.requestUid);
   if (!rec) return;
+  const items = getRequestItems(rec);
+  picks.forEach(({ assetName, qty }) => {
+    const item = items.find(i => i.assetType === assetName && requestItemRemaining(i) > 0);
+    if (item) item.givenQuantity = Math.min(item.quantity || 1, (item.givenQuantity || 0) + qty);
+  });
+  rec.items = items;
+
   const from = rec.status;
-  rec.status = "Fulfilled";
-  rec.assignedAssetUid = assignmentRec.uid;
-  rec.assignedAssetTagNo = assignmentRec.assetTagNo || "";
-  rec.fulfilledAt = nowISO();
+  const allGiven = items.every(i => requestItemRemaining(i) <= 0);
+  rec.status = allGiven ? "Fulfilled" : "Partially Fulfilled";
+  if (allGiven) rec.fulfilledAt = nowISO();
   rec.updatedAt = nowISO();
+
+  const tagList = newRecords.map(r => r.assetTagNo).filter(Boolean);
+  rec.assignedAssetUid = newRecords[0] ? newRecords[0].uid : rec.assignedAssetUid;
+  rec.assignedAssetTagNo = [rec.assignedAssetTagNo, tagList.join(", ")].filter(Boolean).join(", ");
+  rec.assignedUnits = [...(rec.assignedUnits || []), ...newRecords.map(r => ({ assignmentUid: r.uid, assetTagNo: r.assetTagNo || "", assetName: r.assetName }))];
+
+  const givenSummary = newRecords.map(r => `${r.assetName}${r.assetTagNo ? ` (${r.assetTagNo})` : ""}`).join(", ");
   rec.history = [...(rec.history || []), {
     ts: nowISO(), email: (fauth.currentUser || {}).email || "", role: isAdmin() ? "admin" : "teamlead",
-    action: "Asset assigned", fromStatus: from, toStatus: "Fulfilled",
-    comment: assignmentRec.assetTagNo ? `Assigned ${assignmentRec.assetTagNo}` : "",
+    action: allGiven ? "All items given" : "Partially given",
+    fromStatus: from, toStatus: rec.status, comment: givenSummary,
   }];
   saveRecord("requests", rec);
-  logAction("Fulfilled asset request", `${rec.requestId || rec.uid} — ${assignmentRec.assetName}${assignmentRec.assetTagNo ? ` (${assignmentRec.assetTagNo})` : ""} → ${rec.employeeName}`);
+  logAction(allGiven ? "Fulfilled asset request" : "Partially fulfilled asset request",
+    `${rec.requestId || rec.uid} — ${givenSummary} → ${rec.employeeName}`);
+  toast(allGiven ? `Request ${rec.requestId} fulfilled` : `Request ${rec.requestId} partially fulfilled — remaining items stay Pending`);
 }
 
 /* =========================================================
@@ -4096,8 +4209,9 @@ function reportRows(kind) {
     case "activityLog": return activityLogCache.map(l => ({ "When": fmtDateTime(l.ts), "User": l.email || "", "Action": l.action || "", "Details": l.details || "" }));
     case "requests": return (DB.requests || []).map(r => ({
       "Request ID": r.requestId || "(draft)", "Requested By": r.requestedBy || "", "Department": r.department || "",
-      "Employee": r.employeeName || "", "Employee Code": r.employeeCode || "", "Asset Type": r.assetType === "Other" ? (r.otherAssetType || "Other") : (r.assetType || ""),
-      "Request Type": r.requestType || "", "Quantity": r.quantity || 1, "Priority": r.priority || "",
+      "Employee": r.employeeName || "", "Employee Code": r.employeeCode || "", "Assets": requestItemsSummary(r),
+      "Total Quantity": getRequestItems(r).reduce((s, i) => s + (i.quantity || 1), 0),
+      "Request Type": r.requestType || "", "Priority": r.priority || "",
       "Status": r.status || "", "Required By": r.requiredBy || "", "Created": fmtDateTime(r.createdAt),
     }));
     default: return [];
