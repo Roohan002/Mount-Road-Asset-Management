@@ -1551,12 +1551,15 @@ function wireAssignBulk(rows) {
   if (delSel) delSel.onclick = () => {
     if (!requireSuperAdminOrWarn() || assignSelected.size === 0) return;
     confirmBulkDelete(assignSelected.size, "assignments", () => {
-      const idsToDelete = [...assignSelected];
+      const recordsToDelete = DB.assignments.filter(a => assignSelected.has(a.uid));
+      const idsToDelete = recordsToDelete.map(r => r.uid);
       const n = idsToDelete.length;
       DB.assignments = DB.assignments.filter(a => !assignSelected.has(a.uid));
       assignSelected = new Set();
+      unlinkAssignmentsFromRequests(recordsToDelete);
       batchWrite(idsToDelete.map(u => ({ kind: "assignments", type: "delete", uid: u })));
       logAction("Bulk deleted assignments", `Deleted ${n} selected assignment record(s)`); toast("Selected assignments deleted"); paintAssignTable();
+      if (currentPage === "assetRequests") renderAssetRequests();
       if (currentPage === "dashboard") renderDashboard();
     });
   };
@@ -1577,8 +1580,10 @@ function wireAssignBulk(rows) {
         const n = idsToDelete.length;
         DB.assignments = DB.assignments.filter(a => !idSet.has(a.uid));
         assignSelected = new Set();
+        unlinkAssignmentsFromRequests(rows);
         batchWrite(idsToDelete.map(u => ({ kind: "assignments", type: "delete", uid: u })));
         logAction("Bulk deleted assignments", `Deleted ${n} assignment record(s) matching current filters`); toast("All matching assignments deleted"); paintAssignTable();
+        if (currentPage === "assetRequests") renderAssetRequests();
         if (currentPage === "dashboard") renderDashboard();
       });
     };
@@ -2013,12 +2018,49 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
   });
 }
 
+// Reverses fulfillRequestFromAssignment()'s bookkeeping when an Asset
+// Assignment that came from a request gets deleted directly from the
+// Assignment/Returns page — keeps the source request's Given counts and
+// status honest instead of it staying stuck saying more was given than
+// what's actually still on file. Mirror of the Request→Assignment cascade in
+// deleteRequest(); this is the other direction (Assignment→Request).
+function unlinkAssignmentsFromRequests(deletedAssignments) {
+  const byRequestId = new Map();
+  deletedAssignments.forEach(a => {
+    if (!a.sourceRequestId) return;
+    if (!byRequestId.has(a.sourceRequestId)) byRequestId.set(a.sourceRequestId, []);
+    byRequestId.get(a.sourceRequestId).push(a);
+  });
+  byRequestId.forEach((removed, requestId) => {
+    const rec = (DB.requests || []).find(r => r.requestId === requestId);
+    if (!rec) return;
+    const items = getRequestItems(rec);
+    removed.forEach(a => {
+      const item = items.find(i => i.assetType === a.assetName && (i.givenQuantity || 0) > 0);
+      if (item) item.givenQuantity = Math.max(0, (item.givenQuantity || 0) - 1);
+    });
+    rec.items = items;
+    const removedUids = new Set(removed.map(a => a.uid));
+    rec.assignedUnits = (rec.assignedUnits || []).filter(u => !removedUids.has(u.assignmentUid));
+    if (["Fulfilled", "Partially Fulfilled"].includes(rec.status)) {
+      rec.status = items.some(i => (i.givenQuantity || 0) > 0) ? "Partially Fulfilled" : "Approved";
+    }
+    rec.updatedAt = nowISO();
+    rec.history = [...(rec.history || []), {
+      ts: nowISO(), email: (fauth.currentUser || {}).email || "", role: isAdmin() ? "admin" : "teamlead",
+      action: "Linked assignment deleted", toStatus: rec.status,
+      comment: removed.map(a => `${a.assetName}${a.assetTagNo ? ` (${a.assetTagNo})` : ""}`).join(", "),
+    }];
+    saveRecord("requests", rec);
+  });
+}
+
 function deleteAssignment(uidVal) {
   if (!requireSuperAdminOrWarn()) return;
   const rec = DB.assignments.find(a => a.uid === uidVal);
   const desc = rec ? `<strong>${escapeHtml(rec.assetName)}</strong> assigned to <strong>${escapeHtml(rec.employeeName)}</strong>` : "this assignment";
   openModal("Delete assignment?", `
-    <p class="muted" style="margin-top:0">Delete ${desc}? This action can't be undone.</p>
+    <p class="muted" style="margin-top:0">Delete ${desc}? This action can't be undone.${rec && rec.sourceRequestId ? ` This will also update its linked Asset Request (${escapeHtml(rec.sourceRequestId)}) back to reflect it's no longer given.` : ""}</p>
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelDel">Cancel</button>
       <button class="btn btn-danger" id="confirmDel">Delete</button>
@@ -2027,7 +2069,9 @@ function deleteAssignment(uidVal) {
     document.getElementById("confirmDel").onclick = () => {
       DB.assignments = DB.assignments.filter(a => a.uid !== uidVal);
       assignSelected.delete(uidVal);
+      if (rec) unlinkAssignmentsFromRequests([rec]);
       deleteRecord("assignments", uidVal); logAction("Deleted assignment", rec ? `${rec.assetName} — ${rec.employeeName}` : uidVal); closeModal(); toast("Assignment deleted"); paintAssignTable();
+      if (currentPage === "assetRequests") renderAssetRequests();
       if (currentPage === "dashboard") renderDashboard();
     };
   });
@@ -3199,27 +3243,59 @@ function openRequestDetail(uidVal) {
   });
 }
 
+// Every assignment record that was actually created FROM this request — via
+// its assignedUnits log (the precise list, stamped by fulfillRequestFromAssignment)
+// or, as a fallback for older records, by matching sourceRequestId — so a
+// cascading delete can find every one of them, not just the first.
+function findAssignmentsFromRequest(rec) {
+  const uids = new Set((rec.assignedUnits || []).map(u => u.assignmentUid).filter(Boolean));
+  DB.assignments.forEach(a => { if (rec.requestId && a.sourceRequestId === rec.requestId) uids.add(a.uid); });
+  return DB.assignments.filter(a => uids.has(a.uid));
+}
+
 // Delete is Super-Admin-only, same policy as every other collection — an Office
 // Admin/Team Lead can review, approve/reject, or cancel a request, but only a
 // Super Admin can permanently remove one (e.g. cleaning up test requests).
+// Deleting a request cascades to every Asset Assignment record it actually
+// produced — since those only exist because of this request, leaving them
+// behind would be a real assignment with no request to explain where it came
+// from. The Team Lead's own dashboard reflects the deletion automatically
+// (it reads DB.requests, kept live by the existing realtime listener).
 function deleteRequest(uidVal) {
   if (!requireSuperAdminOrWarn()) return;
   const rec = (DB.requests || []).find(r => r.uid === uidVal);
   const desc = rec ? `<strong>${escapeHtml(rec.requestId || "this draft request")}</strong> (${escapeHtml(rec.employeeName || "—")})` : "this request";
+  const linkedAssignments = rec ? findAssignmentsFromRequest(rec) : [];
   openModal("Delete asset request?", `
     <p class="muted" style="margin-top:0">Delete ${desc}? This action can't be undone.</p>
+    ${linkedAssignments.length ? `
+      <div class="viewer-note" style="align-items:flex-start;border-color:var(--red);background:var(--red-light);">
+        <span style="font-size:16px;">⚠️</span>
+        <div>
+          <strong>${linkedAssignments.length} linked Asset Assignment${linkedAssignments.length === 1 ? "" : "s"} will also be deleted</strong>
+          <div style="margin-top:4px;">${linkedAssignments.map(a => `${escapeHtml(a.assetName)}${a.assetTagNo ? ` (${escapeHtml(a.assetTagNo)})` : ""} → ${escapeHtml(a.employeeName)}`).join("<br>")}</div>
+        </div>
+      </div>
+    ` : ""}
     <div class="form-actions">
       <button class="btn btn-secondary" id="cancelDel">Cancel</button>
-      <button class="btn btn-danger" id="confirmDel">Delete</button>
+      <button class="btn btn-danger" id="confirmDel">Delete${linkedAssignments.length ? ` (+ ${linkedAssignments.length} assignment${linkedAssignments.length === 1 ? "" : "s"})` : ""}</button>
     </div>`, () => {
     document.getElementById("cancelDel").onclick = closeModal;
     document.getElementById("confirmDel").onclick = () => {
+      const linkedUids = new Set(linkedAssignments.map(a => a.uid));
       DB.requests = (DB.requests || []).filter(r => r.uid !== uidVal);
-      deleteRecord("requests", uidVal);
-      logAction("Deleted asset request", rec ? `${rec.requestId || rec.uid} — ${rec.employeeName || "—"}` : uidVal);
+      DB.assignments = DB.assignments.filter(a => !linkedUids.has(a.uid));
+      linkedUids.forEach(u => assignSelected.delete(u));
+      batchWrite([
+        { kind: "requests", type: "delete", uid: uidVal },
+        ...linkedAssignments.map(a => ({ kind: "assignments", type: "delete", uid: a.uid })),
+      ]);
+      logAction("Deleted asset request", rec ? `${rec.requestId || rec.uid} — ${rec.employeeName || "—"}${linkedAssignments.length ? ` (+ ${linkedAssignments.length} linked assignment${linkedAssignments.length === 1 ? "" : "s"})` : ""}` : uidVal);
       closeModal();
-      toast("Asset request deleted");
+      toast(linkedAssignments.length ? `Request and ${linkedAssignments.length} linked assignment${linkedAssignments.length === 1 ? "" : "s"} deleted` : "Asset request deleted");
       if (currentPage === "assetRequests") renderAssetRequests();
+      if (currentPage === "assignment") paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
     };
   });
