@@ -58,27 +58,36 @@ service cloud.firestore {
     // overwrite each other's work.
     match /assetTracker/{officeId} {
       allow read: if canViewOffice(officeId);
-      allow write: if canEditOffice(officeId);
+      allow create, update: if canEditOffice(officeId);
+      allow delete: if isSuperAdmin();
 
+      // Delete is Super-Admin-only everywhere in this app — an Office Admin can
+      // add/edit records in their office, but only a Super Admin can permanently
+      // remove one (single, bulk, or "Delete All").
       match /employees/{recordId} {
         allow read: if canViewOffice(officeId);
-        allow write: if canEditOffice(officeId);
+        allow create, update: if canEditOffice(officeId);
+        allow delete: if isSuperAdmin();
       }
       match /assignments/{recordId} {
         allow read: if canViewOffice(officeId);
-        allow write: if canEditOffice(officeId);
+        allow create, update: if canEditOffice(officeId);
+        allow delete: if isSuperAdmin();
       }
       match /inventory/{recordId} {
         allow read: if canViewOffice(officeId);
-        allow write: if canEditOffice(officeId);
+        allow create, update: if canEditOffice(officeId);
+        allow delete: if isSuperAdmin();
       }
       match /refills/{recordId} {
         allow read: if canViewOffice(officeId);
-        allow write: if canEditOffice(officeId);
+        allow create, update: if canEditOffice(officeId);
+        allow delete: if isSuperAdmin();
       }
       match /categories/{recordId} {
         allow read: if canViewOffice(officeId);
-        allow write: if canEditOffice(officeId);
+        allow create, update: if canEditOffice(officeId);
+        allow delete: if isSuperAdmin();
       }
       match /logs/{logId} {
         allow read: if canViewOffice(officeId);
@@ -104,8 +113,9 @@ service cloud.firestore {
               && resource.data.requestedBy == request.auth.token.email
               && request.resource.data.requestedBy == request.auth.token.email
               && request.resource.data.status in ['Draft', 'Submitted', 'Cancelled']);
-        allow delete: if canEditOffice(officeId)
-          || (isTeamLead(officeId) && resource.data.requestedBy == request.auth.token.email && resource.data.status == 'Draft');
+        // Delete is Super-Admin-only, same as every other collection — an Office
+        // Admin can review/approve/reject/cancel a request, but not erase it.
+        allow delete: if isSuperAdmin();
       }
       // Sequential, server-safe numbering for Request IDs (AST-REQ-2026-00001, ...) —
       // a tiny counter doc incremented inside a transaction, separate from the

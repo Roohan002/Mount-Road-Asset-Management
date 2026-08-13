@@ -235,6 +235,7 @@ tbody tr:hover{ background: var(--surface-2); }
 .field input:focus, .field select:focus, .field textarea:focus{
   outline:none; border-color: var(--primary); background:#fff;
 }
+.field input[readonly]{ background: var(--surface); color: var(--text-muted); cursor: not-allowed; }
 .field-row{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
 .form-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:20px; padding-top:16px; border-top:1px solid var(--border); }
 .field label.required::after{ content:" *"; color:var(--red); }

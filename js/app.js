@@ -211,7 +211,7 @@ async function deleteOffice(id) {
   // Firestore doesn't cascade-delete subcollections when a document is deleted,
   // so clear each one out first or the records would be orphaned but still stored.
   const ref = fdb.collection(FIRESTORE_COLLECTION).doc(id);
-  for (const sub of ["employees", "categories", "assignments", "refills", "inventory", "logs"]) {
+  for (const sub of ["employees", "categories", "assignments", "refills", "inventory", "logs", "requests", "counters"]) {
     try {
       const snap = await ref.collection(sub).get();
       const ids = [];
@@ -571,15 +571,22 @@ function confirmBulkDelete(count, label, onConfirm) {
   });
 }
 
-/* Renders the "N selected · Delete Selected · Delete All" strip used on every list page */
+/* Renders the "N selected · Delete Selected · Delete All" strip used on every list page.
+   Delete is Super-Admin-only everywhere in this app — an Office Admin only sees this
+   bar at all if there's a non-delete bulk action to offer (e.g. the combined handover
+   slip on Assignments); otherwise there's nothing here for them to do with a selection. */
 function bulkToolbarHtml(selectedSize, totalSize, extraButtonsHtml) {
   if (!isAdmin()) return "";
+  const superAdmin = isSuperAdmin();
+  if (!superAdmin && !extraButtonsHtml) return "";
   return `
     <div class="bulk-actions">
       <span class="bulk-count">${selectedSize} selected</span>
       ${extraButtonsHtml || ""}
+      ${superAdmin ? `
       <button class="btn btn-danger btn-sm" id="deleteSelectedBtn" ${selectedSize === 0 ? "disabled" : ""}>🗑 Delete Selected</button>
       <button class="btn btn-secondary btn-sm" id="deleteAllBtn" ${totalSize === 0 ? "disabled" : ""}>Delete All</button>
+      ` : ""}
     </div>
   `;
 }
@@ -798,7 +805,9 @@ document.getElementById("hamburger").addEventListener("click", () => {
   document.getElementById("sidebar").classList.toggle("open");
 });
 document.getElementById("resetDataBtn").addEventListener("click", () => {
-  if (!requireAdminOrWarn()) return;
+  // Wipes every record in the office — same "only a Super Admin can delete
+  // anything" policy as the delete buttons themselves.
+  if (!requireSuperAdminOrWarn()) return;
   const isDefaultOffice = currentOfficeId === DEFAULT_OFFICE_ID;
   const officeName = (OFFICES.find(o => o.id === currentOfficeId) || {}).name || "this office";
   // Confirmed by typing the office's own name back (like GitHub's "delete this repo" flow) —
@@ -1288,7 +1297,7 @@ function paintAssignTable() {
           ${a.status !== "Returned" ? `<button class="btn btn-secondary btn-sm btn-icon" title="Return this asset" aria-label="Return asset for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}', true)">↩️</button>` : ""}
           ${a.status === "Returned" && (a.returnOutcome || "Available") === "Available" ? `<button class="btn btn-primary btn-sm btn-icon" title="Reassign to someone else" aria-label="Reassign ${escapeHtml(a.assetName)} to a different employee" onclick="openReassignForm('${a.uid}')">🔁</button>` : ""}
           <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit assignment for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
-          <button class="btn btn-danger btn-sm btn-icon" title="Delete" aria-label="Delete assignment for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>
+          ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" aria-label="Delete assignment for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>` : ""}
           ` : ""}
         </div>
       </td>
@@ -1320,7 +1329,7 @@ function wireAssignBulk(rows) {
   });
   const delSel = document.getElementById("deleteSelectedBtn");
   if (delSel) delSel.onclick = () => {
-    if (!requireAdminOrWarn() || assignSelected.size === 0) return;
+    if (!requireSuperAdminOrWarn() || assignSelected.size === 0) return;
     confirmBulkDelete(assignSelected.size, "assignments", () => {
       const idsToDelete = [...assignSelected];
       const n = idsToDelete.length;
@@ -1341,7 +1350,7 @@ function wireAssignBulk(rows) {
   if (delAll) {
     delAll.title = "Deletes only the assignments currently shown by your search/filters — not the whole log";
     delAll.onclick = () => {
-      if (!requireAdminOrWarn()) return;
+      if (!requireSuperAdminOrWarn()) return;
       confirmBulkDelete(rows.length, "assignments (matching your current search/filters)", () => {
         const idsToDelete = rows.map(r => r.uid);
         const idSet = new Set(idsToDelete);
@@ -1781,7 +1790,7 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
 }
 
 function deleteAssignment(uidVal) {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   const rec = DB.assignments.find(a => a.uid === uidVal);
   const desc = rec ? `<strong>${escapeHtml(rec.assetName)}</strong> assigned to <strong>${escapeHtml(rec.employeeName)}</strong>` : "this assignment";
   openModal("Delete assignment?", `
@@ -2064,7 +2073,7 @@ function paintReturnsTable() {
           ${admin ? `
           ${(a.returnOutcome || "Available") === "Available" ? `<button class="btn btn-primary btn-sm btn-icon" title="Reassign to someone else" aria-label="Reassign ${escapeHtml(a.assetName)} to a different employee" onclick="openReassignForm('${a.uid}')">🔁</button>` : ""}
           <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit return for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
-          <button class="btn btn-danger btn-sm btn-icon" title="Delete" aria-label="Delete return for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>
+          ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" aria-label="Delete return for ${escapeHtml(a.employeeName)}" onclick="deleteAssignment('${a.uid}')">🗑️</button>` : ""}
           ` : ""}
         </div>
       </td>
@@ -2281,12 +2290,22 @@ function paintAdminRequestsTable() {
       <td><div class="row-actions">
         <button class="btn btn-secondary btn-sm btn-icon" title="View / Review" aria-label="Review request ${escapeHtml(r.requestId || "")}" onclick="openRequestDetail('${r.uid}')">👁️</button>
         ${r.status === "Approved" ? `<button class="btn btn-primary btn-sm btn-icon" title="Assign Asset — creates the Asset Assignment record" aria-label="Assign asset for request ${escapeHtml(r.requestId || "")}" onclick="assignAssetForRequest('${r.uid}')">📦</button>` : ""}
+        ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" aria-label="Delete request ${escapeHtml(r.requestId || "")}" onclick="deleteRequest('${r.uid}')">🗑️</button>` : ""}
       </div></td>
     </tr>
   `).join("") : `<tr class="empty-row"><td colspan="12">${filterActive ? `No requests match your filters. <a href="#" id="reqEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a>` : "No asset requests submitted yet."}</td></tr>`;
 
   const emptyClear = document.getElementById("reqEmptyClear");
   if (emptyClear) emptyClear.onclick = (e) => { e.preventDefault(); document.getElementById("reqClearFiltersBtn").click(); };
+}
+
+// "Location" on the request form isn't typed in — it's whichever office the Team
+// Lead currently has open (same {name, city} shown on the sidebar's office badge),
+// since that already tells you where the employee/asset physically is.
+function currentOfficeLocationLabel() {
+  const o = OFFICES.find(o => o.id === currentOfficeId);
+  if (!o) return "";
+  return `${o.name}${o.city ? " · " + o.city : ""}`;
 }
 
 /* ---------- New / Edit Request form (progressive disclosure + review step) ---------- */
@@ -2298,7 +2317,7 @@ function openRequestForm(uidVal) {
   if (editing && !isAdmin() && !["Draft", "Submitted"].includes(editing.status)) { toast("This request can no longer be edited", "err"); return; }
 
   const vals = editing ? { ...editing } : {
-    department: "", isNewEmployee: false, employeeName: "", employeeCode: "", designation: "", team: "", location: "",
+    department: "", isNewEmployee: false, employeeName: "", employeeCode: "", team: "", location: currentOfficeLocationLabel(),
     requestType: "New Asset", assetType: "", otherAssetType: "",
     quantity: 1, quantityReason: "", priority: "Normal", urgentReason: "",
     requiredBy: "", businessJustification: "", additionalInstructions: "", supportingNote: "",
@@ -2306,6 +2325,8 @@ function openRequestForm(uidVal) {
     replacementReason: "", replacementReasonOther: "", currentCondition: "", issueDescription: "",
     joiningDate: "", expectedRequirementDate: "",
   };
+  // Backfill Location on an older Draft that predates this field being auto-filled.
+  if (editing && !vals.location) vals.location = currentOfficeLocationLabel();
   showRequestFormStep(vals, editing);
 }
 
@@ -2340,10 +2361,9 @@ function buildRequestFormHtml(vals, editing) {
       <div class="field"><label>Employee Code</label><input type="text" id="rf_empCode" value="${escapeHtml(vals.employeeCode)}"></div>
     </div>
     <div class="field-row">
-      <div class="field"><label>Designation</label><input type="text" id="rf_designation" value="${escapeHtml(vals.designation)}"></div>
       <div class="field"><label>Team</label><input type="text" id="rf_team" value="${escapeHtml(vals.team)}"></div>
+      <div class="field"><label>Location</label><input type="text" id="rf_location" value="${escapeHtml(vals.location)}" readonly title="Auto-filled from your office — Settings > Switch Office to change it"></div>
     </div>
-    <div class="field"><label>Location</label><input type="text" id="rf_location" value="${escapeHtml(vals.location)}"></div>
 
     <div class="field"><label class="required">What is the requirement?</label>
       <div class="request-type-cards" id="rf_typeCards">
@@ -2426,7 +2446,6 @@ function readRequestFormValues(vals) {
   vals.isNewEmployee = g("rf_newEmp").checked;
   vals.employeeName = g("rf_emp").value.trim();
   vals.employeeCode = vals.isNewEmployee ? "" : g("rf_empCode").value.trim();
-  vals.designation = g("rf_designation").value.trim();
   vals.team = g("rf_team").value.trim();
   vals.location = g("rf_location").value.trim();
   vals.requestType = g("rf_type").value;
@@ -2660,7 +2679,7 @@ async function submitRequestForm(vals, editing, targetStatus) {
     isNewEmployee: !!vals.isNewEmployee,
     employeeName: vals.employeeName,
     employeeCode: vals.isNewEmployee ? "" : vals.employeeCode,
-    designation: vals.designation, team: vals.team, location: vals.location,
+    team: vals.team, location: vals.location,
     requestType: vals.requestType,
     assetType: vals.assetType, otherAssetType: vals.assetType === "Other" ? vals.otherAssetType : "",
     quantity: vals.quantity, quantityReason: vals.quantity > 1 ? vals.quantityReason : "",
@@ -2730,6 +2749,8 @@ function openRequestDetail(uidVal) {
   if (REQUEST_ACTIVE_STATUSES.includes(rec.status) && (admin || (mine && ["Draft", "Submitted"].includes(rec.status)))) {
     actionButtons.push(`<button class="btn btn-secondary" id="rd_cancelBtn">Cancel Request</button>`);
   }
+  // Delete is Super-Admin-only, same policy as every other collection in the app.
+  if (isSuperAdmin()) actionButtons.push(`<button class="btn btn-danger" id="rd_deleteBtn">Delete</button>`);
 
   openModal(rec.requestId ? `Request ${rec.requestId}` : "Request (Draft)", `
     <div class="req-detail-head">
@@ -2743,7 +2764,7 @@ function openRequestDetail(uidVal) {
         <tr><th>Employee</th><td>${escapeHtml(rec.employeeName)}${rec.isNewEmployee ? ` <span class="badge badge-purple">New Employee</span>` : ""}</td></tr>
         <tr><th>Employee Code</th><td>${escapeHtml(rec.employeeCode || "—")}</td></tr>
         <tr><th>Department</th><td>${escapeHtml(rec.department || "—")}</td></tr>
-        <tr><th>Designation / Team / Location</th><td>${escapeHtml([rec.designation, rec.team, rec.location].filter(Boolean).join(" · ") || "—")}</td></tr>
+        <tr><th>Team / Location</th><td>${escapeHtml([rec.team, rec.location].filter(Boolean).join(" · ") || "—")}</td></tr>
         <tr><th>Asset Required</th><td>${escapeHtml(rec.assetType === "Other" ? rec.otherAssetType : rec.assetType)} × ${rec.quantity || 1}</td></tr>
         <tr><th>Request Type</th><td>${escapeHtml(rec.requestType)}</td></tr>
         <tr><th>Required By</th><td>${fmtDate(rec.requiredBy)}</td></tr>
@@ -2828,8 +2849,10 @@ function openRequestDetail(uidVal) {
           rec.status = "Approved";
           rec.adminComment = comment;
           rec.reviewedAt = nowISO();
+          const addedEmployee = ensureEmployeeExists(rec);
           pushHistory("Approved", from, "Approved", comment);
-          persist("Request approved — now assign the actual asset", `${rec.requestId || rec.uid} approved`, { reopen: true });
+          persist(addedEmployee ? `Request approved — added ${addedEmployee.name} to Employees` : "Request approved — now assign the actual asset",
+            `${rec.requestId || rec.uid} approved`, { reopen: true });
         };
       });
     };
@@ -2882,6 +2905,35 @@ function openRequestDetail(uidVal) {
         };
       });
     };
+
+    const deleteBtn = document.getElementById("rd_deleteBtn");
+    if (deleteBtn) deleteBtn.onclick = () => deleteRequest(rec.uid);
+  });
+}
+
+// Delete is Super-Admin-only, same policy as every other collection — an Office
+// Admin/Team Lead can review, approve/reject, or cancel a request, but only a
+// Super Admin can permanently remove one (e.g. cleaning up test requests).
+function deleteRequest(uidVal) {
+  if (!requireSuperAdminOrWarn()) return;
+  const rec = (DB.requests || []).find(r => r.uid === uidVal);
+  const desc = rec ? `<strong>${escapeHtml(rec.requestId || "this draft request")}</strong> (${escapeHtml(rec.employeeName || "—")})` : "this request";
+  openModal("Delete asset request?", `
+    <p class="muted" style="margin-top:0">Delete ${desc}? This action can't be undone.</p>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelDel">Cancel</button>
+      <button class="btn btn-danger" id="confirmDel">Delete</button>
+    </div>`, () => {
+    document.getElementById("cancelDel").onclick = closeModal;
+    document.getElementById("confirmDel").onclick = () => {
+      DB.requests = (DB.requests || []).filter(r => r.uid !== uidVal);
+      deleteRecord("requests", uidVal);
+      logAction("Deleted asset request", rec ? `${rec.requestId || rec.uid} — ${rec.employeeName || "—"}` : uidVal);
+      closeModal();
+      toast("Asset request deleted");
+      if (currentPage === "assetRequests") renderAssetRequests();
+      if (currentPage === "dashboard") renderDashboard();
+    };
   });
 }
 
@@ -2911,6 +2963,30 @@ function openRequestByRequestId(requestId) {
   const rec = (DB.requests || []).find(r => r.requestId === requestId);
   if (!rec) { toast("Linked request not found", "err"); return; }
   openRequestDetail(rec.uid);
+}
+
+// Saves the Admin a manual step: if the request names someone who isn't in the
+// Employees list yet (whether or not the Team Lead remembered to tick "new
+// employee"), add them automatically the moment the request is approved — this
+// runs as the Admin approving it, who already has write access to Employees;
+// Team Leads never gain that access themselves. Returns the new employee record
+// if one was created, or null if the name already matched someone on file.
+function ensureEmployeeExists(rec) {
+  const name = (rec.employeeName || "").trim();
+  if (!name) return null;
+  const exists = DB.employees.some(e => (e.name || "").trim().toLowerCase() === name.toLowerCase());
+  if (exists) return null;
+  const newEmp = {
+    uid: uid(),
+    id: (rec.employeeCode || "").trim(),
+    name,
+    department: rec.department || "",
+    phone: "", email: "",
+  };
+  DB.employees.push(newEmp);
+  saveRecord("employees", newEmp);
+  logAction("Added employee (auto, from Asset Request)", `${name}${rec.department ? " — " + rec.department : ""} (via ${rec.requestId || rec.uid})`);
+  return newEmp;
 }
 
 // Called once an Approved request's asset has actually been handed over via
@@ -2999,7 +3075,7 @@ function paintInvTable() {
       ${admin ? `<td>
         <div class="row-actions">
           <button class="btn btn-secondary btn-sm btn-icon" onclick="openInvForm('${r.uid}')">✏️</button>
-          <button class="btn btn-danger btn-sm btn-icon" onclick="deleteInv('${r.uid}')">🗑️</button>
+          ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" onclick="deleteInv('${r.uid}')">🗑️</button>` : ""}
         </div>
       </td>` : ""}
     </tr>
@@ -3028,7 +3104,7 @@ function wireInvBulk(rows) {
   });
   const delSel = document.getElementById("deleteSelectedBtn");
   if (delSel) delSel.onclick = () => {
-    if (!requireAdminOrWarn() || invSelected.size === 0) return;
+    if (!requireSuperAdminOrWarn() || invSelected.size === 0) return;
     confirmBulkDelete(invSelected.size, "assets", () => {
       const idsToDelete = [...invSelected];
       const n = idsToDelete.length;
@@ -3040,7 +3116,7 @@ function wireInvBulk(rows) {
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
-    if (!requireAdminOrWarn()) return;
+    if (!requireSuperAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "assets (matching current search)", () => {
       const idsToDelete = rows.map(r => r.uid);
       const idSet = new Set(idsToDelete);
@@ -3136,7 +3212,7 @@ function openInvForm(uidVal) {
 }
 
 function deleteInv(uidVal) {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   const rec = DB.inventory.find(r => r.uid === uidVal);
   openModal("Delete asset?", `
     <p class="muted" style="margin-top:0">This action can't be undone.</p>
@@ -3223,7 +3299,7 @@ function paintEmpTable() {
       ${admin ? `<td>
         <div class="row-actions">
           <button class="btn btn-secondary btn-sm btn-icon" onclick="openEmpForm('${e.uid}')">✏️</button>
-          <button class="btn btn-danger btn-sm btn-icon" onclick="deleteEmp('${e.uid}')">🗑️</button>
+          ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" onclick="deleteEmp('${e.uid}')">🗑️</button>` : ""}
         </div>
       </td>` : ""}
     </tr>
@@ -3252,7 +3328,7 @@ function wireEmpBulk(rows) {
   });
   const delSel = document.getElementById("deleteSelectedBtn");
   if (delSel) delSel.onclick = () => {
-    if (!requireAdminOrWarn() || empSelected.size === 0) return;
+    if (!requireSuperAdminOrWarn() || empSelected.size === 0) return;
     confirmBulkDelete(empSelected.size, "employees", () => {
       const idsToDelete = [...empSelected];
       const n = idsToDelete.length;
@@ -3264,7 +3340,7 @@ function wireEmpBulk(rows) {
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
-    if (!requireAdminOrWarn()) return;
+    if (!requireSuperAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "employees (matching current search)", () => {
       const idsToDelete = rows.map(r => r.uid);
       const idSet = new Set(idsToDelete);
@@ -3317,7 +3393,7 @@ function openEmpForm(uidVal) {
 }
 
 function deleteEmp(uidVal) {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   const rec = DB.employees.find(e => e.uid === uidVal);
   openModal("Remove employee?", `
     <p class="muted" style="margin-top:0">This action can't be undone.</p>
@@ -3644,7 +3720,7 @@ function paintRefillTable() {
       <td>${escapeHtml(r.source || "—")}</td>
       ${admin ? `<td>
         <div class="row-actions">
-          <button class="btn btn-danger btn-sm btn-icon" onclick="deleteRefill('${r.uid}')">🗑️</button>
+          ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" onclick="deleteRefill('${r.uid}')">🗑️</button>` : `<span class="muted">—</span>`}
         </div>
       </td>` : ""}
     </tr>
@@ -3673,7 +3749,7 @@ function wireRefillBulk(rows) {
   });
   const delSel = document.getElementById("deleteSelectedBtn");
   if (delSel) delSel.onclick = () => {
-    if (!requireAdminOrWarn() || refillSelected.size === 0) return;
+    if (!requireSuperAdminOrWarn() || refillSelected.size === 0) return;
     confirmBulkDelete(refillSelected.size, "refill entries", () => {
       const idsToDelete = [...refillSelected];
       const n = idsToDelete.length;
@@ -3685,7 +3761,7 @@ function wireRefillBulk(rows) {
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
-    if (!requireAdminOrWarn()) return;
+    if (!requireSuperAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "refill entries", () => {
       const idsToDelete = DB.refills.map(r => r.uid);
       const n = idsToDelete.length;
@@ -3735,7 +3811,7 @@ function openRefillForm() {
 }
 
 function deleteRefill(uidVal) {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   const rec = DB.refills.find(r => r.uid === uidVal);
   openModal("Delete refill entry?", `
     <p class="muted" style="margin-top:0">This will reduce Total Stock for that category.</p>
@@ -3795,7 +3871,7 @@ function paintCatTable() {
       ${admin ? `<td>
         <div class="row-actions">
           <button class="btn btn-secondary btn-sm btn-icon" onclick="openCatForm('${c.uid}')">✏️</button>
-          <button class="btn btn-danger btn-sm btn-icon" onclick="deleteCat('${c.uid}')">🗑️</button>
+          ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" onclick="deleteCat('${c.uid}')">🗑️</button>` : ""}
         </div>
       </td>` : ""}
     </tr>
@@ -3824,7 +3900,7 @@ function wireCatBulk(rows) {
   });
   const delSel = document.getElementById("deleteSelectedBtn");
   if (delSel) delSel.onclick = () => {
-    if (!requireAdminOrWarn() || catSelected.size === 0) return;
+    if (!requireSuperAdminOrWarn() || catSelected.size === 0) return;
     confirmBulkDelete(catSelected.size, "categories", () => {
       const idsToDelete = [...catSelected];
       const n = idsToDelete.length;
@@ -3836,7 +3912,7 @@ function wireCatBulk(rows) {
   };
   const delAll = document.getElementById("deleteAllBtn");
   if (delAll) delAll.onclick = () => {
-    if (!requireAdminOrWarn()) return;
+    if (!requireSuperAdminOrWarn()) return;
     confirmBulkDelete(rows.length, "categories", () => {
       const idsToDelete = DB.categories.map(c => c.uid);
       const n = idsToDelete.length;
@@ -3896,7 +3972,7 @@ function openCatForm(uidVal) {
 }
 
 function deleteCat(uidVal) {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   const rec = DB.categories.find(c => c.uid === uidVal);
   openModal("Delete category?", `
     <p class="muted" style="margin-top:0">Existing assignments and refill entries referencing it will keep their history but stop appearing in dropdowns.</p>
@@ -4424,9 +4500,9 @@ function paintChips(key) {
   const el = document.getElementById(`chips_${key}`);
   if (!el) return;
   const items = DB.lists[key] || [];
-  const admin = isAdmin();
+  const superAdmin = isSuperAdmin();
   el.innerHTML = items.length ? items.map(v => `
-    <span class="tag-chip">${escapeHtml(v)} ${admin ? `<span class="chip-remove" style="cursor:pointer;color:var(--red)" data-key="${escapeHtml(key)}" data-val="${escapeHtml(v)}">✕</span>` : ""}</span>
+    <span class="tag-chip">${escapeHtml(v)} ${superAdmin ? `<span class="chip-remove" style="cursor:pointer;color:var(--red)" title="Delete (Super Admin only)" data-key="${escapeHtml(key)}" data-val="${escapeHtml(v)}">✕</span>` : ""}</span>
   `).join("") : `<p class="muted" style="font-size:12.5px">No values yet</p>`;
   // data-attributes + addEventListener, not an inline onclick built from the value itself —
   // a list value containing a quote (or anything) can't break out of a hand-built JS string.
@@ -4436,7 +4512,7 @@ function paintChips(key) {
 }
 
 function removeListItem(key, val) {
-  if (!requireAdminOrWarn()) return;
+  if (!requireSuperAdminOrWarn()) return;
   DB.lists[key] = (DB.lists[key] || []).filter(v => v !== val);
   saveMeta();
   logAction("Removed list option", `${key}: "${val}"`);
