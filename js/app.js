@@ -357,7 +357,14 @@ function seedFromSource() {
   };
 }
 
-async function loadInitialData() {
+// `fetchCollections` defaults to true (read everything here, right now).
+// The normal app-open path passes false: attachRealtimeListener()'s first
+// snapshot delivers the exact same initial data a moment later anyway, so
+// fetching it twice on every single login/reconnect was silently doubling
+// Firestore's read cost for zero benefit. The one caller that DOES need it
+// (resetOfficeData — nothing re-opens the listeners afterward, so nothing
+// else would ever repopulate DB) keeps the default.
+async function loadInitialData(fetchCollections = true) {
   const metaSnap = await docRef().get();
   const meta = metaSnap.exists ? metaSnap.data() : null;
 
@@ -369,7 +376,7 @@ async function loadInitialData() {
   if (meta && Array.isArray(meta.employees)) {
     if (isAdmin()) {
       await migrateLegacyBlobToRecords(meta);
-      return loadInitialData();
+      return loadInitialData(fetchCollections);
     }
     // Not an admin for this office — can't write the conversion. Load the
     // legacy shape directly (read access is open to anyone signed in) so
@@ -402,7 +409,7 @@ async function loadInitialData() {
       const empty = emptyOfficeDB();
       await docRef().set({ lists: empty.lists, stockManual: empty.stockManual });
     }
-    return loadInitialData();
+    return loadInitialData(fetchCollections);
   }
 
   DB = {
@@ -410,6 +417,8 @@ async function loadInitialData() {
     stockManual: meta.stockManual || {},
     employees: [], categories: [], assignments: [], refills: [], inventory: [], requests: [],
   };
+  if (!fetchCollections) return; // attachRealtimeListener()'s first snapshot fills these in instead
+
   const [empSnap, catSnap, asgSnap, refSnap, invSnap] = await Promise.all([
     employeesColl().get(), categoriesColl().get(), assignmentsColl().get(), refillsColl().get(), inventoryColl().get(),
   ]);
@@ -454,31 +463,66 @@ async function migrateLegacyBlobToRecords(meta) {
 }
 
 let unsubscribeFns = [];
+// Returns a Promise that resolves once every listener's FIRST snapshot has
+// landed — that first snapshot IS the initial data load (see loadInitialData's
+// `fetchCollections` flag), so callers await this instead of fetching once
+// and then attaching listeners separately, which used to pay for every
+// document twice on every single app open.
 function attachRealtimeListener() {
-  const colls = { employees: employeesColl, categories: categoriesColl, assignments: assignmentsColl, refills: refillsColl, inventory: inventoryColl };
+  const readyPromises = [];
+  // Master Inventory and the Stock Refill Log are Admin/Viewer-only pages — a
+  // Team Lead can never navigate to either (see TEAM_LEAD_PAGES) and nothing
+  // on their Dashboard or Asset Requests page reads DB.inventory/DB.refills,
+  // so there's no reason to pay for a live listener on either collection for
+  // that role. DB.inventory/DB.refills just stay empty arrays for them.
+  const colls = { employees: employeesColl, categories: categoriesColl, assignments: assignmentsColl };
+  if (!isTeamLead()) Object.assign(colls, { refills: refillsColl, inventory: inventoryColl });
   Object.entries(colls).forEach(([key, fn]) => {
-    unsubscribeFns.push(fn().onSnapshot(snap => {
-      const list = [];
-      snap.forEach(d => list.push(d.data()));
-      DB[key] = list;
-      goto(currentPage); // keep every open browser (signed-in users) in sync live
-    }, err => console.error(`Firestore listener error (${key}):`, err)));
+    let gotFirst = false;
+    readyPromises.push(new Promise(resolve => {
+      unsubscribeFns.push(fn().onSnapshot(snap => {
+        const list = [];
+        snap.forEach(d => list.push(d.data()));
+        DB[key] = list;
+        if (!gotFirst) { gotFirst = true; resolve(); }
+        else goto(currentPage); // keep every open browser (signed-in users) in sync live
+      }, err => {
+        console.error(`Firestore listener error (${key}):`, err);
+        if (!gotFirst) { gotFirst = true; resolve(); }
+      }));
+    }));
   });
-  unsubscribeFns.push(docRef().onSnapshot(snap => {
-    if (!snap.exists) return;
-    const data = snap.data();
-    if (data.lists) DB.lists = data.lists;
-    if (data.stockManual) DB.stockManual = data.stockManual;
-    goto(currentPage);
-  }, err => console.error("Firestore listener error (meta):", err)));
+  readyPromises.push(new Promise(resolve => {
+    let gotFirst = false;
+    unsubscribeFns.push(docRef().onSnapshot(snap => {
+      if (snap.exists) {
+        const data = snap.data();
+        if (data.lists) DB.lists = data.lists;
+        if (data.stockManual) DB.stockManual = data.stockManual;
+      }
+      if (!gotFirst) { gotFirst = true; resolve(); }
+      else goto(currentPage);
+    }, err => {
+      console.error("Firestore listener error (meta):", err);
+      if (!gotFirst) { gotFirst = true; resolve(); }
+    }));
+  }));
   // Kept separate from the `colls` loop above — the query itself (all requests vs.
   // just this person's own) depends on role, see requestsQuery().
-  unsubscribeFns.push(requestsQuery().onSnapshot(snap => {
-    const list = [];
-    snap.forEach(d => list.push(d.data()));
-    DB.requests = list;
-    goto(currentPage);
-  }, err => console.error("Firestore listener error (requests):", err)));
+  readyPromises.push(new Promise(resolve => {
+    let gotFirst = false;
+    unsubscribeFns.push(requestsQuery().onSnapshot(snap => {
+      const list = [];
+      snap.forEach(d => list.push(d.data()));
+      DB.requests = list;
+      if (!gotFirst) { gotFirst = true; resolve(); }
+      else goto(currentPage);
+    }, err => {
+      console.error("Firestore listener error (requests):", err);
+      if (!gotFirst) { gotFirst = true; resolve(); }
+    }));
+  }));
+  return Promise.all(readyPromises);
 }
 function detachRealtimeListener() {
   unsubscribeFns.forEach(fn => fn());
@@ -2636,7 +2680,7 @@ function buildRequestFormHtml(vals, editing) {
       <div class="field"><label>Employee Code</label><input type="text" id="rf_empCode" value="${escapeHtml(vals.employeeCode)}"></div>
     </div>
     <div class="field-row">
-      <div class="field"><label>Team <span class="muted" style="font-weight:500;">(auto-fills from the employee if known; saved for next time otherwise)</span></label>
+      <div class="field"><label>Team <span class="muted" style="font-weight:500;" id="rf_teamSourceNote"></span></label>
         <input type="text" id="rf_team" list="rf_teamList" value="${escapeHtml(vals.team)}">
         <datalist id="rf_teamList">${distinctEmployeeTeams().map(t => `<option value="${escapeHtml(t)}">`).join("")}</datalist>
       </div>
@@ -2810,20 +2854,14 @@ function wireRequestForm(vals, editing) {
   newEmpCk.addEventListener("change", syncNewEmpMode);
   syncNewEmpMode();
 
-  // Autofill Employee Code / Department / Team from a matched Employee record —
-  // same "touched" pattern as the Assignment form (js/app.js openAssignForm), so
-  // it never clobbers something the Team Lead already typed themselves. Team in
-  // particular is usually blank on older employee records — whatever gets typed
-  // here gets saved back onto the employee at Approval time (see
-  // ensureEmployeeExists) so it's remembered for next time.
+  // Autofill Employee Code / Department from a matched Employee record — same
+  // "touched" pattern as the Assignment form (js/app.js openAssignForm), so it
+  // never clobbers something the Team Lead already typed themselves.
   const deptSel = g("rf_dept");
-  const teamInput = g("rf_team");
   let empCodeTouched = !!empCodeInput.value.trim();
   let deptTouched = !!deptSel.value;
-  let teamTouched = !!teamInput.value.trim();
   empCodeInput.addEventListener("input", () => { empCodeTouched = true; });
   deptSel.addEventListener("change", () => { deptTouched = true; });
-  teamInput.addEventListener("input", () => { teamTouched = true; });
   const autofillFromEmployee = () => {
     if (newEmpCk.checked) return;
     const typed = empInput.value.trim().toLowerCase();
@@ -2834,11 +2872,42 @@ function wireRequestForm(vals, editing) {
     if (!deptTouched && match.department && [...deptSel.options].some(o => o.value === match.department)) {
       deptSel.value = match.department;
     }
-    if (!teamTouched && match.team) teamInput.value = match.team;
   };
   empInput.addEventListener("input", autofillFromEmployee);
   empInput.addEventListener("change", autofillFromEmployee);
   if (!editing) autofillFromEmployee();
+
+  // Team is different: the Employee Database is the master for it. If the
+  // matched employee already has a Team on file, the field is LOCKED to that
+  // value — no touched-pattern, no "keep what I typed" exception — because
+  // the whole point is a Team Lead can never accidentally (or deliberately)
+  // change someone's master Team from this form. Only when the master has no
+  // Team yet does the field open up for manual entry, clearly labeled as such
+  // (see ensureEmployeeExists() for where that manual value gets saved back —
+  // only ever filling in a blank, never overwriting).
+  const teamInput = g("rf_team");
+  const teamNote = g("rf_teamSourceNote");
+  const syncTeamLock = () => {
+    const typed = empInput.value.trim().toLowerCase();
+    const match = !newEmpCk.checked && typed ? DB.employees.find(e => (e.name || "").trim().toLowerCase() === typed) : null;
+    const masterTeam = match ? (match.team || "").trim() : "";
+    if (masterTeam) {
+      teamInput.value = masterTeam;
+      teamInput.readOnly = true;
+      teamInput.removeAttribute("list");
+      teamNote.textContent = "🔒 From Employee Master — can't be changed here";
+      teamNote.style.color = "var(--primary)";
+    } else {
+      teamInput.readOnly = false;
+      teamInput.setAttribute("list", "rf_teamList");
+      teamNote.textContent = match ? "✏️ Not in Employee Master yet — enter manually" : "✏️ Manual entry — saved to Employee Master if it's blank there";
+      teamNote.style.color = "";
+    }
+  };
+  empInput.addEventListener("input", syncTeamLock);
+  empInput.addEventListener("change", syncTeamLock);
+  newEmpCk.addEventListener("change", syncTeamLock);
+  syncTeamLock();
 
   const typeCards = [...document.querySelectorAll("#rf_typeCards .request-type-card")];
   const typeHidden = g("rf_type");
@@ -2961,6 +3030,7 @@ function showRequestReviewStep(vals, editing) {
         <tr><th>Employee</th><td>${escapeHtml(vals.employeeName)}${vals.isNewEmployee ? ` <span class="badge badge-purple">New Employee</span>` : ""}</td></tr>
         <tr><th>Employee Code</th><td>${escapeHtml(vals.employeeCode || "—")}</td></tr>
         <tr><th>Department</th><td>${escapeHtml(vals.department)}</td></tr>
+        <tr><th>Team</th><td>${escapeHtml(vals.team || "—")}${vals.team ? ` ${(DB.employees.find(e => (e.name || "").trim().toLowerCase() === (vals.employeeName || "").trim().toLowerCase()) || {}).team ? '<span class="badge badge-purple" title="From Employee Master">📋 Master</span>' : '<span class="badge badge-grey" title="Not in Employee Master">✏️ Manual</span>'}` : ""}</td></tr>
         <tr><th>Assets Required</th><td>${(vals.items || []).map(i => `${escapeHtml(requestItemLabel(i))}${i.quantity > 1 ? ` × ${i.quantity}` : ""}`).join("<br>") || "—"}${vals.quantityReason ? `<div class="muted" style="margin-top:4px;">${escapeHtml(vals.quantityReason)}</div>` : ""}</td></tr>
         <tr><th>Request Type</th><td>${escapeHtml(vals.requestType)}</td></tr>
         <tr><th>Priority</th><td>${priorityBadge(vals.priority)}${vals.urgentReason ? ` — ${escapeHtml(vals.urgentReason)}` : ""}</td></tr>
@@ -3008,12 +3078,25 @@ async function submitRequestForm(vals, editing, targetStatus) {
   };
   const wasStatus = rec.status || null;
 
+  // Employee Database is the master for Team — resolved here, not trusted from
+  // the form, so a stale/tampered vals.team can never overwrite an existing
+  // master value: if the matched employee already has a Team on file, THAT is
+  // what gets stored on the request, full stop; only when the master has none
+  // does the manually-entered value get used (and it's a "manual" source, not
+  // silently treated as authoritative).
+  const matchedEmp = !vals.isNewEmployee
+    ? DB.employees.find(e => (e.name || "").trim().toLowerCase() === (vals.employeeName || "").trim().toLowerCase())
+    : null;
+  const masterTeam = matchedEmp ? (matchedEmp.team || "").trim() : "";
+  const resolvedTeam = masterTeam || (vals.team || "").trim();
+  const teamSource = masterTeam ? "master" : (resolvedTeam ? "manual" : "");
+
   Object.assign(rec, {
     department: vals.department,
     isNewEmployee: !!vals.isNewEmployee,
     employeeName: vals.employeeName,
     employeeCode: vals.isNewEmployee ? "" : vals.employeeCode,
-    team: vals.team, location: vals.location,
+    team: resolvedTeam, teamSource, location: vals.location,
     requestType: vals.requestType,
     items: vals.items || [],
     quantityReason: (vals.items || []).some(i => i.quantity > 1) ? vals.quantityReason : "",
@@ -3086,6 +3169,15 @@ function openRequestDetail(uidVal) {
   const admin = isAdmin();
   const history = rec.history || [];
 
+  // Team conflict detection (§4/§5 of the Team master-data spec): compare what's
+  // stored on this request against the employee's CURRENT master Team — the
+  // form locks the field to master at submit time, so a mismatch here can only
+  // mean the master changed *after* this request was made. Never auto-resolved.
+  const teamMatchedEmp = DB.employees.find(e => (e.name || "").trim().toLowerCase() === (rec.employeeName || "").trim().toLowerCase());
+  const currentMasterTeam = teamMatchedEmp ? (teamMatchedEmp.team || "").trim() : "";
+  const recTeam = (rec.team || "").trim();
+  const teamConflict = !!(currentMasterTeam && recTeam && currentMasterTeam !== recTeam);
+
   const actionButtons = [];
   if (admin) {
     if (["Submitted", "Draft"].includes(rec.status)) actionButtons.push(`<button class="btn btn-secondary" id="rd_reviewBtn">Start Review</button>`);
@@ -3109,12 +3201,20 @@ function openRequestDetail(uidVal) {
     ${admin && rec.status === "Approved" ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📦</span><div>This request is approved but <strong>no asset has been handed over yet</strong> — nothing will show up on the Asset Assignment page until you click <strong>Assign Asset</strong> below and complete the handover.</div></div>` : ""}
     ${rec.status === "Partially Fulfilled" ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">⏳</span><div><strong>Partially fulfilled</strong> — ${escapeHtml(getRequestItems(rec).filter(i => requestItemRemaining(i) > 0).map(i => `${requestItemLabel(i)} ×${requestItemRemaining(i)}`).join(", "))} still pending. Click <strong>Assign Asset</strong> once stock is available to give the rest.</div></div>` : ""}
     ${rec.status === "Fulfilled" ? `<div class="viewer-note" style="border-color:var(--green,#22c55e);"><span style="font-size:16px;">✅</span><div>Fulfilled — everything on this request is recorded on the <a href="#" id="rd_gotoAssignment" style="color:var(--primary);font-weight:600;">Asset Assignment page</a>.</div></div>` : ""}
+    ${teamConflict ? `<div class="viewer-note" style="align-items:flex-start;border-color:var(--red);background:var(--red-light);">
+      <span style="font-size:16px;">⚠️</span>
+      <div>
+        <strong>Team mismatch detected</strong>
+        <div style="margin-top:2px;">Employee Master shows <strong>${escapeHtml(currentMasterTeam)}</strong>, but this request shows <strong>${escapeHtml(recTeam)}</strong>. Employee Master data will remain unchanged.</div>
+        ${admin ? `<button class="btn btn-secondary btn-sm" id="rd_resolveTeamBtn" style="margin-top:8px;">Resolve…</button>` : `<div class="muted" style="margin-top:6px;">Only an Admin can resolve this.</div>`}
+      </div>
+    </div>` : ""}
     <div class="table-wrap"><table>
       <tbody>
         <tr><th>Employee</th><td>${escapeHtml(rec.employeeName)}${rec.isNewEmployee ? ` <span class="badge badge-purple">New Employee</span>` : ""}</td></tr>
         <tr><th>Employee Code</th><td>${escapeHtml(rec.employeeCode || "—")}</td></tr>
         <tr><th>Department</th><td>${escapeHtml(rec.department || "—")}</td></tr>
-        <tr><th>Team / Location</th><td>${escapeHtml([rec.team, rec.location].filter(Boolean).join(" · ") || "—")}</td></tr>
+        <tr><th>Team / Location</th><td>${escapeHtml([rec.team, rec.location].filter(Boolean).join(" · ") || "—")}${rec.team ? ` ${rec.teamSource === "master" ? '<span class="badge badge-purple" title="From Employee Master">📋 Master</span>' : rec.teamSource === "manual" ? '<span class="badge badge-grey" title="Manually entered — not in Employee Master at submission time">✏️ Manual</span>' : ""}` : ""}</td></tr>
         <tr><th>Assets Required</th><td>
           <div class="table-wrap"><table style="min-width:0;">
             <thead><tr><th>Asset</th><th>Qty</th><th>Given</th><th>Status</th></tr></thead>
@@ -3167,6 +3267,8 @@ function openRequestDetail(uidVal) {
     document.getElementById("rd_closeBtn").onclick = closeModal;
     const gotoAssignLink = document.getElementById("rd_gotoAssignment");
     if (gotoAssignLink) gotoAssignLink.onclick = (e) => { e.preventDefault(); closeModal(); goto("assignment"); };
+    const resolveTeamBtn = document.getElementById("rd_resolveTeamBtn");
+    if (resolveTeamBtn) resolveTeamBtn.onclick = () => openTeamConflictResolver(rec, teamMatchedEmp, currentMasterTeam, recTeam);
 
     const pushHistory = (action, fromStatus, toStatus, comment) => {
       rec.history = [...(rec.history || []), { ts: nowISO(), email: myEmail, role: admin ? "admin" : "teamlead", action, fromStatus, toStatus, comment: comment || "" }];
@@ -3270,6 +3372,59 @@ function openRequestDetail(uidVal) {
 
     const deleteBtn = document.getElementById("rd_deleteBtn");
     if (deleteBtn) deleteBtn.onclick = () => deleteRequest(rec.uid);
+  });
+}
+
+// The only path that resolves a Team mismatch (§4/§8 of the master-data spec)
+// — Admin-only, requires a reason, and never silently picks a side. Either
+// updates Employee Master to match this request (with a teamHistory entry),
+// or leaves Master untouched and corrects the stale value on the request
+// itself so the mismatch banner clears. Both choices are logged.
+function openTeamConflictResolver(rec, matchedEmp, masterTeam, requestTeam) {
+  if (!requireAdminOrWarn()) return;
+  openModal("Resolve Team Mismatch", `
+    <p class="muted" style="margin-top:0">Employee Master currently shows <strong>${escapeHtml(masterTeam)}</strong> for ${escapeHtml(rec.employeeName)}. This request shows <strong>${escapeHtml(requestTeam)}</strong>.</p>
+    <div class="field"><label>Which is correct?</label>
+      <select id="rtc_choice">
+        <option value="master">Employee Master is correct (${escapeHtml(masterTeam)}) — fix this request to match</option>
+        <option value="request">This request is correct (${escapeHtml(requestTeam)}) — update Employee Master</option>
+      </select>
+    </div>
+    <div class="field"><label class="required">Reason</label><textarea id="rtc_reason" rows="2" placeholder="Required — kept on the audit trail"></textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="rtc_cancel">Cancel</button>
+      <button class="btn btn-primary" id="rtc_confirm">Confirm</button>
+    </div>
+  `, () => {
+    document.getElementById("rtc_cancel").onclick = closeModal;
+    document.getElementById("rtc_confirm").onclick = () => {
+      const choice = document.getElementById("rtc_choice").value;
+      const reason = document.getElementById("rtc_reason").value.trim();
+      if (!reason) { toast("A reason is required", "err"); return; }
+      const myEmail = (fauth.currentUser || {}).email || "";
+
+      if (choice === "request" && matchedEmp) {
+        pushTeamHistory(matchedEmp, { previousTeam: masterTeam, newTeam: requestTeam, source: "admin-conflict-resolution", requestId: rec.requestId || rec.uid, reason });
+        matchedEmp.team = requestTeam;
+        saveRecord("employees", matchedEmp);
+        logAction("Resolved Team mismatch — updated Employee Master", `${rec.employeeName}: ${masterTeam} → ${requestTeam} (${reason})`);
+      } else {
+        logAction("Resolved Team mismatch — kept Employee Master", `${rec.employeeName}: Master stays "${masterTeam}"; request corrected to match (${reason})`);
+      }
+
+      const finalTeam = choice === "request" ? requestTeam : masterTeam;
+      rec.team = finalTeam;
+      rec.teamSource = "master";
+      rec.updatedAt = nowISO();
+      rec.history = [...(rec.history || []), {
+        ts: nowISO(), email: myEmail, role: "admin", action: "Resolved Team mismatch",
+        comment: `${choice === "request" ? "Master updated to" : "Kept Master at"} "${finalTeam}" — ${reason}`,
+      }];
+      saveRecord("requests", rec);
+      toast("Team mismatch resolved");
+      closeModal();
+      openRequestDetail(rec.uid);
+    };
   });
 }
 
@@ -3387,6 +3542,7 @@ function ensureEmployeeExists(rec) {
   const existing = DB.employees.find(e => (e.name || "").trim().toLowerCase() === name.toLowerCase());
   if (existing) {
     if (isAdmin() && team && !(existing.team || "").trim()) {
+      pushTeamHistory(existing, { previousTeam: "", newTeam: team, source: "auto-backfill", requestId: rec.requestId || rec.uid });
       existing.team = team;
       saveRecord("employees", existing);
       logAction("Saved employee team (auto, from Asset Request)", `${name} — ${team} (via ${rec.requestId || rec.uid})`);
@@ -3401,6 +3557,7 @@ function ensureEmployeeExists(rec) {
     team,
     phone: "", email: "",
   };
+  if (team) pushTeamHistory(newEmp, { previousTeam: "", newTeam: team, source: "auto-backfill", requestId: rec.requestId || rec.uid });
   DB.employees.push(newEmp);
   saveRecord("employees", newEmp);
   logAction(isAdmin() ? "Added employee (auto, from Asset Request)" : "Added employee (auto, by Team Lead's Asset Request)",
@@ -3729,6 +3886,23 @@ function distinctEmployeeTeams() {
   return [...new Set(DB.employees.map(e => (e.team || "").trim()).filter(Boolean))].sort();
 }
 
+// Audit trail for every change to an employee's master Team — who changed it,
+// from what to what, where the value came from, and (for admin-made changes)
+// why. Appended to the employee's own record so it travels with them; every
+// entry also goes through logAction() for visibility in the shared Activity
+// Log, same as everything else in the app.
+function pushTeamHistory(emp, { previousTeam, newTeam, source, requestId, reason }) {
+  emp.teamHistory = [...(emp.teamHistory || []), {
+    ts: nowISO(),
+    byEmail: (fauth.currentUser || {}).email || "",
+    previousTeam: previousTeam || "",
+    newTeam: newTeam || "",
+    source, // "auto-backfill" | "admin-conflict-resolution" | "manual-edit"
+    requestId: requestId || "",
+    reason: reason || "",
+  }];
+}
+
 function paintEmpTable() {
   const tbody = document.getElementById("empTbody");
   if (!tbody) return;
@@ -3840,8 +4014,15 @@ function openEmpForm(uidVal) {
         phone: document.getElementById("f_phone").value.trim(),
         email: document.getElementById("f_email").value.trim(),
       };
-      if (editing) { Object.assign(editing, rec); saveRecord("employees", editing); logAction("Edited employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee updated"); }
-      else { const newRec = { uid: uid(), ...rec }; DB.employees.push(newRec); saveRecord("employees", newRec); logAction("Added employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee added"); }
+      if (editing) {
+        const prevTeam = (editing.team || "").trim();
+        if (prevTeam !== rec.team) pushTeamHistory(editing, { previousTeam: prevTeam, newTeam: rec.team, source: "manual-edit" });
+        Object.assign(editing, rec); saveRecord("employees", editing); logAction("Edited employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee updated");
+      } else {
+        const newRec = { uid: uid(), ...rec };
+        if (rec.team) pushTeamHistory(newRec, { previousTeam: "", newTeam: rec.team, source: "manual-edit" });
+        DB.employees.push(newRec); saveRecord("employees", newRec); logAction("Added employee", `${rec.name}${rec.id ? " (" + rec.id + ")" : ""}`); toast("Employee added");
+      }
       closeModal(); paintEmpTable();
     };
   });
@@ -5075,8 +5256,8 @@ async function openOffice(officeId) {
   showLoadingScreen();
   try {
     await fetchOfficeRole();
-    await loadInitialData();
-    attachRealtimeListener();
+    await loadInitialData(false);
+    await attachRealtimeListener();
     dataBootstrapped = true;
   } catch (err) {
     console.error(err);
@@ -5303,8 +5484,8 @@ async function init() {
     if (!dataBootstrapped) {
       showLoadingScreen();
       try {
-        await loadInitialData();
-        attachRealtimeListener();
+        await loadInitialData(false);
+        await attachRealtimeListener();
         dataBootstrapped = true;
       } catch (err) {
         console.error(err);
