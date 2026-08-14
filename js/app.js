@@ -63,8 +63,9 @@ function inventoryColl() { return docRef().collection("inventory"); }
 function refillsColl() { return docRef().collection("refills"); }
 function categoriesColl() { return docRef().collection("categories"); }
 function requestsColl() { return docRef().collection("requests"); }
+function transfersColl() { return docRef().collection("transfers"); }
 function collFor(kind) {
-  return { employees: employeesColl, assignments: assignmentsColl, inventory: inventoryColl, refills: refillsColl, categories: categoriesColl, requests: requestsColl }[kind]();
+  return { employees: employeesColl, assignments: assignmentsColl, inventory: inventoryColl, refills: refillsColl, categories: categoriesColl, requests: requestsColl, transfers: transfersColl }[kind]();
 }
 // Team Leads can only ever list THEIR OWN requests (enforced by firestore.rules —
 // an unfiltered query would be denied outright for them), so which query to run
@@ -179,7 +180,7 @@ function emptyOfficeDB() {
 }
 async function resetOfficeData(toOriginalSheet) {
   const deleteOps = [];
-  ["employees", "categories", "assignments", "refills", "inventory", "requests"].forEach(kind => {
+  ["employees", "categories", "assignments", "refills", "inventory", "requests", "transfers"].forEach(kind => {
     (DB[kind] || []).forEach(r => deleteOps.push({ kind, type: "delete", uid: r.uid }));
   });
   if (deleteOps.length) await batchWrite(deleteOps);
@@ -226,7 +227,7 @@ async function deleteOffice(id) {
   // Firestore doesn't cascade-delete subcollections when a document is deleted,
   // so clear each one out first or the records would be orphaned but still stored.
   const ref = fdb.collection(FIRESTORE_COLLECTION).doc(id);
-  for (const sub of ["employees", "categories", "assignments", "refills", "inventory", "logs", "requests", "counters"]) {
+  for (const sub of ["employees", "categories", "assignments", "refills", "inventory", "logs", "requests", "counters", "transfers"]) {
     try {
       const snap = await ref.collection(sub).get();
       const ids = [];
@@ -365,14 +366,14 @@ function seedFromSource() {
   };
 }
 
-// `fetchCollections` defaults to true (read everything here, right now).
-// The normal app-open path passes false: attachRealtimeListener()'s first
-// snapshot delivers the exact same initial data a moment later anyway, so
-// fetching it twice on every single login/reconnect was silently doubling
-// Firestore's read cost for zero benefit. The one caller that DOES need it
-// (resetOfficeData — nothing re-opens the listeners afterward, so nothing
-// else would ever repopulate DB) keeps the default.
-async function loadInitialData(fetchCollections = true) {
+// Loads the office's meta doc (lists/stockManual), handling one-time
+// migration/seeding as needed, then hands off to refreshAllData() for the
+// per-record collections (employees/assignments/etc) — the only thing that
+// ever fetches those, so there's exactly one read path for them, not two
+// (this file used to fetch everything here AND again via a realtime
+// listener's first snapshot — see refreshAllData()'s comment for why
+// listeners were removed entirely in favor of load-once + manual refresh).
+async function loadInitialData() {
   const metaSnap = await docRef().get();
   const meta = metaSnap.exists ? metaSnap.data() : null;
 
@@ -384,7 +385,7 @@ async function loadInitialData(fetchCollections = true) {
   if (meta && Array.isArray(meta.employees)) {
     if (isAdmin()) {
       await migrateLegacyBlobToRecords(meta);
-      return loadInitialData(fetchCollections);
+      return loadInitialData();
     }
     // Not an admin for this office — can't write the conversion. Load the
     // legacy shape directly (read access is open to anyone signed in) so
@@ -395,7 +396,7 @@ async function loadInitialData(fetchCollections = true) {
       stockManual: meta.stockManual || {},
       employees: meta.employees || [], categories: meta.categories || [],
       assignments: meta.assignments || [], refills: meta.refills || [], inventory: meta.inventory || [],
-      requests: [],
+      requests: [], transfers: [],
     };
     await fetchRequestsIntoDB();
     return;
@@ -417,25 +418,15 @@ async function loadInitialData(fetchCollections = true) {
       const empty = emptyOfficeDB();
       await docRef().set({ lists: empty.lists, stockManual: empty.stockManual });
     }
-    return loadInitialData(fetchCollections);
+    return loadInitialData();
   }
 
   DB = {
     lists: meta.lists || JSON.parse(JSON.stringify(SEED_DATA.lists || {})),
     stockManual: meta.stockManual || {},
-    employees: [], categories: [], assignments: [], refills: [], inventory: [], requests: [],
+    employees: [], categories: [], assignments: [], refills: [], inventory: [], requests: [], transfers: [],
   };
-  if (!fetchCollections) return; // attachRealtimeListener()'s first snapshot fills these in instead
-
-  const [empSnap, catSnap, asgSnap, refSnap, invSnap] = await Promise.all([
-    employeesColl().get(), categoriesColl().get(), assignmentsColl().get(), refillsColl().get(), inventoryColl().get(),
-  ]);
-  empSnap.forEach(d => DB.employees.push(d.data()));
-  catSnap.forEach(d => DB.categories.push(d.data()));
-  asgSnap.forEach(d => DB.assignments.push(d.data()));
-  refSnap.forEach(d => DB.refills.push(d.data()));
-  invSnap.forEach(d => DB.inventory.push(d.data()));
-  await fetchRequestsIntoDB();
+  await refreshAllData();
 }
 // Asset Requests are loaded separately from the rest of the collections (rather
 // than folded into the Promise.all above) because WHICH query is even allowed
@@ -470,103 +461,87 @@ async function migrateLegacyBlobToRecords(meta) {
   }, { merge: true });
 }
 
-let unsubscribeFns = [];
-// Returns a Promise that resolves once every listener's FIRST snapshot has
-// landed — that first snapshot IS the initial data load (see loadInitialData's
-// `fetchCollections` flag), so callers await this instead of fetching once
-// and then attaching listeners separately, which used to pay for every
-// document twice on every single app open.
-// Which collections currently have NO live data (their listener's most recent
+// Which collections currently have NO data loaded (their most recent fetch
 // attempt failed — quota limit, offline, etc.) — surfaced via a persistent
-// banner (updateDataLoadWarning) instead of failing silently. Previously a
-// failed employees load just left DB.employees empty with no indication why,
-// which looked exactly like "this employee genuinely isn't in Employee
+// banner (updateDataLoadWarning) instead of failing silently. A failed
+// employees load used to just leave DB.employees empty with no indication
+// why, which looked exactly like "this employee genuinely isn't in Employee
 // Master" — very misleading for the Team-lock feature specifically.
 let dataLoadFailures = new Set();
-const DATA_LOAD_LABELS = { employees: "Employees", categories: "Asset Categories", assignments: "Asset Assignment", refills: "Stock Refill Log", inventory: "Master Inventory", meta: "Settings / Lists", requests: "Asset Requests" };
+const DATA_LOAD_LABELS = { employees: "Employees", categories: "Asset Categories", assignments: "Asset Assignment", refills: "Stock Refill Log", inventory: "Master Inventory", meta: "Settings / Lists", requests: "Asset Requests", transfers: "Asset Transfers" };
 function updateDataLoadWarning() {
   const bar = document.getElementById("dataLoadWarningBar");
   if (!bar) return;
   if (dataLoadFailures.size) {
     bar.style.display = "flex";
     const names = [...dataLoadFailures].map(k => DATA_LOAD_LABELS[k] || k).join(", ");
-    bar.textContent = `⚠️ Couldn't load live data for: ${names} — related fields (like Team autofill) won't work correctly until this reconnects. Usually means a Firestore quota limit or connection issue.`;
+    bar.textContent = `⚠️ Couldn't load: ${names} — related fields (like Team autofill) won't work correctly. Usually a Firestore quota limit or connection issue. Try 🔄 Refresh Data below once it clears.`;
   } else {
     bar.style.display = "none";
   }
 }
 
-function attachRealtimeListener() {
-  const readyPromises = [];
-  // Master Inventory and the Stock Refill Log are Admin/Viewer-only pages — a
-  // Team Lead can never navigate to either (see TEAM_LEAD_PAGES) and nothing
-  // on their Dashboard or Asset Requests page reads DB.inventory/DB.refills,
-  // so there's no reason to pay for a live listener on either collection for
-  // that role. DB.inventory/DB.refills just stay empty arrays for them.
+// One-time fetch of every collection — this app deliberately does NOT use
+// Firestore realtime listeners (onSnapshot). Listeners re-broadcast every
+// single change to every other person who has the app open at that moment —
+// on Firestore's free Spark plan (50k reads/day, hard cap, no paid tier),
+// that fan-out is what actually burns through the quota, far more than
+// logins alone: one write with N people connected costs N reads, repeated
+// for every change anyone makes. Loading once (on sign-in, and again only
+// when the person explicitly hits 🔄 Refresh Data) makes reads scale with
+// how often people actually ask for fresh data, not with how many tabs
+// happen to be open in the background. The trade-off: other people's changes
+// don't appear until you refresh — no longer instant across devices/tabs.
+async function refreshAllData() {
+  // Master Inventory, the Stock Refill Log, and Asset Transfers are all
+  // Admin/Viewer-only pages — a Team Lead can never navigate to any of them
+  // (see TEAM_LEAD_PAGES) and nothing on their Dashboard or Asset Requests
+  // page reads DB.inventory/DB.refills/DB.transfers, so there's no reason to
+  // fetch any of them for that role. They just stay empty arrays.
   const colls = { employees: employeesColl, categories: categoriesColl, assignments: assignmentsColl };
-  if (!isTeamLead()) Object.assign(colls, { refills: refillsColl, inventory: inventoryColl });
-  Object.entries(colls).forEach(([key, fn]) => {
-    let gotFirst = false;
-    readyPromises.push(new Promise(resolve => {
-      unsubscribeFns.push(fn().onSnapshot(snap => {
-        const list = [];
-        snap.forEach(d => list.push(d.data()));
-        DB[key] = list;
-        dataLoadFailures.delete(key);
-        updateDataLoadWarning();
-        if (!gotFirst) { gotFirst = true; resolve(); }
-        else goto(currentPage); // keep every open browser (signed-in users) in sync live
-      }, err => {
-        console.error(`Firestore listener error (${key}):`, err);
-        dataLoadFailures.add(key);
-        updateDataLoadWarning();
-        if (!gotFirst) { gotFirst = true; resolve(); }
-      }));
-    }));
-  });
-  readyPromises.push(new Promise(resolve => {
-    let gotFirst = false;
-    unsubscribeFns.push(docRef().onSnapshot(snap => {
-      if (snap.exists) {
-        const data = snap.data();
-        if (data.lists) DB.lists = data.lists;
-        if (data.stockManual) DB.stockManual = data.stockManual;
-      }
-      dataLoadFailures.delete("meta");
-      updateDataLoadWarning();
-      if (!gotFirst) { gotFirst = true; resolve(); }
-      else goto(currentPage);
-    }, err => {
-      console.error("Firestore listener error (meta):", err);
-      dataLoadFailures.add("meta");
-      updateDataLoadWarning();
-      if (!gotFirst) { gotFirst = true; resolve(); }
-    }));
+  if (!isTeamLead()) Object.assign(colls, { refills: refillsColl, inventory: inventoryColl, transfers: transfersColl });
+
+  const tasks = Object.entries(colls).map(([key, fn]) =>
+    fn().get().then(snap => {
+      const list = [];
+      snap.forEach(d => list.push(d.data()));
+      DB[key] = list;
+      dataLoadFailures.delete(key);
+    }).catch(err => {
+      console.error(`Couldn't load ${key}:`, err);
+      dataLoadFailures.add(key);
+    })
+  );
+  tasks.push(docRef().get().then(snap => {
+    if (snap.exists) {
+      const data = snap.data();
+      if (data.lists) DB.lists = data.lists;
+      if (data.stockManual) DB.stockManual = data.stockManual;
+    }
+    dataLoadFailures.delete("meta");
+  }).catch(err => {
+    console.error("Couldn't load office settings:", err);
+    dataLoadFailures.add("meta");
   }));
   // Kept separate from the `colls` loop above — the query itself (all requests vs.
   // just this person's own) depends on role, see requestsQuery().
-  readyPromises.push(new Promise(resolve => {
-    let gotFirst = false;
-    unsubscribeFns.push(requestsQuery().onSnapshot(snap => {
-      const list = [];
-      snap.forEach(d => list.push(d.data()));
-      DB.requests = list;
-      dataLoadFailures.delete("requests");
-      updateDataLoadWarning();
-      if (!gotFirst) { gotFirst = true; resolve(); }
-      else goto(currentPage);
-    }, err => {
-      console.error("Firestore listener error (requests):", err);
-      dataLoadFailures.add("requests");
-      updateDataLoadWarning();
-      if (!gotFirst) { gotFirst = true; resolve(); }
-    }));
+  tasks.push(requestsQuery().get().then(snap => {
+    const list = [];
+    snap.forEach(d => list.push(d.data()));
+    DB.requests = list;
+    dataLoadFailures.delete("requests");
+  }).catch(err => {
+    console.error("Couldn't load asset requests:", err);
+    dataLoadFailures.add("requests");
   }));
-  return Promise.all(readyPromises);
+
+  await Promise.all(tasks);
+  updateDataLoadWarning();
+  updateRequestsNavBadge();
 }
-function detachRealtimeListener() {
-  unsubscribeFns.forEach(fn => fn());
-  unsubscribeFns = [];
+// Resets the "couldn't load" banner on sign-out/office-switch so a stale
+// warning from a previous session/office never lingers into the next one.
+function stopDataSync() {
   dataLoadFailures = new Set();
   updateDataLoadWarning();
 }
@@ -712,21 +687,41 @@ function nextAssetTagNo(categoryName) {
 }
 
 /* ---------------- Computed: Stock Summary ---------------- */
+// Total Stock = Stock Refill Log entries + units RECEIVED from another office,
+// PLUS Under Repair (still owned, just temporarily unusable), MINUS
+// Faulty/Lost/Scrap — those are gone for good (broken beyond repair, lost, or
+// disposed), so they no longer count as stock we actually have, not just
+// "stock we have but can't hand out."
+//
+// Assigned = assigned to an employee here + sent to another office. Once a
+// unit has left this office, whether to a person or another branch, it's
+// equally out of our available pool — one number, not two separate
+// deductions (assignedToEmployees / sentTotal are still broken out below for
+// the on-screen footnote). Reassigning a previously-returned unit never
+// double-counts: the old assignment record stays "Returned" permanently, only
+// the new one is ever "Assigned" — see openReassignForm().
 function computeStockSummary() {
   return DB.categories.map(cat => {
     const name = cat.name;
-    const total = DB.refills
+    const refillTotal = DB.refills
       .filter(r => r.category === name)
       .reduce((s, r) => s + (Number(r.quantity) || 0), 0);
-    const assigned = DB.assignments
+    const receivedTotal = (DB.transfers || [])
+      .filter(t => t.assetType === name && t.direction === "Received")
+      .reduce((s, t) => s + (Number(t.quantity) || 0), 0);
+    const sentTotal = (DB.transfers || [])
+      .filter(t => t.assetType === name && t.direction === "Sent")
+      .reduce((s, t) => s + (Number(t.quantity) || 0), 0);
+    const assignedToEmployees = DB.assignments
       .filter(a => a.assetName === name && a.status === "Assigned").length;
+    const assigned = assignedToEmployees + sentTotal;
     const manual = DB.stockManual[name] || { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
-    const available = total - assigned - manual.underRepair - manual.faulty - manual.lost - manual.scrap;
+    const total = refillTotal + receivedTotal - manual.faulty - manual.lost - manual.scrap;
+    const available = total - assigned - manual.underRepair;
     const low = available <= manual.threshold;
     return {
-      category: name, total, assigned,
-      underRepair: manual.underRepair, faulty: manual.faulty,
-      lost: manual.lost, scrap: manual.scrap,
+      category: name, total, assigned, assignedToEmployees, sentTotal, receivedTotal,
+      underRepair: manual.underRepair, faulty: manual.faulty, lost: manual.lost, scrap: manual.scrap,
       threshold: manual.threshold, available, low,
     };
   });
@@ -897,6 +892,7 @@ const PAGES = {
   empHistory: { title: "Employee History", render: renderEmployeeHistory },
   stock: { title: "Stock Summary", render: renderStock },
   refill: { title: "Stock Refill Log", render: renderRefill },
+  transfers: { title: "Asset Transfers", render: renderTransfers },
   categories: { title: "Asset Categories", render: renderCategories },
   activityLog: { title: "Activity Log", render: renderActivityLog },
   reports: { title: "Reports", render: renderReports },
@@ -937,9 +933,8 @@ function goto(page) {
 }
 // Unread-style count on the "Asset Requests" nav item — Submitted requests an
 // Admin hasn't looked at yet, same idea as a chat app's unread badge. Called
-// from goto() so it stays live on every page render AND every realtime data
-// update (attachRealtimeListener calls goto(currentPage) on change), without
-// needing its own separate listener.
+// from goto() (every page render) and from refreshAllData() (every fetch), so
+// it's as fresh as the data currently in memory — no separate listener needed.
 function updateRequestsNavBadge() {
   const btn = document.querySelector('.nav-item[data-page="assetRequests"]');
   if (!btn) return;
@@ -964,6 +959,24 @@ document.getElementById("nav").addEventListener("click", (e) => {
 });
 document.getElementById("hamburger").addEventListener("click", () => {
   document.getElementById("sidebar").classList.toggle("open");
+});
+document.getElementById("refreshDataBtn").addEventListener("click", async () => {
+  if (!fauth || !fauth.currentUser || !currentOfficeId) return;
+  const btn = document.getElementById("refreshDataBtn");
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = "🔄 Refreshing…";
+  try {
+    await refreshAllData();
+    goto(currentPage);
+    toast("Data refreshed");
+  } catch (err) {
+    console.error(err);
+    toast("Couldn't refresh — check your connection", "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 });
 document.getElementById("resetDataBtn").addEventListener("click", () => {
   // Wipes every record in the office — same "only a Super Admin can delete
@@ -1082,14 +1095,17 @@ function departmentAssignedBreakdown() {
 // Asset Lifecycle Flow: a small Sankey-style diagram — one "Total Stock" node on the
 // left flowing out to every status bucket on the right, with line thickness scaled to
 // each bucket's share. Shows at a glance where every unit in stock currently sits.
+// Only buckets that are still genuinely part of "Total Stock" belong here —
+// Faulty/Lost/Scrap are excluded from Total itself now (see
+// computeStockSummary: they're gone for good, not just unavailable), so
+// showing them as a slice "flowing out of" Total would be double-counting
+// something that was already subtracted before this diagram even runs.
+// Under Repair is still part of Total (temporarily unusable, not gone).
 function svgLifecycleFlow(s) {
   const nodesAll = [
     { label: "Assigned", value: s.assigned, color: "#8a5cf6" },
+    { label: "Under Repair", value: s.underRepair, color: "#f5a623" },
     { label: "Available", value: s.available, color: "#0fb9a7" },
-    { label: "Under Repair", value: s.underRepair, color: "#e2a13b" },
-    { label: "Faulty", value: s.faulty, color: "#e2513b" },
-    { label: "Lost", value: s.lost, color: "#7c8393" },
-    { label: "Scrap", value: s.scrap, color: "#4c5ef8" },
   ];
   const nodes = nodesAll.filter(n => n.value > 0);
   if (!s.total || !nodes.length) {
@@ -1351,7 +1367,7 @@ function renderTeamLeadDashboard() {
       </table></div>
     </div>
 
-    <p class="footer-note"><span class="live-dot" style="display:inline-block;vertical-align:middle;margin-right:6px;"></span>Speelfinance · Asset Management Tracker — live, synced in real time</p>
+    <p class="footer-note">Speelfinance · Asset Management Tracker — synced when you sign in or hit 🔄 Refresh Data</p>
   `;
   const newReqBtn = document.getElementById("tlNewReqBtn");
   if (newReqBtn) newReqBtn.onclick = () => openRequestForm();
@@ -1371,11 +1387,11 @@ function renderDashboard() {
   // works as a jumping-off point rather than a dead-end summary.
   const cards = [
     { label: "Asset Categories", value: s.categories, icon: "🏷️", cls: "icon-indigo", foot: "Tracked categories", goto: "categories" },
-    { label: "Total Inventory", value: s.total, icon: "📦", cls: "icon-blue", foot: "Units added via refills", goto: "stock" },
+    { label: "Total Inventory", value: s.total, icon: "📦", cls: "icon-blue", foot: "Refills + received, minus faulty/lost/scrap", goto: "stock" },
     { label: "Available", value: s.available, icon: "🟢", cls: "icon-teal", foot: "Ready to assign", goto: "stock" },
     { label: "Assigned", value: s.assigned, icon: "🔵", cls: "icon-purple", foot: "Currently in use", goto: "assignment", presetFilter: "Assigned" },
-    { label: "Under Repair", value: s.underRepair, icon: "🟡", cls: "icon-amber", foot: "Being serviced", goto: "stock" },
-    { label: "Faulty", value: s.faulty, icon: "🔴", cls: "icon-red", foot: "Needs attention", goto: "stock" },
+    { label: "Under Repair", value: s.underRepair, icon: "🔧", cls: "icon-amber", foot: "Being fixed", goto: "stock" },
+    { label: "Faulty", value: s.faulty, icon: "🔴", cls: "icon-red", foot: "Not working", goto: "stock" },
     { label: "Lost", value: s.lost, icon: "✖", cls: "icon-grey", foot: "Unaccounted", goto: "stock" },
     { label: "Scrap", value: s.scrap, icon: "⚫", cls: "icon-grey", foot: "Decommissioned", goto: "stock" },
     // Kept to just these two so the dashboard doesn't get overloaded (§21) —
@@ -1505,7 +1521,7 @@ function renderDashboard() {
     </div>
     </div>
 
-    <p class="footer-note"><span class="live-dot" style="display:inline-block;vertical-align:middle;margin-right:6px;"></span>Speelfinance · Asset Management Tracker — live, synced in real time</p>
+    <p class="footer-note">Speelfinance · Asset Management Tracker — synced when you sign in or hit 🔄 Refresh Data</p>
   `;
 }
 
@@ -3506,8 +3522,9 @@ function findAssignmentsFromRequest(rec) {
 // Deleting a request cascades to every Asset Assignment record it actually
 // produced — since those only exist because of this request, leaving them
 // behind would be a real assignment with no request to explain where it came
-// from. The Team Lead's own dashboard reflects the deletion automatically
-// (it reads DB.requests, kept live by the existing realtime listener).
+// from. The requesting Team Lead's own dashboard reflects the deletion the
+// next time they load the app or hit Refresh Data (DB.requests is no longer
+// kept live in the background — see refreshAllData()).
 function deleteRequest(uidVal) {
   if (!requireSuperAdminOrWarn()) return;
   const rec = (DB.requests || []).find(r => r.uid === uidVal);
@@ -4325,6 +4342,15 @@ function openEmpHistoryModal(empUid) {
 /* =========================================================
    STOCK SUMMARY
    ========================================================= */
+// Spells out exactly which numbers produced a negative Available, right
+// where you're looking — instead of having to reconstruct the arithmetic by
+// hand (or ask someone) every time a category goes negative. Only shown for
+// negative rows; a healthy positive number doesn't need explaining.
+function stockShortfallBreakdown(r) {
+  if (r.available >= 0) return "";
+  return `Total ${r.total} − Assigned ${r.assigned} − Under Repair ${r.underRepair} = ${r.available}`;
+}
+
 function renderStock() {
   const content = document.getElementById("content");
   const rows = computeStockSummary();
@@ -4333,7 +4359,8 @@ function renderStock() {
     ${viewerNotice()}
     <div class="card">
       <div class="card-header">
-        <div><h2>Stock Summary</h2><div class="sub">Auto-calculated from Asset Assignment + Stock Refill Log. Repair / Faulty / Lost / Scrap and Threshold are editable${admin ? "" : " (Admin only)"}.</div></div>
+        <div><h2>Stock Summary</h2><div class="sub">Auto-calculated from Asset Assignment + Stock Refill Log + Asset Transfers. Repair / Faulty / Lost / Scrap and Threshold are editable${admin ? "" : " (Admin only)"}.</div></div>
+        <button class="btn btn-secondary btn-sm" onclick="goto('transfers')">Asset Transfers →</button>
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
@@ -4344,16 +4371,17 @@ function renderStock() {
           ${rows.map(r => `
             <tr>
               <td><strong>${escapeHtml(r.category)}</strong></td>
-              <td>${r.total}</td>
-              <td>${r.assigned}</td>
+              <td>${r.total}${r.receivedTotal ? `<div class="muted" style="font-size:11px;">incl. ${r.receivedTotal} received</div>` : ""}</td>
+              <td>${r.assigned}${r.sentTotal ? `<div class="muted" style="font-size:11px;">${r.assignedToEmployees} to employees + ${r.sentTotal} sent to other offices</div>` : ""}</td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="faulty" value="${r.faulty}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="lost" value="${r.lost}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="scrap" value="${r.scrap}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><strong style="color:${r.available <= 0 ? 'var(--red)' : 'var(--text)'}">${r.available}</strong></td>
+              <td><strong style="${r.available < 0 ? "color:var(--red)" : ""}">${r.available}</strong></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="threshold" value="${r.threshold}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td>${statusBadge(r.low ? "⚠ Low Stock" : "OK")}</td>
             </tr>
+            ${r.available < 0 ? `<tr><td></td><td colspan="9" class="muted" style="font-size:11.5px;color:var(--red);padding-top:0;">${stockShortfallBreakdown(r)}</td></tr>` : ""}
           `).join("")}
         </tbody>
       </table></div>
@@ -4522,6 +4550,249 @@ function deleteRefill(uidVal) {
       DB.refills = DB.refills.filter(r => r.uid !== uidVal);
       refillSelected.delete(uidVal);
       deleteRecord("refills", uidVal); logAction("Deleted refill entry", rec ? `-${rec.quantity} ${rec.category}` : uidVal); closeModal(); toast("Refill entry deleted"); paintRefillTable();
+    };
+  });
+}
+
+/* =========================================================
+   ASSET TRANSFERS — inter-office Sent/Received log
+   Each office logs its own side independently (no cross-office write —
+   offices are completely separate in this app, same as everywhere else).
+   Sending Mount Road → Supreme means: log a "Sent" entry while viewing
+   Mount Road, and separately log a "Received" entry while viewing Supreme.
+   Folded into Stock Summary automatically — see computeStockSummary().
+   ========================================================= */
+let transferSelected = new Set();
+let transferFilter = { direction: "" };
+
+function transferDirectionBadge(direction) {
+  const cls = direction === "Received" ? "badge-green" : "badge-amber";
+  const icon = direction === "Received" ? "⬇️" : "⬆️";
+  return `<span class="badge ${cls}">${icon} ${escapeHtml(direction)}</span>`;
+}
+
+function renderTransfers() {
+  transferSelected = new Set();
+  const content = document.getElementById("content");
+  const all = [...DB.transfers].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const sentTotal = all.filter(t => t.direction === "Sent").reduce((s, t) => s + (Number(t.quantity) || 0), 0);
+  const receivedTotal = all.filter(t => t.direction === "Received").reduce((s, t) => s + (Number(t.quantity) || 0), 0);
+  const officesInvolved = new Set(all.map(t => (t.otherOffice || "").trim().toLowerCase()).filter(Boolean)).size;
+
+  content.innerHTML = `
+    ${viewerNotice()}
+    <div class="stat-grid" style="margin-bottom:18px">
+      ${[
+        { icon: "🔀", cls: "icon-blue", value: all.length, label: "Total Transfers" },
+        { icon: "⬆️", cls: "icon-amber", value: sentTotal, label: "Units Sent Out" },
+        { icon: "⬇️", cls: "icon-teal", value: receivedTotal, label: "Units Received" },
+        { icon: "🏢", cls: "icon-purple", value: officesInvolved, label: "Offices Involved" },
+      ].map(c => `
+        <div class="stat-card">
+          <div class="stat-top"><div class="stat-icon ${c.cls}">${c.icon}</div><div class="stat-label">${c.label}</div></div>
+          <div class="stat-value">${c.value}</div>
+        </div>
+      `).join("")}
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div><h2>Asset Transfers</h2><div class="sub" id="transferCountSub">${all.length} transfer${all.length === 1 ? "" : "s"} — Sent updates leave the current office, Received brings stock in</div></div>
+        ${isAdmin() ? `<button class="btn btn-primary" id="addTransferBtn">+ Log Transfer</button>` : ""}
+      </div>
+      <div class="toolbar">
+        <select class="filter-select" id="transferDirFilter">
+          <option value="">All directions</option>
+          <option value="Sent" ${transferFilter.direction === "Sent" ? "selected" : ""}>Sent</option>
+          <option value="Received" ${transferFilter.direction === "Received" ? "selected" : ""}>Received</option>
+        </select>
+        <div id="transferBulkBar" style="margin-left:auto"></div>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          ${isAdmin() ? `<th class="ck-col"><input type="checkbox" class="select-ck" id="transferSelectAll"></th>` : ""}
+          <th>Date</th><th>Direction</th><th>Office</th><th>Asset</th><th>Qty</th><th>Tags / Serials</th><th>Handled By</th><th>Remarks</th>${isAdmin() ? "<th></th>" : ""}
+        </tr></thead>
+        <tbody id="transferTbody"></tbody>
+      </table></div>
+    </div>
+  `;
+  if (isAdmin()) document.getElementById("addTransferBtn").onclick = () => openTransferForm();
+  document.getElementById("transferDirFilter").onchange = (e) => { transferFilter.direction = e.target.value; paintTransferTable(); };
+  paintTransferTable();
+}
+
+function getFilteredTransfers() {
+  let rows = [...DB.transfers].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  if (transferFilter.direction) rows = rows.filter(t => t.direction === transferFilter.direction);
+  return rows;
+}
+
+function paintTransferTable() {
+  const tbody = document.getElementById("transferTbody");
+  if (!tbody) return;
+  const rows = getFilteredTransfers();
+  const admin = isAdmin();
+
+  tbody.innerHTML = rows.length ? rows.map(t => `
+    <tr>
+      ${admin ? `<td class="ck-col"><input type="checkbox" class="select-ck row-ck" data-uid="${t.uid}" ${transferSelected.has(t.uid) ? "checked" : ""}></td>` : ""}
+      <td>${fmtDate(t.date)}</td>
+      <td>${transferDirectionBadge(t.direction)}</td>
+      <td>${escapeHtml(t.otherOffice || "—")}</td>
+      <td>${escapeHtml(t.assetType || "—")}</td>
+      <td><strong>${t.direction === "Received" ? "+" : "−"}${t.quantity}</strong></td>
+      <td>${escapeHtml(t.assetTags || "—")}</td>
+      <td>${escapeHtml(t.handledBy || "—")}</td>
+      <td>${escapeHtml(t.remarks || "—")}</td>
+      ${admin ? `<td>
+        <div class="row-actions">
+          ${isSuperAdmin() ? `<button class="btn btn-danger btn-sm btn-icon" title="Delete (Super Admin only)" onclick="deleteTransfer('${t.uid}')">🗑️</button>` : `<span class="muted">—</span>`}
+        </div>
+      </td>` : ""}
+    </tr>
+  `).join("") : `<tr class="empty-row"><td colspan="${admin ? 9 : 8}">No transfers logged yet — click "+ Log Transfer" to record assets sent to or received from another office.</td></tr>`;
+
+  document.getElementById("transferBulkBar").innerHTML = bulkToolbarHtml(transferSelected.size, rows.length);
+  wireTransferBulk(rows);
+}
+
+function wireTransferBulk(rows) {
+  if (!isAdmin()) return;
+  const selectAll = document.getElementById("transferSelectAll");
+  if (selectAll) {
+    selectAll.checked = rows.length > 0 && rows.every(r => transferSelected.has(r.uid));
+    selectAll.onchange = (e) => {
+      rows.forEach(r => e.target.checked ? transferSelected.add(r.uid) : transferSelected.delete(r.uid));
+      paintTransferTable();
+    };
+  }
+  document.querySelectorAll("#transferTbody .row-ck").forEach(ck => {
+    ck.onchange = () => {
+      ck.checked ? transferSelected.add(ck.dataset.uid) : transferSelected.delete(ck.dataset.uid);
+      document.getElementById("transferBulkBar").innerHTML = bulkToolbarHtml(transferSelected.size, rows.length);
+      wireTransferBulk(rows);
+    };
+  });
+  const delSel = document.getElementById("deleteSelectedBtn");
+  if (delSel) delSel.onclick = () => {
+    if (!requireSuperAdminOrWarn() || transferSelected.size === 0) return;
+    confirmBulkDelete(transferSelected.size, "transfer entries", () => {
+      const idsToDelete = [...transferSelected];
+      const n = idsToDelete.length;
+      DB.transfers = DB.transfers.filter(t => !transferSelected.has(t.uid));
+      transferSelected = new Set();
+      batchWrite(idsToDelete.map(u => ({ kind: "transfers", type: "delete", uid: u })));
+      logAction("Bulk deleted transfer entries", `Deleted ${n} selected entr${n === 1 ? "y" : "ies"}`); toast("Selected entries deleted"); paintTransferTable();
+    });
+  };
+  const delAll = document.getElementById("deleteAllBtn");
+  if (delAll) delAll.onclick = () => {
+    if (!requireSuperAdminOrWarn()) return;
+    confirmBulkDelete(rows.length, "transfer entries", () => {
+      const idsToDelete = DB.transfers.map(t => t.uid);
+      const n = idsToDelete.length;
+      DB.transfers = [];
+      transferSelected = new Set();
+      batchWrite(idsToDelete.map(u => ({ kind: "transfers", type: "delete", uid: u })));
+      logAction("Bulk deleted transfer entries", `Deleted all ${n} transfer log entries`); toast("All transfer entries deleted"); paintTransferTable();
+    });
+  };
+}
+
+function openTransferForm() {
+  if (!requireAdminOrWarn()) return;
+  const cats = DB.categories.map(c => c.name);
+  const otherOffices = OFFICES.filter(o => o.id !== currentOfficeId);
+  openModal("Log Asset Transfer", `
+    <div class="field-row">
+      <div class="field"><label class="required">Direction</label>
+        <select id="f_direction">
+          <option value="Sent">Sent — leaving this office</option>
+          <option value="Received">Received — arriving at this office</option>
+        </select>
+      </div>
+      <div class="field"><label>Date</label><input type="date" id="f_date" value="${todayISO()}"></div>
+    </div>
+    <div class="field">
+      <label class="required" id="f_officeLabel">Sent To</label>
+      <input type="text" id="f_office" list="transferOfficeList" placeholder="Office name">
+      <datalist id="transferOfficeList">${otherOffices.map(o => `<option value="${escapeHtml(o.name)}">`).join("")}</datalist>
+    </div>
+    <div class="field-row">
+      <div class="field"><label class="required">Asset Type <span class="muted" style="font-weight:500;">(must be an existing category — Stock Summary is calculated per category)</span></label>
+        <select id="f_assetType">
+          <option value="">—</option>
+          ${cats.map(c => `<option>${escapeHtml(c)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="field"><label class="required">Quantity</label><input type="number" min="1" id="f_qty" value="1"></div>
+    </div>
+    <div class="field"><label>Asset Tags / Serials <span class="muted" style="font-weight:500;">(optional — comma-separated if tracking specific units)</span></label><input type="text" id="f_tags" placeholder="e.g. PHN-0012, PHN-0013"></div>
+    <div class="field-row">
+      <div class="field"><label>Handled By</label><input type="text" id="f_handledBy" value="${escapeHtml((fauth.currentUser || {}).email || "")}"></div>
+      <div class="field"><label>Remarks</label><input type="text" id="f_remarks"></div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">Log Transfer</button>
+    </div>
+  `, () => {
+    document.getElementById("modal").classList.add("modal-wide");
+    const dirSel = document.getElementById("f_direction");
+    const officeLabel = document.getElementById("f_officeLabel");
+    const syncDirection = () => { officeLabel.textContent = dirSel.value === "Received" ? "Received From" : "Sent To"; };
+    dirSel.addEventListener("change", syncDirection);
+    syncDirection();
+
+    const assetSel = document.getElementById("f_assetType");
+
+    document.getElementById("cancelBtn").onclick = closeModal;
+    document.getElementById("saveBtn").onclick = () => {
+      const direction = dirSel.value;
+      const otherOffice = document.getElementById("f_office").value.trim();
+      const assetType = assetSel.value;
+      const qty = Number(document.getElementById("f_qty").value);
+      if (!otherOffice) { toast(direction === "Received" ? "Enter which office it came from" : "Enter which office it's going to", "err"); return; }
+      if (!assetType) { toast("Select an asset type", "err"); return; }
+      if (!qty || qty <= 0) { toast("Enter a valid quantity", "err"); return; }
+      const newRec = {
+        uid: uid(), id: DB.transfers.length + 1,
+        date: document.getElementById("f_date").value || todayISO(),
+        direction, otherOffice,
+        assetType,
+        quantity: qty,
+        assetTags: document.getElementById("f_tags").value.trim(),
+        handledBy: document.getElementById("f_handledBy").value.trim(),
+        remarks: document.getElementById("f_remarks").value.trim(),
+      };
+      DB.transfers.push(newRec);
+      saveRecord("transfers", newRec);
+      logAction(`Logged asset transfer (${direction})`, `${direction === "Received" ? "+" : "−"}${qty} ${assetType} ${direction === "Received" ? "from" : "to"} ${otherOffice}`);
+      closeModal();
+      toast("Transfer logged");
+      paintTransferTable();
+      if (currentPage === "stock") renderStock();
+      if (currentPage === "dashboard") renderDashboard();
+    };
+  });
+}
+
+function deleteTransfer(uidVal) {
+  if (!requireSuperAdminOrWarn()) return;
+  const rec = DB.transfers.find(t => t.uid === uidVal);
+  openModal("Delete transfer entry?", `
+    <p class="muted" style="margin-top:0">This will change Total Stock / Available for that category on Stock Summary.</p>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelDel">Cancel</button>
+      <button class="btn btn-danger" id="confirmDel">Delete</button>
+    </div>`, () => {
+    document.getElementById("cancelDel").onclick = closeModal;
+    document.getElementById("confirmDel").onclick = () => {
+      DB.transfers = DB.transfers.filter(t => t.uid !== uidVal);
+      transferSelected.delete(uidVal);
+      deleteRecord("transfers", uidVal);
+      logAction("Deleted transfer entry", rec ? `${rec.direction} ${rec.quantity} ${rec.assetType} ${rec.direction === "Received" ? "from" : "to"} ${rec.otherOffice}` : uidVal);
+      closeModal(); toast("Transfer entry deleted"); paintTransferTable();
     };
   });
 }
@@ -4790,6 +5061,7 @@ function reportRows(kind) {
     case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
     case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
     case "refill": return DB.refills.map(r => ({ "Date": r.date || "", "Category": r.category || "", "Quantity Added": r.quantity || 0, "Added By": r.addedBy || "", "Source / Remarks": r.source || "" }));
+    case "transfers": return DB.transfers.map(t => ({ "Date": t.date || "", "Direction": t.direction || "", "Other Office": t.otherOffice || "", "Asset Type": t.assetType || "", "Quantity": t.quantity || 0, "Tags / Serials": t.assetTags || "", "Handled By": t.handledBy || "", "Remarks": t.remarks || "" }));
     case "categories": return DB.categories.map(c => ({ "Category": c.name || "", "Notes": c.notes || "" }));
     case "activityLog": return activityLogCache.map(l => ({ "When": fmtDateTime(l.ts), "User": l.email || "", "Action": l.action || "", "Details": l.details || "" }));
     case "requests": return (DB.requests || []).map(r => ({
@@ -4814,6 +5086,7 @@ function renderReports() {
     { kind: "inventory", label: "Master Inventory", sheet: "Master Inventory", icon: "💻" },
     { kind: "stock", label: "Stock Summary", sheet: "Stock Summary", icon: "📦" },
     { kind: "refill", label: "Stock Refill Log", sheet: "Stock Refill Log", icon: "➕" },
+    { kind: "transfers", label: "Asset Transfers", sheet: "Asset Transfers", icon: "🔀" },
     { kind: "categories", label: "Asset Categories", sheet: "Asset Categories", icon: "🏷️" },
   ];
 
@@ -4861,7 +5134,7 @@ function renderReports() {
       info: OFFICES.find(o => o.id === currentOfficeId) || { id: currentOfficeId },
       lists: DB.lists, stockManual: DB.stockManual,
       employees: DB.employees, assignments: DB.assignments, inventory: DB.inventory,
-      refills: DB.refills, categories: DB.categories, logs: activityLogCache,
+      refills: DB.refills, categories: DB.categories, transfers: DB.transfers, logs: activityLogCache,
     };
     const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -5318,8 +5591,7 @@ async function openOffice(officeId) {
   showLoadingScreen();
   try {
     await fetchOfficeRole();
-    await loadInitialData(false);
-    await attachRealtimeListener();
+    await loadInitialData();
     dataBootstrapped = true;
   } catch (err) {
     console.error(err);
@@ -5342,7 +5614,7 @@ async function openOffice(officeId) {
   goto(currentPage);
 }
 async function showOfficeSelectScreen() {
-  detachRealtimeListener();
+  stopDataSync();
   DB = null;
   dataBootstrapped = false;
   currentOfficeId = null;
@@ -5505,7 +5777,7 @@ async function init() {
       currentOfficeRole = null;
       officeRoleMap = {};
       paintRoleUI();
-      detachRealtimeListener();
+      stopDataSync();
       DB = null;
       dataBootstrapped = false;
       currentOfficeId = null;
@@ -5546,8 +5818,7 @@ async function init() {
     if (!dataBootstrapped) {
       showLoadingScreen();
       try {
-        await loadInitialData(false);
-        await attachRealtimeListener();
+        await loadInitialData();
         dataBootstrapped = true;
       } catch (err) {
         console.error(err);

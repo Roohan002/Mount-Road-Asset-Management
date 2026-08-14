@@ -90,6 +90,14 @@ service cloud.firestore {
         allow create, update: if canEditOffice(officeId);
         allow delete: if isSuperAdmin();
       }
+      // Inter-office Asset Transfers (Sent to / Received from another office) —
+      // each office logs its own side independently; there's no cross-office
+      // write here, same as every other collection in this app.
+      match /transfers/{recordId} {
+        allow read: if canViewOffice(officeId);
+        allow create, update: if canEditOffice(officeId);
+        allow delete: if isSuperAdmin();
+      }
       match /categories/{recordId} {
         allow read: if canViewOffice(officeId);
         allow create, update: if canEditOffice(officeId);

@@ -54,6 +54,9 @@
         <button class="nav-item" data-page="refill">
           <span class="nav-icon">➕</span><span>Stock Refill Log</span>
         </button>
+        <button class="nav-item" data-page="transfers">
+          <span class="nav-icon">🔀</span><span>Asset Transfers</span>
+        </button>
         <button class="nav-item" data-page="categories">
           <span class="nav-icon">🏷️</span><span>Asset Categories</span>
         </button>
@@ -72,6 +75,7 @@
       </nav>
 
       <div class="sidebar-footer">
+        <button class="btn-ghost btn-refresh" id="refreshDataBtn" title="Pull the latest data from the server — other people's changes only show up here, not automatically">🔄 Refresh Data</button>
         <div class="office-box" id="officeBox">
           <div class="role-row">
             <span class="role-label">Office</span>

@@ -109,6 +109,12 @@ body{
   font-size:12.5px; cursor:pointer; transition: background .15s;
 }
 .btn-ghost:hover{ background: rgba(255,255,255,.14); color:#fff; }
+.btn-refresh{
+  margin-bottom:14px; font-weight:700;
+  background: rgba(76,94,248,.16); color:#c9cfff; border-color: rgba(76,94,248,.35);
+}
+.btn-refresh:hover{ background: rgba(76,94,248,.28); color:#fff; }
+.btn-refresh:disabled{ opacity:.6; cursor:default; }
 
 .main{ flex:1; min-width:0; display:flex; flex-direction:column; }
 .topbar{
@@ -124,7 +130,6 @@ body{
 }
 .page-title{ font-size: 18px; font-weight:700; margin:0; letter-spacing:-.01em; }
 .topbar-right{ margin-left:auto; display:flex; align-items:center; gap:8px; color: var(--text-muted); font-size:12.5px; }
-.live-dot{ width:8px; height:8px; border-radius:50%; background: var(--teal); box-shadow: 0 0 0 3px var(--teal-light); }
 
 .content{ padding: 24px 28px 60px; max-width: 1400px; width:100%; margin: 0 auto; }
 
