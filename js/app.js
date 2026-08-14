@@ -700,6 +700,13 @@ function nextAssetTagNo(categoryName) {
 // the on-screen footnote). Reassigning a previously-returned unit never
 // double-counts: the old assignment record stays "Returned" permanently, only
 // the new one is ever "Assigned" — see openReassignForm().
+//
+// Custody holdings (bulk lots handed to a Team Lead/Manager to redistribute —
+// see openAssignForm's "📦 Bulk stock lot" checkbox) are also out of the
+// available pool, but they're NOT a personal assignment either, so they get
+// their own bucket instead of being folded into "Assigned" — see
+// openRedistributeForm() for how a unit moves from here into a real
+// personal assignment once the custodian actually hands it to someone.
 function computeStockSummary() {
   return DB.categories.map(cat => {
     const name = cat.name;
@@ -713,14 +720,16 @@ function computeStockSummary() {
       .filter(t => t.assetType === name && t.direction === "Sent")
       .reduce((s, t) => s + (Number(t.quantity) || 0), 0);
     const assignedToEmployees = DB.assignments
-      .filter(a => a.assetName === name && a.status === "Assigned").length;
+      .filter(a => a.assetName === name && a.status === "Assigned" && !a.custodyHolder).length;
+    const custodyHeld = DB.assignments
+      .filter(a => a.assetName === name && a.status === "Assigned" && a.custodyHolder).length;
     const assigned = assignedToEmployees + sentTotal;
     const manual = DB.stockManual[name] || { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
     const total = refillTotal + receivedTotal - manual.faulty - manual.lost - manual.scrap;
-    const available = total - assigned - manual.underRepair;
+    const available = total - assigned - manual.underRepair - custodyHeld;
     const low = available <= manual.threshold;
     return {
-      category: name, total, assigned, assignedToEmployees, sentTotal, receivedTotal,
+      category: name, total, assigned, assignedToEmployees, sentTotal, receivedTotal, custodyHeld,
       underRepair: manual.underRepair, faulty: manual.faulty, lost: manual.lost, scrap: manual.scrap,
       threshold: manual.threshold, available, low,
     };
@@ -734,6 +743,7 @@ function computeDashboard() {
     total: rows.reduce((s, r) => s + r.total, 0),
     available: rows.reduce((s, r) => s + r.available, 0),
     assigned: rows.reduce((s, r) => s + r.assigned, 0),
+    custodyHeld: rows.reduce((s, r) => s + r.custodyHeld, 0),
     underRepair: rows.reduce((s, r) => s + r.underRepair, 0),
     faulty: rows.reduce((s, r) => s + r.faulty, 0),
     lost: rows.reduce((s, r) => s + r.lost, 0),
@@ -1104,6 +1114,7 @@ function departmentAssignedBreakdown() {
 function svgLifecycleFlow(s) {
   const nodesAll = [
     { label: "Assigned", value: s.assigned, color: "#8a5cf6" },
+    { label: "With Custodians", value: s.custodyHeld, color: "#3b82f6" },
     { label: "Under Repair", value: s.underRepair, color: "#f5a623" },
     { label: "Available", value: s.available, color: "#0fb9a7" },
   ];
@@ -1390,6 +1401,7 @@ function renderDashboard() {
     { label: "Total Inventory", value: s.total, icon: "📦", cls: "icon-blue", foot: "Refills + received, minus faulty/lost/scrap", goto: "stock" },
     { label: "Available", value: s.available, icon: "🟢", cls: "icon-teal", foot: "Ready to assign", goto: "stock" },
     { label: "Assigned", value: s.assigned, icon: "🔵", cls: "icon-purple", foot: "Currently in use", goto: "assignment", presetFilter: "Assigned" },
+    { label: "With Custodians", value: s.custodyHeld, icon: "📦", cls: "icon-blue", foot: "Bulk stock held by Team Leads/Managers", goto: "assignment", presetCustody: "custody" },
     { label: "Under Repair", value: s.underRepair, icon: "🔧", cls: "icon-amber", foot: "Being fixed", goto: "stock" },
     { label: "Faulty", value: s.faulty, icon: "🔴", cls: "icon-red", foot: "Not working", goto: "stock" },
     { label: "Lost", value: s.lost, icon: "✖", cls: "icon-grey", foot: "Unaccounted", goto: "stock" },
@@ -1425,7 +1437,7 @@ function renderDashboard() {
       ${cards.map(c => `
         <div class="stat-card" role="button" tabindex="0" title="View in ${c.goto === "assignment" ? "Asset Assignment" : c.goto === "categories" ? "Asset Categories" : c.goto === "assetRequests" ? "Asset Requests" : "Stock Summary"}"
           style="cursor:pointer"
-          onclick="${c.presetFilter ? `assignFilter.status='${c.presetFilter}';` : ""}goto('${c.goto}')"
+          onclick="${c.presetFilter ? `assignFilter.status='${c.presetFilter}';` : ""}${c.presetCustody ? `assignFilter.custody='${c.presetCustody}';` : ""}goto('${c.goto}')"
           onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}">
           <div class="stat-top">
             <div class="stat-icon ${c.cls}">${c.icon}</div>
@@ -1528,7 +1540,7 @@ function renderDashboard() {
 /* =========================================================
    ASSET ASSIGNMENT
    ========================================================= */
-let assignFilter = { q: "", status: "", dept: "" };
+let assignFilter = { q: "", status: "", dept: "", custody: "" };
 let assignSelected = new Set();
 
 function renderAssignment() {
@@ -1552,6 +1564,11 @@ function renderAssignment() {
           <option value="">All departments</option>
           ${depts.map(d => `<option value="${escapeHtml(d)}" ${assignFilter.dept === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}
         </select>
+        <select class="filter-select" id="assignCustodyFilter" title="Bulk stock held by a Team Lead/Manager, not yet given to an end user">
+          <option value="">Personal + Custody</option>
+          <option value="custody" ${assignFilter.custody === "custody" ? "selected" : ""}>📦 Custody holdings only</option>
+          <option value="personal" ${assignFilter.custody === "personal" ? "selected" : ""}>Personal assignments only</option>
+        </select>
         <button class="btn btn-secondary btn-sm" id="assignClearFiltersBtn" style="display:none">Clear filters</button>
         <div id="assignBulkBar"></div>
       </div>
@@ -1570,11 +1587,13 @@ function renderAssignment() {
   document.getElementById("assignSearch").oninput = (e) => { assignFilter.q = e.target.value.toLowerCase(); paintAssignTable(); };
   document.getElementById("assignStatusFilter").onchange = (e) => { assignFilter.status = e.target.value; paintAssignTable(); };
   document.getElementById("assignDeptFilter").onchange = (e) => { assignFilter.dept = e.target.value; paintAssignTable(); };
+  document.getElementById("assignCustodyFilter").onchange = (e) => { assignFilter.custody = e.target.value; paintAssignTable(); };
   document.getElementById("assignClearFiltersBtn").onclick = () => {
-    assignFilter = { q: "", status: "", dept: "" };
+    assignFilter = { q: "", status: "", dept: "", custody: "" };
     document.getElementById("assignSearch").value = "";
     document.getElementById("assignStatusFilter").value = "";
     document.getElementById("assignDeptFilter").value = "";
+    document.getElementById("assignCustodyFilter").value = "";
     paintAssignTable();
   };
 
@@ -1588,6 +1607,8 @@ function getFilteredAssignments() {
   }
   if (assignFilter.status) rows = rows.filter(a => a.status === assignFilter.status);
   if (assignFilter.dept) rows = rows.filter(a => a.department === assignFilter.dept);
+  if (assignFilter.custody === "custody") rows = rows.filter(a => a.custodyHolder);
+  if (assignFilter.custody === "personal") rows = rows.filter(a => !a.custodyHolder);
   return rows;
 }
 
@@ -1596,7 +1617,7 @@ function paintAssignTable() {
   if (!tbody) return;
   const rows = getFilteredAssignments();
   const admin = isAdmin();
-  const filterActive = !!(assignFilter.q || assignFilter.status || assignFilter.dept);
+  const filterActive = !!(assignFilter.q || assignFilter.status || assignFilter.dept || assignFilter.custody);
 
   const countSub = document.getElementById("assignCountSub");
   if (countSub) {
@@ -1613,7 +1634,7 @@ function paintAssignTable() {
       <td>${fmtAssignDateCell(a)}</td>
       <td>${escapeHtml(a.assetName)}${a.sourceRequestId ? `<div class="muted" style="font-size:11px;margin-top:2px;">${admin ? `<a href="#" onclick="event.preventDefault();openRequestByRequestId('${escapeHtml(a.sourceRequestId)}')" style="color:var(--primary);font-weight:600;">📋 from ${escapeHtml(a.sourceRequestId)}</a>` : `📋 from ${escapeHtml(a.sourceRequestId)}`}</div>` : ""}${a.reassignedFromEmployee ? `<div class="muted" style="font-size:11px;margin-top:2px;">🔁 reassigned from ${escapeHtml(a.reassignedFromEmployee)}</div>` : ""}</td>
       <td>${a.assetTagNo ? `<span class="badge badge-grey">${escapeHtml(a.assetTagNo)}</span>` : "—"}</td>
-      <td>${escapeHtml(a.employeeName)}</td>
+      <td>${escapeHtml(a.employeeName)}${a.custodyHolder ? `<div style="margin-top:2px;"><span class="badge badge-blue" title="Bulk stock held for later redistribution to their team">📦 Custody</span></div>` : ""}</td>
       <td>${escapeHtml(a.department || "—")}</td>
       <td>${escapeHtml(a.assignedBy || "—")}</td>
       <td>${a.returnDate ? fmtDate(a.returnDate) : "—"}${a.returnCondition ? `<br>${conditionBadge(a.returnCondition)}` : ""}</td>
@@ -1623,6 +1644,7 @@ function paintAssignTable() {
         <div class="row-actions">
           <button class="btn btn-secondary btn-sm btn-icon" title="Handover Slip (PDF)" aria-label="Generate handover slip for ${escapeHtml(a.employeeName)}" onclick="openHandoverSlip('${a.uid}')">📄</button>
           ${admin ? `
+          ${a.status === "Assigned" && a.custodyHolder ? `<button class="btn btn-primary btn-sm btn-icon" title="Redistribute to a team member" aria-label="Redistribute ${escapeHtml(a.assetName)} from ${escapeHtml(a.employeeName)}" onclick="openRedistributeForm('${a.uid}')">↪️</button>` : ""}
           ${a.status !== "Returned" ? `<button class="btn btn-secondary btn-sm btn-icon" title="Return this asset" aria-label="Return asset for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}', true)">↩️</button>` : ""}
           ${a.status === "Returned" && (a.returnOutcome || "Available") === "Available" ? `<button class="btn btn-primary btn-sm btn-icon" title="Reassign to someone else" aria-label="Reassign ${escapeHtml(a.assetName)} to a different employee" onclick="openReassignForm('${a.uid}')">🔁</button>` : ""}
           <button class="btn btn-secondary btn-sm btn-icon" title="Edit" aria-label="Edit assignment for ${escapeHtml(a.employeeName)}" onclick="openAssignForm('${a.uid}')">✏️</button>
@@ -1957,6 +1979,11 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
       </div>
       <div class="field"><label>Employee ID</label><input type="text" id="f_empid" value="${escapeHtml(editing ? editing.employeeId || "" : (requestPrefill ? requestPrefill.employeeCode || "" : ""))}"></div>
     </div>
+    ${!editing && !quickReturn ? `
+    <label class="checkbox-row" style="display:flex;align-items:center;gap:8px;margin:2px 0 14px;font-size:13px;color:var(--text-faint);">
+      <input type="checkbox" id="f_custody">
+      📦 Bulk stock lot held by the person above (Team Lead/Manager) to redistribute to their team later — not a personal assignment
+    </label>` : ""}
     <div class="field-row">
       <div class="field"><label>Department</label>
         <select id="f_dept"><option value="">—</option>${depts.map(d => `<option ${(editing ? editing.department === d : (requestPrefill && requestPrefill.department === d)) ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}</select>
@@ -2092,6 +2119,13 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
           return { assetName: cb.value, qty };
         });
 
+        // Bulk stock lot for a Team Lead/Manager to hold and redistribute later —
+        // still an "Assigned" record (it's out of Available either way), but
+        // flagged so Stock Summary can show it as "With Custodians" instead of
+        // lumping it in with real personal assignments. See openRedistributeForm().
+        const custodyChk = document.getElementById("f_custody");
+        const isCustody = !!(custodyChk && custodyChk.checked);
+
         const summaryParts = [];
         picks.forEach(({ assetName, qty }) => {
           for (let i = 0; i < qty; i++) {
@@ -2103,6 +2137,7 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
               assetName,
               assetTagNo: nextAssetTagNo(assetName),
               sourceRequestId: requestPrefill ? requestPrefill.requestId : "",
+              custodyHolder: isCustody,
             };
             DB.assignments.push(newRec);
             newRecords.push(newRec);
@@ -2112,7 +2147,7 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
 
         newRecords.forEach(r => saveRecord("assignments", r));
         saveMeta(); // persists the updated per-category tag-number counters
-        logAction("Added assignment(s)", `${summaryParts.join(", ")} → ${empName}`);
+        logAction(isCustody ? "Issued bulk stock to custodian" : "Added assignment(s)", `${summaryParts.join(", ")} → ${empName}${isCustody ? " (held for team redistribution)" : ""}`);
         // Lets you backfill an asset you never logged an "Assigned" row for at
         // all — just add it here with Status already set to "Returned" (e.g. an
         // old phone someone's handing back, 1-2 years after the fact) and it
@@ -2307,6 +2342,104 @@ function openReassignForm(returnedUidVal) {
       closeModal();
       if (currentPage === "returns") paintReturnsTable();
       if (currentPage === "assignment") paintAssignTable();
+      if (currentPage === "dashboard") renderDashboard();
+    };
+  });
+}
+
+// Hands one unit out of a custodian's bulk stock lot to the actual team
+// member who's getting it. Unlike Reassign, nothing was ever "returned" —
+// the physical unit just changes hands from the custodian to the employee —
+// so this edits the SAME assignment record in place (same asset tag, still
+// "Assigned" the whole time) instead of closing one record and opening a
+// new one. Stock Summary's "With Custodians" count drops by 1 and its
+// "Assigned" (personal) count rises by 1 the moment this saves.
+function openRedistributeForm(uidVal) {
+  if (!requireAdminOrWarn()) return;
+  const rec = DB.assignments.find(a => a.uid === uidVal);
+  if (!rec) { toast("Record not found", "err"); return; }
+  if (!rec.custodyHolder || rec.status !== "Assigned") {
+    toast("This isn't an active custody holding", "err"); return;
+  }
+
+  const depts = DB.lists.department || [];
+  const custodianName = rec.employeeName;
+  openModal(`Redistribute ${rec.assetName}${rec.assetTagNo ? ` (${rec.assetTagNo})` : ""}`, `
+    <div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📦</span><div>Currently held by <strong>${escapeHtml(custodianName)}</strong> as bulk stock. Pick who's actually getting this unit — the same asset tag carries over, and this stops counting as a custody holding.</div></div>
+    <div class="field"><label>Date</label><input type="date" id="rd_date" value="${todayISO()}"></div>
+    <div class="field-row">
+      <div class="field"><label>Employee / Recipient Name</label>
+        <input type="text" id="rd_emp" list="rd_empList" placeholder="Employee name">
+        <datalist id="rd_empList">${DB.employees.map(e => `<option value="${escapeHtml(e.name)}">`).join("")}</datalist>
+      </div>
+      <div class="field"><label>Employee ID</label><input type="text" id="rd_empid"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Department</label>
+        <select id="rd_dept"><option value="">—</option>${depts.map(d => `<option ${rec.department === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}</select>
+      </div>
+      <div class="field"><label>Assigned By</label><input type="text" id="rd_by" value="${escapeHtml((fauth.currentUser || {}).email || "")}"></div>
+    </div>
+    <div class="field"><label>Remarks <span class="muted" style="font-weight:500;">(optional)</span></label><textarea id="rd_remarks" rows="2"></textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="rd_cancel">Cancel</button>
+      <button class="btn btn-primary" id="rd_save">Redistribute</button>
+    </div>
+  `, () => {
+    document.getElementById("modal").classList.add("modal-wide");
+    const empIdInput = document.getElementById("rd_empid");
+    const deptSel = document.getElementById("rd_dept");
+    let empIdTouched = false, deptTouched = !!rec.department;
+    empIdInput.addEventListener("input", () => { empIdTouched = true; });
+    deptSel.addEventListener("change", () => { deptTouched = true; });
+    const empInput = document.getElementById("rd_emp");
+    const autofillFromName = () => {
+      const typed = empInput.value.trim().toLowerCase();
+      if (!typed) return;
+      const match = DB.employees.find(e => (e.name || "").trim().toLowerCase() === typed);
+      if (!match) return;
+      if (!empIdTouched && match.id) empIdInput.value = match.id;
+      if (!deptTouched && match.department && [...deptSel.options].some(o => o.value === match.department)) deptSel.value = match.department;
+    };
+    empInput.addEventListener("input", autofillFromName);
+    empInput.addEventListener("change", autofillFromName);
+
+    document.getElementById("rd_cancel").onclick = closeModal;
+    document.getElementById("rd_save").onclick = () => {
+      const empName = empInput.value.trim();
+      if (!empName) { toast("Employee name is required", "err"); return; }
+      const dateVal = document.getElementById("rd_date").value;
+      if (!dateVal) { toast("Date is required", "err"); return; }
+      if (empName.toLowerCase() === (custodianName || "").trim().toLowerCase()) {
+        toast("Pick who this is actually going to, not the custodian themselves", "err"); return;
+      }
+
+      rec.employeeName = empName;
+      rec.employeeId = empIdInput.value.trim();
+      rec.department = deptSel.value;
+      rec.assignedBy = document.getElementById("rd_by").value.trim() || rec.assignedBy;
+      const note = document.getElementById("rd_remarks").value.trim();
+      rec.remarks = [rec.remarks, `Redistributed from ${custodianName} to ${empName} on ${fmtDate(dateVal)}${note ? ` — ${note}` : ""}`].filter(Boolean).join("\n");
+      rec.custodyHolder = false;
+      saveRecord("assignments", rec);
+
+      // Master Inventory tracks who currently has the asset — update it the
+      // same way a normal edit/reassign would, so it doesn't keep showing
+      // the custodian as the holder after the unit's actually moved on.
+      if (rec.assetTagNo) {
+        const inv = DB.inventory.find(i => i.assetId === rec.assetTagNo);
+        if (inv) {
+          inv.assignedTo = empName;
+          inv.department = rec.department || inv.department;
+          saveRecord("inventory", inv);
+        }
+      }
+
+      logAction("Redistributed from custody", `${rec.assetName}${rec.assetTagNo ? ` (${rec.assetTagNo})` : ""} — ${custodianName} → ${empName}`);
+      toast(`${rec.assetName} redistributed to ${empName}`);
+      closeModal();
+      if (currentPage === "assignment") paintAssignTable();
+      if (currentPage === "stock") renderStock();
       if (currentPage === "dashboard") renderDashboard();
     };
   });
@@ -4348,7 +4481,7 @@ function openEmpHistoryModal(empUid) {
 // negative rows; a healthy positive number doesn't need explaining.
 function stockShortfallBreakdown(r) {
   if (r.available >= 0) return "";
-  return `Total ${r.total} − Assigned ${r.assigned} − Under Repair ${r.underRepair} = ${r.available}`;
+  return `Total ${r.total} − Assigned ${r.assigned} − Under Repair ${r.underRepair}${r.custodyHeld ? ` − With Custodians ${r.custodyHeld}` : ""} = ${r.available}`;
 }
 
 function renderStock() {
@@ -4364,7 +4497,7 @@ function renderStock() {
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Category</th><th>Total Stock</th><th>Assigned</th><th>Under Repair</th><th>Faulty</th>
+          <th>Category</th><th>Total Stock</th><th>Assigned</th><th title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th><th>Under Repair</th><th>Faulty</th>
           <th>Lost</th><th>Scrap</th><th>Available</th><th>Threshold</th><th>Alert</th>
         </tr></thead>
         <tbody>
@@ -4373,6 +4506,7 @@ function renderStock() {
               <td><strong>${escapeHtml(r.category)}</strong></td>
               <td>${r.total}${r.receivedTotal ? `<div class="muted" style="font-size:11px;">incl. ${r.receivedTotal} received</div>` : ""}</td>
               <td>${r.assigned}${r.sentTotal ? `<div class="muted" style="font-size:11px;">${r.assignedToEmployees} to employees + ${r.sentTotal} sent to other offices</div>` : ""}</td>
+              <td>${r.custodyHeld ? `<a href="#" onclick="event.preventDefault();assignFilter.custody='custody';goto('assignment');">${r.custodyHeld} 📦</a>` : "0"}</td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="faulty" value="${r.faulty}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="lost" value="${r.lost}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
@@ -4381,7 +4515,7 @@ function renderStock() {
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="threshold" value="${r.threshold}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td>${statusBadge(r.low ? "⚠ Low Stock" : "OK")}</td>
             </tr>
-            ${r.available < 0 ? `<tr><td></td><td colspan="9" class="muted" style="font-size:11.5px;color:var(--red);padding-top:0;">${stockShortfallBreakdown(r)}</td></tr>` : ""}
+            ${r.available < 0 ? `<tr><td></td><td colspan="10" class="muted" style="font-size:11.5px;color:var(--red);padding-top:0;">${stockShortfallBreakdown(r)}</td></tr>` : ""}
           `).join("")}
         </tbody>
       </table></div>
@@ -5056,10 +5190,10 @@ function reportRows(kind) {
   const stock = kind === "stock" ? computeStockSummary() : null;
   switch (kind) {
     case "employees": return DB.employees.map(e => ({ "Employee ID": e.id || "", "Name": e.name || "", "Department": e.department || "", "Email": e.email || "", "Phone": e.phone || "" }));
-    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "", "Linked Asset Request": a.sourceRequestId || "", "Reassigned From": a.reassignedFromEmployee || "" }));
+    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "", "Linked Asset Request": a.sourceRequestId || "", "Reassigned From": a.reassignedFromEmployee || "", "Custody Holding": a.custodyHolder ? "Yes" : "No" }));
     case "returns": return getReturnedAssignments().map(a => ({ "Return Date": a.returnDate || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Returned By": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "" }));
     case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
-    case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
+    case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "With Custodians": r.custodyHeld, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
     case "refill": return DB.refills.map(r => ({ "Date": r.date || "", "Category": r.category || "", "Quantity Added": r.quantity || 0, "Added By": r.addedBy || "", "Source / Remarks": r.source || "" }));
     case "transfers": return DB.transfers.map(t => ({ "Date": t.date || "", "Direction": t.direction || "", "Other Office": t.otherOffice || "", "Asset Type": t.assetType || "", "Quantity": t.quantity || 0, "Tags / Serials": t.assetTags || "", "Handled By": t.handledBy || "", "Remarks": t.remarks || "" }));
     case "categories": return DB.categories.map(c => ({ "Category": c.name || "", "Notes": c.notes || "" }));

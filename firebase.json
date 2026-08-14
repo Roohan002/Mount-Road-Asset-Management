@@ -12,6 +12,14 @@
       "README.txt",
       "firestore.rules",
       "firestore.indexes.json"
+    ],
+    "headers": [
+      {
+        "source": "**/*.@(html|js|css)",
+        "headers": [
+          { "key": "Cache-Control", "value": "no-cache" }
+        ]
+      }
     ]
   }
 }
