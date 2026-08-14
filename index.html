@@ -9,6 +9,11 @@
 </head>
 <body>
 
+  <!-- Shown whenever a collection's live data fails to load (quota limit, offline, etc.) —
+       previously this failed silently, leaving things like Team autofill quietly broken
+       with no indication why. Persists across page navigation since it lives outside #content. -->
+  <div id="dataLoadWarningBar" class="data-load-warning" style="display:none"></div>
+
   <div class="app-shell">
 
     <!-- Sidebar -->

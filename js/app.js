@@ -168,11 +168,14 @@ async function loadOfficesList() {
 async function saveOfficesList() {
   await officesDocRef().set({ offices: OFFICES });
 }
+// Blank starting meta for a brand-new office — keeps the generic dropdown
+// option lists (status/condition/floor/department) but no actual records.
+// Every actual record collection (employees/assignments/etc.) starts empty
+// simply by not existing yet — only .lists/.stockManual ever get written from
+// this, so that's all it returns (used to also list empty record arrays that
+// nothing ever read, which just implied a full DB shape was being built here).
 function emptyOfficeDB() {
-  // Blank starting data for a brand-new office — keeps the generic dropdown
-  // option lists (status/condition/floor/department) but no actual records.
-  const lists = JSON.parse(JSON.stringify(SEED_DATA.lists || {}));
-  return { employees: [], categories: [], lists, assignments: [], refills: [], inventory: [], stockManual: {} };
+  return { lists: JSON.parse(JSON.stringify(SEED_DATA.lists || {})), stockManual: {} };
 }
 async function resetOfficeData(toOriginalSheet) {
   const deleteOps = [];
@@ -180,6 +183,11 @@ async function resetOfficeData(toOriginalSheet) {
     (DB[kind] || []).forEach(r => deleteOps.push({ kind, type: "delete", uid: r.uid }));
   });
   if (deleteOps.length) await batchWrite(deleteOps);
+  // Not part of DB (only ever touched directly via requestCounterRef()), so it's
+  // not covered by the loop above — without this, Request IDs would keep
+  // incrementing from wherever they left off instead of restarting at 00001,
+  // even though every actual request was just wiped.
+  try { await requestCounterRef().delete(); } catch (err) { console.error("Couldn't reset the request ID counter:", err); }
 
   if (toOriginalSheet) {
     const seed = seedFromSource();
@@ -468,6 +476,26 @@ let unsubscribeFns = [];
 // `fetchCollections` flag), so callers await this instead of fetching once
 // and then attaching listeners separately, which used to pay for every
 // document twice on every single app open.
+// Which collections currently have NO live data (their listener's most recent
+// attempt failed — quota limit, offline, etc.) — surfaced via a persistent
+// banner (updateDataLoadWarning) instead of failing silently. Previously a
+// failed employees load just left DB.employees empty with no indication why,
+// which looked exactly like "this employee genuinely isn't in Employee
+// Master" — very misleading for the Team-lock feature specifically.
+let dataLoadFailures = new Set();
+const DATA_LOAD_LABELS = { employees: "Employees", categories: "Asset Categories", assignments: "Asset Assignment", refills: "Stock Refill Log", inventory: "Master Inventory", meta: "Settings / Lists", requests: "Asset Requests" };
+function updateDataLoadWarning() {
+  const bar = document.getElementById("dataLoadWarningBar");
+  if (!bar) return;
+  if (dataLoadFailures.size) {
+    bar.style.display = "flex";
+    const names = [...dataLoadFailures].map(k => DATA_LOAD_LABELS[k] || k).join(", ");
+    bar.textContent = `⚠️ Couldn't load live data for: ${names} — related fields (like Team autofill) won't work correctly until this reconnects. Usually means a Firestore quota limit or connection issue.`;
+  } else {
+    bar.style.display = "none";
+  }
+}
+
 function attachRealtimeListener() {
   const readyPromises = [];
   // Master Inventory and the Stock Refill Log are Admin/Viewer-only pages — a
@@ -484,10 +512,14 @@ function attachRealtimeListener() {
         const list = [];
         snap.forEach(d => list.push(d.data()));
         DB[key] = list;
+        dataLoadFailures.delete(key);
+        updateDataLoadWarning();
         if (!gotFirst) { gotFirst = true; resolve(); }
         else goto(currentPage); // keep every open browser (signed-in users) in sync live
       }, err => {
         console.error(`Firestore listener error (${key}):`, err);
+        dataLoadFailures.add(key);
+        updateDataLoadWarning();
         if (!gotFirst) { gotFirst = true; resolve(); }
       }));
     }));
@@ -500,10 +532,14 @@ function attachRealtimeListener() {
         if (data.lists) DB.lists = data.lists;
         if (data.stockManual) DB.stockManual = data.stockManual;
       }
+      dataLoadFailures.delete("meta");
+      updateDataLoadWarning();
       if (!gotFirst) { gotFirst = true; resolve(); }
       else goto(currentPage);
     }, err => {
       console.error("Firestore listener error (meta):", err);
+      dataLoadFailures.add("meta");
+      updateDataLoadWarning();
       if (!gotFirst) { gotFirst = true; resolve(); }
     }));
   }));
@@ -515,10 +551,14 @@ function attachRealtimeListener() {
       const list = [];
       snap.forEach(d => list.push(d.data()));
       DB.requests = list;
+      dataLoadFailures.delete("requests");
+      updateDataLoadWarning();
       if (!gotFirst) { gotFirst = true; resolve(); }
       else goto(currentPage);
     }, err => {
       console.error("Firestore listener error (requests):", err);
+      dataLoadFailures.add("requests");
+      updateDataLoadWarning();
       if (!gotFirst) { gotFirst = true; resolve(); }
     }));
   }));
@@ -527,6 +567,8 @@ function attachRealtimeListener() {
 function detachRealtimeListener() {
   unsubscribeFns.forEach(fn => fn());
   unsubscribeFns = [];
+  dataLoadFailures = new Set();
+  updateDataLoadWarning();
 }
 
 function uid() {
@@ -1679,6 +1721,12 @@ function groupAssignmentsByEmployee(records) {
   return [...map.values()];
 }
 
+// Tracks the signature pad's current window-level "mouseup" handler (needed so
+// releasing the mouse outside the canvas still stops the stroke) — this modal
+// can be reopened many times a session (every handover slip), and `window`
+// itself is never recreated, so without this the old handler from each past
+// opening would stack up on window forever instead of being replaced.
+let sigPadMouseupHandler = null;
 function openSignatureSlipModal(records, summaryHtml) {
   const groups = groupAssignmentsByEmployee(records);
   openModal(records.length > 1 ? "Combined Asset Handover Slip" : "Asset Handover Slip", `
@@ -1708,7 +1756,9 @@ function openSignatureSlipModal(records, summaryHtml) {
     const move = (e) => { if (!drawing) return; const p = pos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); e.preventDefault(); };
     const end = () => { drawing = false; };
     canvas.addEventListener("mousedown", start); canvas.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", end);
+    if (sigPadMouseupHandler) window.removeEventListener("mouseup", sigPadMouseupHandler);
+    sigPadMouseupHandler = end;
+    window.addEventListener("mouseup", sigPadMouseupHandler);
     canvas.addEventListener("touchstart", start); canvas.addEventListener("touchmove", move); canvas.addEventListener("touchend", end);
     document.getElementById("sigClearBtn").onclick = () => { ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, canvas.width, canvas.height); hasSignature = false; };
 
@@ -2900,7 +2950,19 @@ function wireRequestForm(vals, editing) {
     } else {
       teamInput.readOnly = false;
       teamInput.setAttribute("list", "rf_teamList");
-      teamNote.textContent = match ? "✏️ Not in Employee Master yet — enter manually" : "✏️ Manual entry — saved to Employee Master if it's blank there";
+      // Spelled out with the live employee count + a close-spelling hint so a
+      // "no match" is immediately tellable apart from "data hasn't loaded" —
+      // the two used to look identical, which is exactly what caused the
+      // last confusing report.
+      if (match) {
+        teamNote.textContent = "✏️ Not in Employee Master yet — enter manually";
+      } else if (typed) {
+        const close = DB.employees.find(e => (e.name || "").toLowerCase().includes(typed) || typed.includes((e.name || "").toLowerCase()));
+        teamNote.textContent = `✏️ No exact match for "${empInput.value.trim()}" in Employee Master (${DB.employees.length} on file)`
+          + (close ? ` — did you mean "${close.name}"?` : " — check the spelling on the Employees page, or tick \"new employee\" above");
+      } else {
+        teamNote.textContent = "✏️ Manual entry";
+      }
       teamNote.style.color = "";
     }
   };
