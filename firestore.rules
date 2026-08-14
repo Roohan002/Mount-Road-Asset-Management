@@ -173,5 +173,18 @@ service cloud.firestore {
       allow read: if isSignedIn();
       allow write: if isSuperAdmin();
     }
+
+    // Login Activity — one record per sign-in (device/browser + approximate
+    // location), written by the app right after a successful sign-in. This
+    // happens BEFORE an office is chosen, so it lives at the top level, not
+    // under assetTracker/{officeId}. Anyone signed in can write ONE record —
+    // their own — for their own login; only a Super Admin can read the log.
+    // Append-only, same as the per-office Activity Log: nobody can edit or
+    // delete an entry once it exists, so it stays a trustworthy record.
+    match /loginLogs/{recordId} {
+      allow read: if isSuperAdmin();
+      allow create: if isSignedIn() && request.resource.data.email == request.auth.token.email;
+      allow update, delete: if false;
+    }
   }
 }

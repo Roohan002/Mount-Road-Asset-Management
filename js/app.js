@@ -907,6 +907,7 @@ const PAGES = {
   activityLog: { title: "Activity Log", render: renderActivityLog },
   reports: { title: "Reports", render: renderReports },
   settings: { title: "Settings", render: renderSettings },
+  loginActivity: { title: "Login Activity", render: renderLoginActivity },
 };
 
 // Pages a pure Team Lead (has the "teamlead" role and isn't also an Admin) is allowed to
@@ -923,6 +924,7 @@ function applyNavVisibility() {
     const page = b.dataset.page;
     if (teamLeadOnly) { b.style.display = TEAM_LEAD_PAGES.has(page) ? "" : "none"; return; }
     if (page === "assetRequests") { b.style.display = canOpenAssetRequests() ? "" : "none"; return; }
+    if (page === "loginActivity") { b.style.display = isSuperAdmin() ? "" : "none"; return; }
     b.style.display = "";
   });
 }
@@ -931,6 +933,7 @@ function goto(page) {
   if (!PAGES[page]) page = "dashboard"; // guard against a stale/invalid saved page
   if (isTeamLead() && !TEAM_LEAD_PAGES.has(page)) page = "dashboard";
   if (page === "assetRequests" && !canOpenAssetRequests()) page = "dashboard";
+  if (page === "loginActivity" && !isSuperAdmin()) page = "dashboard";
   currentPage = page;
   localStorage.setItem(LAST_PAGE_KEY, page);
   document.querySelectorAll(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page === page));
@@ -5171,6 +5174,89 @@ function fmtDateTime(iso) {
 }
 
 /* =========================================================
+   LOGIN ACTIVITY — Super Admin only. Who signed in, on what device, from
+   roughly where. Global (not per-office) since sign-in happens before an
+   office is chosen — see loginLogsColl()/recordLoginActivity().
+   ========================================================= */
+let loginLogCache = [];
+let loginLogFilter = { q: "", user: "" };
+
+function renderLoginActivity() {
+  const content = document.getElementById("content");
+  if (!isSuperAdmin()) {
+    content.innerHTML = `<div class="viewer-note">🔒 Login Activity is visible to Super Admins only.</div>`;
+    return;
+  }
+  content.innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <div><h2>Login Activity</h2><div class="sub">Every sign-in, across every office — device/browser and an approximate location, most recent first.</div></div>
+        <button class="btn btn-secondary btn-sm" id="loginLogRefreshBtn">↻ Refresh</button>
+      </div>
+      <div class="viewer-note" style="margin-bottom:14px;">📍 Location is an approximate city/country guess from the sign-in device's internet connection, looked up through a free outside service — not GPS-precise, and occasionally unavailable or off by a city.</div>
+      <div class="toolbar">
+        <div class="search-box"><input type="text" id="loginLogSearch" placeholder="Search email, device, location..." /></div>
+        <select class="filter-select" id="loginLogUserFilter"><option value="">All users</option></select>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>When</th><th>User</th><th>Device</th><th>Browser / OS</th><th>Location</th></tr></thead>
+        <tbody id="loginLogTbody"><tr class="empty-row"><td colspan="5">Loading…</td></tr></tbody>
+      </table></div>
+    </div>
+  `;
+  document.getElementById("loginLogSearch").oninput = (e) => { loginLogFilter.q = e.target.value.toLowerCase(); paintLoginLogTable(); };
+  document.getElementById("loginLogUserFilter").onchange = (e) => { loginLogFilter.user = e.target.value; paintLoginLogTable(); };
+  document.getElementById("loginLogRefreshBtn").onclick = loadLoginActivity;
+  loadLoginActivity();
+}
+
+async function loadLoginActivity() {
+  if (!fdb || !isSuperAdmin()) return;
+  const tbody = document.getElementById("loginLogTbody");
+  if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="5">Loading…</td></tr>`;
+  try {
+    const snap = await loginLogsColl().orderBy("ts", "desc").limit(500).get();
+    loginLogCache = [];
+    snap.forEach(doc => loginLogCache.push(doc.data()));
+
+    const userSel = document.getElementById("loginLogUserFilter");
+    if (userSel) {
+      const users = [...new Set(loginLogCache.map(l => l.email).filter(Boolean))].sort();
+      userSel.innerHTML = `<option value="">All users</option>${users.map(u => `<option value="${escapeHtml(u)}">${escapeHtml(u)}</option>`).join("")}`;
+      userSel.value = loginLogFilter.user;
+    }
+    paintLoginLogTable();
+  } catch (err) {
+    console.error(err);
+    if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="5">Couldn't load login activity — check your Firestore Rules cover the "loginLogs" collection.</td></tr>`;
+  }
+}
+
+function loginLocationLabel(l) {
+  const parts = [l.city, l.region, l.country].filter(Boolean);
+  return parts.length ? parts.join(", ") : "—";
+}
+
+function paintLoginLogTable() {
+  const tbody = document.getElementById("loginLogTbody");
+  if (!tbody) return;
+  let rows = [...loginLogCache];
+  if (loginLogFilter.user) rows = rows.filter(l => l.email === loginLogFilter.user);
+  if (loginLogFilter.q) {
+    rows = rows.filter(l => `${l.email || ""} ${l.os || ""} ${l.browser || ""} ${loginLocationLabel(l)}`.toLowerCase().includes(loginLogFilter.q));
+  }
+  tbody.innerHTML = rows.length ? rows.map(l => `
+    <tr>
+      <td style="white-space:nowrap;">${fmtDateTime(l.ts)}</td>
+      <td>${escapeHtml(l.email || "—")}</td>
+      <td>${escapeHtml(l.deviceType || "—")}<div class="muted" style="font-size:11px;">${escapeHtml(l.screen || "")}</div></td>
+      <td>${escapeHtml(l.browser || "—")} · ${escapeHtml(l.os || "—")}</td>
+      <td>${escapeHtml(loginLocationLabel(l))}${l.ip ? `<div class="muted" style="font-size:11px;">${escapeHtml(l.ip)}</div>` : ""}</td>
+    </tr>
+  `).join("") : `<tr class="empty-row"><td colspan="5">No sign-ins recorded yet.</td></tr>`;
+}
+
+/* =========================================================
    REPORTS — export any module (or everything) to Excel
    ========================================================= */
 function safeFileBit(s) {
@@ -5876,10 +5962,79 @@ function attemptGateSignIn() {
   const email = emailInp.value.trim();
   const pw = pwInp.value;
   if (!email || !pw) { showSignInGate("Enter your email and password."); return; }
-  fauth.signInWithEmailAndPassword(email, pw).catch(err => {
-    showSignInGate(err.message.replace(/^Firebase:\s*/, ""));
-  });
+  fauth.signInWithEmailAndPassword(email, pw)
+    .then(cred => recordLoginActivity((cred.user || {}).email || email))
+    .catch(err => {
+      showSignInGate(err.message.replace(/^Firebase:\s*/, ""));
+    });
   // On success, the onAuthStateChanged listener below handles loading data + showing the app.
+}
+
+/* ---------------- Login Activity — who signed in, on what, from roughly where ---------------- */
+function loginLogsColl() { return fdb.collection("loginLogs"); }
+
+// Small heuristic User-Agent reader — good enough for "what did they sign in
+// on" at a glance, without pulling in a parsing library for it.
+function parseUserAgent(ua) {
+  ua = ua || "";
+  let os = "Unknown OS";
+  if (/Windows NT 10/.test(ua)) os = "Windows 10/11";
+  else if (/Windows NT/.test(ua)) os = "Windows";
+  else if (/Mac OS X/.test(ua)) os = "macOS";
+  else if (/Android/.test(ua)) os = "Android";
+  else if (/iPhone|iPad|iPod/.test(ua)) os = "iOS";
+  else if (/Linux/.test(ua)) os = "Linux";
+
+  let browser = "Unknown Browser";
+  if (/Edg\//.test(ua)) browser = "Edge";
+  else if (/OPR\//.test(ua)) browser = "Opera";
+  else if (/Chrome\//.test(ua) && !/Chromium/.test(ua)) browser = "Chrome";
+  else if (/Firefox\//.test(ua)) browser = "Firefox";
+  else if (/Safari\//.test(ua) && !/Chrome/.test(ua)) browser = "Safari";
+
+  const deviceType = /Mobile|Android|iPhone/.test(ua) ? "Mobile" : /iPad|Tablet/.test(ua) ? "Tablet" : "Desktop";
+  return { os, browser, deviceType };
+}
+
+// Writes one Login Activity record right after a real, explicit sign-in
+// (never on a page refresh that just silently resumes an existing session —
+// this is only called from attemptGateSignIn's success path). Never blocks
+// or fails the sign-in itself: the location lookup is a best-effort call to
+// a free, keyless IP-geolocation service (ipapi.co) — if it's slow, rate-
+// limited, or unreachable, the login is still recorded, just without a
+// location. This is approximate (city/country from the connection's IP),
+// not GPS-precise, and depends on that outside service staying up.
+async function recordLoginActivity(email) {
+  if (!fdb || !email) return;
+  const { os, browser, deviceType } = parseUserAgent(navigator.userAgent);
+  const rec = {
+    uid: uid(),
+    email,
+    ts: nowISO(),
+    os, browser, deviceType,
+    screen: (typeof screen !== "undefined") ? `${screen.width}x${screen.height}` : "",
+    language: navigator.language || "",
+    userAgent: navigator.userAgent || "",
+    city: "", region: "", country: "", ip: "",
+  };
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch("https://ipapi.co/json/", { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const geo = await res.json();
+      if (!geo.error) {
+        rec.city = geo.city || "";
+        rec.region = geo.region || "";
+        rec.country = geo.country_name || "";
+        rec.ip = geo.ip || "";
+      }
+    }
+  } catch (err) {
+    console.warn("Login location lookup skipped:", err);
+  }
+  loginLogsColl().doc(rec.uid).set(rec).catch(err => console.error("Couldn't record login activity:", err));
 }
 document.getElementById("gateSignInBtn").addEventListener("click", attemptGateSignIn);
 ["gate_email", "gate_pw"].forEach(id => {
