@@ -4507,10 +4507,11 @@ function renderStock() {
         <div><h2>Stock Summary</h2><div class="sub">Auto-calculated from Asset Assignment + Stock Refill Log + Asset Transfers. Repair / Faulty / Lost / Scrap and Threshold are editable${admin ? "" : " (Admin only)"}.</div></div>
         <button class="btn btn-secondary btn-sm" onclick="goto('transfers')">Asset Transfers →</button>
       </div>
-      <div class="table-wrap"><table>
+      <div class="table-wrap"><table class="stock-table">
         <thead><tr>
-          <th>Category</th><th>Total Stock</th><th>Assigned</th><th title="Total Stock minus Assigned only — doesn't account for Custody, Repair, Faulty, Lost, or Scrap">Total − Assigned</th><th title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th><th>Under Repair</th><th>Faulty</th>
-          <th>Lost</th><th>Scrap</th><th>Available</th><th>Threshold</th><th>Alert</th>
+          <th>Category</th><th>Total Stock</th><th>Assigned</th><th title="Total Stock minus Assigned only — doesn't account for Custody, Repair, Faulty, Lost, or Scrap">Total − Assigned</th><th title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th>
+          <th class="stock-col-editable">Under Repair</th><th class="stock-col-editable">Faulty</th><th class="stock-col-editable">Lost</th><th class="stock-col-editable">Scrap</th>
+          <th>Available</th><th>Threshold</th><th>Alert</th>
         </tr></thead>
         <tbody>
           ${rows.map(r => `
@@ -4518,17 +4519,17 @@ function renderStock() {
               <td><strong>${escapeHtml(r.category)}</strong></td>
               <td>${r.total}${r.receivedTotal ? `<div class="muted" style="font-size:11px;">incl. ${r.receivedTotal} received</div>` : ""}</td>
               <td>${r.assigned}${r.sentTotal ? `<div class="muted" style="font-size:11px;">${r.assignedToEmployees} to employees + ${r.sentTotal} sent to other offices</div>` : ""}</td>
-              <td style="${r.netAfterAssigned < 0 ? "color:var(--red)" : ""}">${r.netAfterAssigned}</td>
+              <td class="${r.netAfterAssigned < 0 ? "stock-net-negative" : ""}">${r.netAfterAssigned}</td>
               <td>${r.custodyHeld ? `<a href="#" onclick="event.preventDefault();assignFilter.custody='custody';goto('assignment');">${r.custodyHeld} 📦</a>` : "0"}</td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="faulty" value="${r.faulty}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="lost" value="${r.lost}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="scrap" value="${r.scrap}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><strong style="${r.available < 0 ? "color:var(--red)" : ""}">${r.available}</strong></td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="threshold" value="${r.threshold}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
+              <td class="stock-col-editable"><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"}></td>
+              <td class="stock-col-editable"><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="faulty" value="${r.faulty}" ${admin ? "" : "disabled"}></td>
+              <td class="stock-col-editable"><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="lost" value="${r.lost}" ${admin ? "" : "disabled"}></td>
+              <td class="stock-col-editable"><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="scrap" value="${r.scrap}" ${admin ? "" : "disabled"}></td>
+              <td><strong class="${r.available < 0 ? "stock-net-negative" : ""}">${r.available}</strong></td>
+              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="threshold" value="${r.threshold}" ${admin ? "" : "disabled"}></td>
               <td>${statusBadge(r.low ? "⚠ Low Stock" : "OK")}</td>
             </tr>
-            ${r.available < 0 ? `<tr><td></td><td colspan="11" class="muted" style="font-size:11.5px;color:var(--red);padding-top:0;">${stockShortfallBreakdown(r)}</td></tr>` : ""}
+            ${r.available < 0 ? `<tr class="stock-shortfall-row"><td></td><td colspan="11" class="muted" style="font-size:11.5px;color:var(--red);">${stockShortfallBreakdown(r)}</td></tr>` : ""}
           `).join("")}
         </tbody>
       </table></div>

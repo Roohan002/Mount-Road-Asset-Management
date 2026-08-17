@@ -211,6 +211,39 @@ tbody tr:hover{ background: var(--surface-2); }
 
 .empty-row td{ text-align:center; color:var(--text-faint); padding:36px 12px; white-space:normal; }
 
+/* ---------- Stock Summary table ----------
+   Every numeric column right-aligns with tabular figures so digits stack
+   cleanly; Category stays pinned on the left while scrolling the wider
+   columns into view; the four hand-edited counters (Under Repair, Faulty,
+   Lost, Scrap) get a faint warm tint so it's obvious at a glance which
+   numbers are typed in versus calculated. */
+.stock-table thead th{ text-align:right; }
+.stock-table thead th:first-child{ text-align:left; }
+.stock-table tbody td{ text-align:right; font-variant-numeric: tabular-nums; }
+.stock-table tbody td:first-child{ text-align:left; font-variant-numeric: normal; }
+.stock-table thead th:first-child,
+.stock-table tbody td:first-child{
+  position: sticky; left:0; z-index:1;
+  background: var(--surface);
+}
+.stock-table thead th:first-child{ background: var(--surface-2); z-index:2; }
+.stock-table tbody tr:hover td:first-child{ background: var(--surface-2); }
+.stock-table th.stock-col-editable{ background: var(--amber-light); color:#9a6a12; }
+.stock-table td.stock-col-editable{ background: var(--amber-light); }
+.stock-table td.stock-col-editable{ background: color-mix(in srgb, var(--amber-light) 55%, var(--surface)); }
+.stock-table .stock-net-negative{ color: var(--red); font-weight:700; }
+.stock-table .stock-shortfall-row td{ padding-top:0; }
+
+.stock-edit{
+  width:68px; padding:6px 8px; border-radius:7px; border:1px solid var(--border);
+  background: var(--surface); color: var(--text);
+  text-align:right; font-variant-numeric: tabular-nums; font-size:13px;
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.stock-edit:hover:not(:disabled){ border-color: var(--primary); }
+.stock-edit:focus{ outline:none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-light); }
+.stock-edit:disabled{ opacity:.55; cursor:not-allowed; }
+
 /* ---------- Badges ---------- */
 .badge{
   display:inline-flex; align-items:center; gap:5px;
