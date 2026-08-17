@@ -687,11 +687,12 @@ function nextAssetTagNo(categoryName) {
 }
 
 /* ---------------- Computed: Stock Summary ---------------- */
-// Total Stock = Stock Refill Log entries + units RECEIVED from another office,
-// PLUS Under Repair (still owned, just temporarily unusable), MINUS
-// Faulty/Lost/Scrap — those are gone for good (broken beyond repair, lost, or
-// disposed), so they no longer count as stock we actually have, not just
-// "stock we have but can't hand out."
+// Total Stock is a plain, gross count — every unit ever logged in via Stock
+// Refill Log or RECEIVED from another office. Nothing is ever subtracted
+// from it, so it's always a simple, sensible number you can trust at a
+// glance, never tangled up with Under Repair/Faulty/Lost/Scrap or anything
+// else. Every one of those instead comes out of Available, all in one
+// place — see below.
 //
 // Assigned = assigned to an employee here + sent to another office. Once a
 // unit has left this office, whether to a person or another branch, it's
@@ -725,8 +726,8 @@ function computeStockSummary() {
       .filter(a => a.assetName === name && a.status === "Assigned" && a.custodyHolder).length;
     const assigned = assignedToEmployees + sentTotal;
     const manual = DB.stockManual[name] || { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
-    const total = refillTotal + receivedTotal - manual.faulty - manual.lost - manual.scrap;
-    const available = total - assigned - manual.underRepair - custodyHeld;
+    const total = refillTotal + receivedTotal;
+    const available = total - assigned - custodyHeld - manual.underRepair - manual.faulty - manual.lost - manual.scrap;
     const low = available <= manual.threshold;
     return {
       category: name, total, assigned, assignedToEmployees, sentTotal, receivedTotal, custodyHeld,
@@ -1107,18 +1108,19 @@ function departmentAssignedBreakdown() {
 
 // Asset Lifecycle Flow: a small Sankey-style diagram — one "Total Stock" node on the
 // left flowing out to every status bucket on the right, with line thickness scaled to
-// each bucket's share. Shows at a glance where every unit in stock currently sits.
-// Only buckets that are still genuinely part of "Total Stock" belong here —
-// Faulty/Lost/Scrap are excluded from Total itself now (see
-// computeStockSummary: they're gone for good, not just unavailable), so
-// showing them as a slice "flowing out of" Total would be double-counting
-// something that was already subtracted before this diagram even runs.
-// Under Repair is still part of Total (temporarily unusable, not gone).
+// each bucket's share. Shows at a glance where every unit ever stocked currently sits.
+// Total Stock is a plain gross number (see computeStockSummary) and nothing is
+// subtracted from it up front, so every bucket below — including Faulty/Lost/
+// Scrap — is shown as its own slice flowing out of it, keeping the branches
+// a true breakdown of the whole.
 function svgLifecycleFlow(s) {
   const nodesAll = [
     { label: "Assigned", value: s.assigned, color: "#8a5cf6" },
     { label: "With Custodians", value: s.custodyHeld, color: "#3b82f6" },
     { label: "Under Repair", value: s.underRepair, color: "#f5a623" },
+    { label: "Faulty", value: s.faulty, color: "#e0575a" },
+    { label: "Lost", value: s.lost, color: "#9aa1ac" },
+    { label: "Scrap", value: s.scrap, color: "#6b7280" },
     { label: "Available", value: s.available, color: "#0fb9a7" },
   ];
   const nodes = nodesAll.filter(n => n.value > 0);
@@ -1401,7 +1403,7 @@ function renderDashboard() {
   // works as a jumping-off point rather than a dead-end summary.
   const cards = [
     { label: "Asset Categories", value: s.categories, icon: "🏷️", cls: "icon-indigo", foot: "Tracked categories", goto: "categories" },
-    { label: "Total Inventory", value: s.total, icon: "📦", cls: "icon-blue", foot: "Refills + received, minus faulty/lost/scrap", goto: "stock" },
+    { label: "Total Inventory", value: s.total, icon: "📦", cls: "icon-blue", foot: "Every unit ever refilled or received", goto: "stock" },
     { label: "Available", value: s.available, icon: "🟢", cls: "icon-teal", foot: "Ready to assign", goto: "stock" },
     { label: "Assigned", value: s.assigned, icon: "🔵", cls: "icon-purple", foot: "Currently in use", goto: "assignment", presetFilter: "Assigned" },
     { label: "With Custodians", value: s.custodyHeld, icon: "📦", cls: "icon-blue", foot: "Bulk stock held by Team Leads/Managers", goto: "assignment", presetCustody: "custody" },
@@ -4484,7 +4486,10 @@ function openEmpHistoryModal(empUid) {
 // negative rows; a healthy positive number doesn't need explaining.
 function stockShortfallBreakdown(r) {
   if (r.available >= 0) return "";
-  return `Total ${r.total} − Assigned ${r.assigned} − Under Repair ${r.underRepair}${r.custodyHeld ? ` − With Custodians ${r.custodyHeld}` : ""} = ${r.available}`;
+  const parts = [`Total ${r.total}`, `Assigned ${r.assigned}`];
+  if (r.custodyHeld) parts.push(`With Custodians ${r.custodyHeld}`);
+  parts.push(`Under Repair ${r.underRepair}`, `Faulty ${r.faulty}`, `Lost ${r.lost}`, `Scrap ${r.scrap}`);
+  return `${parts.join(" − ")} = ${r.available}`;
 }
 
 function renderStock() {
