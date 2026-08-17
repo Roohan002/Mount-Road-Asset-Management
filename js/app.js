@@ -3504,6 +3504,9 @@ function openRequestDetail(uidVal) {
       actionButtons.push(`<button class="btn btn-primary" id="rd_approveBtn">Approve</button>`);
     }
     if (["Approved", "Partially Fulfilled"].includes(rec.status)) actionButtons.push(`<button class="btn btn-primary" id="rd_assignBtn">Assign Asset</button>`);
+    if (["Approved", "Partially Fulfilled"].includes(rec.status) && availableCustodyForRequest(rec).length) {
+      actionButtons.push(`<button class="btn btn-secondary" id="rd_custodyBtn">📦 Fulfill from Custody</button>`);
+    }
   }
   if (REQUEST_ACTIVE_STATUSES.includes(rec.status) && (admin || (mine && ["Draft", "Submitted"].includes(rec.status)))) {
     actionButtons.push(`<button class="btn btn-secondary" id="rd_cancelBtn">Cancel Request</button>`);
@@ -3668,6 +3671,9 @@ function openRequestDetail(uidVal) {
 
     const assignBtn = document.getElementById("rd_assignBtn");
     if (assignBtn) assignBtn.onclick = () => assignAssetForRequest(rec.uid);
+
+    const custodyBtn = document.getElementById("rd_custodyBtn");
+    if (custodyBtn) custodyBtn.onclick = () => openFulfillFromCustodyForm(rec.uid);
 
     const cancelBtn = document.getElementById("rd_cancelBtn");
     if (cancelBtn) cancelBtn.onclick = () => {
@@ -3923,6 +3929,102 @@ function fulfillRequestFromAssignment(requestPrefill, picks, newRecords) {
   logAction(allGiven ? "Fulfilled asset request" : "Partially fulfilled asset request",
     `${rec.requestId || rec.uid} — ${givenSummary} → ${rec.employeeName}`);
   toast(allGiven ? `Request ${rec.requestId} fulfilled` : `Request ${rec.requestId} partially fulfilled — remaining items stay Pending`);
+}
+
+// Custody units (bulk stock some Team Lead/Manager is already holding — see
+// openAssignForm's custody checkbox) that match one of THIS request's still-
+// outstanding asset types, from any custodian. Lets an Admin fulfill a
+// request straight out of stock that's already been issued somewhere,
+// instead of minting a brand-new unit from general Available every time.
+function availableCustodyForRequest(rec) {
+  const remainingTypes = new Set(getRequestItems(rec).filter(i => requestItemRemaining(i) > 0).map(i => i.assetType));
+  if (!remainingTypes.size) return [];
+  return DB.assignments.filter(a => a.custodyHolder && a.status === "Assigned" && remainingTypes.has(a.assetName));
+}
+
+// Ticks specific already-issued custody units over to this request's
+// employee — same "edit the record in place, same asset tag" mechanic as
+// openRedistributeForm, just driven from the request side and for possibly
+// several units/types at once, then rolled into the request's progress via
+// fulfillRequestFromAssignment() exactly like a normal "Assign Asset" would.
+function openFulfillFromCustodyForm(uidVal) {
+  if (!requireAdminOrWarn()) return;
+  const rec = DB.requests.find(r => r.uid === uidVal);
+  if (!rec) { toast("Request not found", "err"); return; }
+  const units = availableCustodyForRequest(rec);
+  if (!units.length) { toast("No matching custody stock available for this request", "err"); return; }
+  const remainingByType = {};
+  getRequestItems(rec).forEach(i => { if (requestItemRemaining(i) > 0) remainingByType[i.assetType] = requestItemRemaining(i); });
+
+  openModal(`Fulfill ${rec.requestId || ""} from Custody`, `
+    <div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📦</span><div>Tick which already-issued custody units to hand to <strong>${escapeHtml(rec.employeeName)}</strong>, instead of pulling fresh stock. Each ticked unit keeps its own asset tag and comes straight out of that custodian's holding.</div></div>
+    <div class="muted" style="font-size:12px;margin-bottom:8px;">Still needed: ${Object.entries(remainingByType).map(([t, q]) => `${escapeHtml(t)} ×${q}`).join(", ")}</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Asset</th><th>Asset Tag</th><th>Currently Held By</th></tr></thead>
+      <tbody>
+        ${units.map(a => `
+          <tr>
+            <td><input type="checkbox" class="fc-unit" value="${a.uid}" data-asset="${escapeHtml(a.assetName)}"></td>
+            <td>${escapeHtml(a.assetName)}</td>
+            <td>${a.assetTagNo ? `<span class="badge badge-grey">${escapeHtml(a.assetTagNo)}</span>` : "—"}</td>
+            <td>${escapeHtml(a.employeeName)}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table></div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="fc_cancel">Cancel</button>
+      <button class="btn btn-primary" id="fc_confirm">Fulfill Selected</button>
+    </div>
+  `, () => {
+    document.getElementById("modal").classList.add("modal-wide");
+    document.getElementById("fc_cancel").onclick = closeModal;
+    document.getElementById("fc_confirm").onclick = () => {
+      const checked = [...document.querySelectorAll(".fc-unit:checked")];
+      if (!checked.length) { toast("Tick at least one unit", "err"); return; }
+
+      // Don't let more of a type be ticked than the request actually still needs.
+      const countByType = {};
+      for (const cb of checked) {
+        const t = cb.dataset.asset;
+        countByType[t] = (countByType[t] || 0) + 1;
+        if (countByType[t] > (remainingByType[t] || 0)) {
+          toast(`Ticked more ${t} than this request still needs (${remainingByType[t] || 0} remaining)`, "err");
+          return;
+        }
+      }
+
+      const newRecords = [];
+      checked.forEach(cb => {
+        const a = DB.assignments.find(x => x.uid === cb.value);
+        if (!a) return;
+        const custodianName = a.employeeName;
+        a.employeeName = rec.employeeName;
+        a.employeeId = rec.employeeCode || "";
+        a.department = rec.department || a.department;
+        a.remarks = [a.remarks, `Redistributed from ${custodianName} to ${rec.employeeName} on ${fmtDate(todayISO())} — fulfilling ${rec.requestId || rec.uid}`].filter(Boolean).join("\n");
+        a.custodyHolder = false;
+        a.sourceRequestId = rec.requestId || "";
+        saveRecord("assignments", a);
+        // Admin-only action, so — unlike the Team Lead self-service path —
+        // Master Inventory can safely be kept in sync here.
+        if (a.assetTagNo) {
+          const inv = DB.inventory.find(i => i.assetId === a.assetTagNo);
+          if (inv) { inv.assignedTo = rec.employeeName; inv.department = a.department || inv.department; saveRecord("inventory", inv); }
+        }
+        newRecords.push(a);
+      });
+
+      const picks = Object.entries(countByType).map(([assetName, qty]) => ({ assetName, qty }));
+      fulfillRequestFromAssignment({ requestUid: rec.uid }, picks, newRecords);
+      logAction("Fulfilled from custody", `${rec.requestId || rec.uid} — ${picks.map(p => `${p.assetName} ×${p.qty}`).join(", ")} → ${rec.employeeName}`);
+      closeModal();
+      if (currentPage === "assetRequests") renderAssetRequests();
+      if (currentPage === "assignment") paintAssignTable();
+      if (currentPage === "stock") renderStock();
+      if (currentPage === "dashboard") renderDashboard();
+    };
+  });
 }
 
 /* =========================================================
