@@ -1279,6 +1279,18 @@ function teamStatCards(ov) {
   ];
 }
 
+// Team Lead self-service custody (redistributing their own held stock
+// straight from their Dashboard) is fully built but switched OFF for now —
+// the "type in the custodian's exact login email" setup step proved
+// confusing in practice and needs a better UX (e.g. picking from a list of
+// existing Team Lead logins instead of free-typing an email) before it's
+// ready to actually use. Admins can still do everything it would've done,
+// via Asset Assignment's ↪ Redistribute and a Request's 📦 Fulfill from
+// Custody — this flag only hides the Team-Lead-does-it-themselves path.
+// Flip back to true once that setup step is reworked; nothing else here
+// needs to change to bring it back.
+const CUSTODY_SELF_SERVICE_ENABLED = false;
+
 // A Team Lead's "home" — their own team's asset picture front and center
 // (who has what, who has nothing, category mix, recent activity), plus their
 // own request queue below it so both halves of the job are in one place.
@@ -1299,7 +1311,7 @@ function renderTeamLeadDashboard() {
   const reqSummary = computeRequestsSummary(mine);
   const recentRequests = mine.slice(0, 6);
   const recentTeamActivity = sortAssignmentsNewestFirst(ov.teamAssignments).slice(0, 8);
-  const myCustody = sortAssignmentsNewestFirst(myCustodyStock());
+  const myCustody = CUSTODY_SELF_SERVICE_ENABLED ? sortAssignmentsNewestFirst(myCustodyStock()) : [];
 
   content.innerHTML = `
     ${viewerNotice()}
@@ -2023,11 +2035,12 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
       <input type="checkbox" id="f_custody">
       📦 Bulk stock lot held by the person above (Team Lead/Manager) to redistribute to their team later — not a personal assignment
     </label>
+    ${CUSTODY_SELF_SERVICE_ENABLED ? `
     <div class="field" id="f_custody_email_wrap" style="display:none;margin-bottom:14px;">
       <label>Custodian's login email <span class="muted" style="font-weight:500;">(lets them redistribute this stock themselves from their Dashboard — must be their real sign-in email)</span></label>
       <input type="email" id="f_custody_email" placeholder="teamlead@company.com">
-    </div>` : ""}
-    ${editing && editing.custodyHolder ? `
+    </div>` : ""}` : ""}
+    ${CUSTODY_SELF_SERVICE_ENABLED && editing && editing.custodyHolder ? `
     <div class="field" style="margin-bottom:14px;">
       <label>📦 Custodian's login email <span class="muted" style="font-weight:500;">(this is still an active custody holding — set this so they can redistribute it themselves from their Dashboard)</span></label>
       <input type="email" id="f_custody_email_edit" value="${escapeHtml(editing.custodianEmail || "")}" placeholder="teamlead@company.com">
@@ -2117,7 +2130,7 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
       // their own custody stock themselves later, from their Dashboard.
       const custodyChkToggle = document.getElementById("f_custody");
       const custodyEmailWrap = document.getElementById("f_custody_email_wrap");
-      if (custodyChkToggle) {
+      if (custodyChkToggle && custodyEmailWrap) {
         custodyChkToggle.addEventListener("change", () => {
           custodyEmailWrap.style.display = custodyChkToggle.checked ? "" : "none";
         });
@@ -2189,8 +2202,11 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
         // Firestore Rules (and openRedistributeForm) recognize THIS specific
         // person as the one allowed to redistribute this specific stock later,
         // straight from their own Dashboard, without needing Admin rights.
-        const custodyEmail = isCustody ? document.getElementById("f_custody_email").value.trim().toLowerCase() : "";
-        if (isCustody && !custodyEmail) {
+        // Self-service is currently switched off (CUSTODY_SELF_SERVICE_ENABLED)
+        // so this field doesn't even render — skip asking for it.
+        const custodyEmailInput = document.getElementById("f_custody_email");
+        const custodyEmail = isCustody && custodyEmailInput ? custodyEmailInput.value.trim().toLowerCase() : "";
+        if (CUSTODY_SELF_SERVICE_ENABLED && isCustody && !custodyEmail) {
           toast("Enter the custodian's login email — it's what lets them redistribute this stock themselves", "err");
           return;
         }
