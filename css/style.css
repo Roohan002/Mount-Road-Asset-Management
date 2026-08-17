@@ -211,6 +211,44 @@ tbody tr:hover{ background: var(--surface-2); }
 
 .empty-row td{ text-align:center; color:var(--text-faint); padding:36px 12px; white-space:normal; }
 
+/* ---------- Stock Summary table ----------
+   Fixed column widths (via <colgroup>) so every header lines up exactly
+   with the data beneath it, instead of each column stretching to fit its
+   own widest line. Numbers right-align on tabular figures; a hairline
+   divider marks each logical group (stock counts / custody / the four
+   hand-edited counters / the result) instead of a painted color band. */
+.stock-table{ table-layout: fixed; }
+.stock-table th, .stock-table td{ padding:9px 12px; white-space:normal; font-variant-numeric: tabular-nums; }
+.stock-table th:not(:first-child), .stock-table td:not(:first-child){ text-align:right; }
+.stock-table th{ line-height:1.35; }
+.stock-table .stock-div{ border-left:1px solid var(--border); }
+.stock-table th.stock-div-accent{ border-left:2px solid var(--amber); color:#9a6a12; }
+.stock-table td.stock-div-accent{ border-left:2px solid var(--amber); }
+.stock-table .stock-negative{ color: var(--red); }
+.stock-table td strong{ font-weight:700; }
+.stock-note-row td{ padding-top:0; padding-bottom:12px; font-size:11.5px; color:var(--text-faint); }
+.stock-note-row:hover{ background:none; }
+
+.stock-edit{
+  width:100%; box-sizing:border-box; padding:3px 2px 5px; text-align:right;
+  border:none; border-bottom:1.5px solid var(--border); border-radius:0;
+  background:transparent; color:var(--text);
+  font-variant-numeric: tabular-nums; font-size:13px; font-family:inherit;
+  transition: border-color .15s ease;
+}
+.stock-edit:hover:not(:disabled){ border-bottom-color: var(--amber); }
+.stock-edit:focus{ outline:none; border-bottom-color: var(--primary); border-bottom-width:2px; }
+.stock-edit:disabled{ opacity:.5; }
+
+.stock-table th.stock-sortable{ cursor:pointer; user-select:none; }
+.stock-table th.stock-sortable:hover{ color: var(--text); }
+.stock-sort-arrow{ display:inline-block; width:9px; font-size:9px; color: var(--primary); vertical-align:middle; }
+.stock-lowonly-toggle{
+  display:inline-flex; align-items:center; gap:7px; font-size:12.8px; color:var(--text-muted);
+  cursor:pointer; user-select:none;
+}
+.stock-lowonly-toggle input{ accent-color: var(--amber); width:14px; height:14px; cursor:pointer; }
+
 /* ---------- Badges ---------- */
 .badge{
   display:inline-flex; align-items:center; gap:5px;

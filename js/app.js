@@ -4496,9 +4496,32 @@ function stockShortfallBreakdown(r) {
   return `${parts.join(" − ")} = ${r.available}`;
 }
 
+// Search + "Low Stock only" filter, and click-to-sort on Category/Available —
+// the same toolbar/sort affordances every other list page in this app already
+// has (Asset Assignment, Transfers, Refill Log...), brought to Stock Summary
+// too. Sort state persists across edits/repaints; only renderStock() (search
+// text changing, filter toggling) rebuilds the toolbar itself.
+let stockFilter = { q: "", lowOnly: false };
+let stockSort = { key: "category", dir: "asc" };
+
+function stockSortArrow(key) {
+  if (stockSort.key !== key) return "";
+  return stockSort.dir === "asc" ? "▲" : "▼";
+}
+
+function getFilteredSortedStock() {
+  let rows = computeStockSummary();
+  if (stockFilter.q) rows = rows.filter(r => r.category.toLowerCase().includes(stockFilter.q));
+  if (stockFilter.lowOnly) rows = rows.filter(r => r.low);
+  const { key, dir } = stockSort;
+  const mul = dir === "asc" ? 1 : -1;
+  return rows.sort((a, b) => typeof a[key] === "string"
+    ? a[key].localeCompare(b[key]) * mul
+    : (a[key] - b[key]) * mul);
+}
+
 function renderStock() {
   const content = document.getElementById("content");
-  const rows = computeStockSummary();
   const admin = isAdmin();
   content.innerHTML = `
     ${viewerNotice()}
@@ -4507,33 +4530,79 @@ function renderStock() {
         <div><h2>Stock Summary</h2><div class="sub">Auto-calculated from Asset Assignment + Stock Refill Log + Asset Transfers. Repair / Faulty / Lost / Scrap and Threshold are editable${admin ? "" : " (Admin only)"}.</div></div>
         <button class="btn btn-secondary btn-sm" onclick="goto('transfers')">Asset Transfers →</button>
       </div>
-      <div class="table-wrap"><table>
+      <div class="toolbar">
+        <div class="search-box"><input type="text" id="stockSearch" placeholder="Search category..." value="${escapeHtml(stockFilter.q)}" /></div>
+        <label class="stock-lowonly-toggle"><input type="checkbox" id="stockLowOnly" ${stockFilter.lowOnly ? "checked" : ""}> ⚠ Low stock only</label>
+        <button class="btn btn-secondary btn-sm" id="stockClearFiltersBtn" style="display:none">Clear filters</button>
+      </div>
+      <div class="table-wrap"><table class="stock-table">
+        <colgroup>
+          <col style="width:176px"><col style="width:90px"><col style="width:88px"><col style="width:104px">
+          <col style="width:108px"><col style="width:86px"><col style="width:78px"><col style="width:68px"><col style="width:68px">
+          <col style="width:88px"><col style="width:80px"><col style="width:100px">
+        </colgroup>
         <thead><tr>
-          <th>Category</th><th>Total Stock</th><th>Assigned</th><th title="Total Stock minus Assigned only — doesn't account for Custody, Repair, Faulty, Lost, or Scrap">Total − Assigned</th><th title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th><th>Under Repair</th><th>Faulty</th>
-          <th>Lost</th><th>Scrap</th><th>Available</th><th>Threshold</th><th>Alert</th>
+          <th class="stock-sortable" data-sort="category">Category <span class="stock-sort-arrow">${stockSortArrow("category")}</span></th>
+          <th>Total Stock</th><th>Assigned</th><th title="Total Stock minus Assigned only — doesn't account for Custody, Repair, Faulty, Lost, or Scrap">Total − Assigned</th>
+          <th class="stock-div" title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th>
+          <th class="stock-div stock-div-accent">Under Repair</th><th>Faulty</th><th>Lost</th><th>Scrap</th>
+          <th class="stock-div stock-sortable" data-sort="available">Available <span class="stock-sort-arrow">${stockSortArrow("available")}</span></th><th>Threshold</th><th>Alert</th>
         </tr></thead>
-        <tbody>
-          ${rows.map(r => `
+        <tbody id="stockTbody"></tbody>
+      </table></div>
+    </div>
+  `;
+  document.getElementById("stockSearch").oninput = (e) => { stockFilter.q = e.target.value.toLowerCase(); paintStockTable(); };
+  document.getElementById("stockLowOnly").onchange = (e) => { stockFilter.lowOnly = e.target.checked; paintStockTable(); };
+  document.getElementById("stockClearFiltersBtn").onclick = () => {
+    stockFilter = { q: "", lowOnly: false };
+    document.getElementById("stockSearch").value = "";
+    document.getElementById("stockLowOnly").checked = false;
+    paintStockTable();
+  };
+  document.querySelectorAll(".stock-sortable").forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.sort;
+      stockSort = stockSort.key === key ? { key, dir: stockSort.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" };
+      document.querySelectorAll(".stock-sortable").forEach(h => {
+        h.querySelector(".stock-sort-arrow").textContent = stockSortArrow(h.dataset.sort);
+      });
+      paintStockTable();
+    };
+  });
+  paintStockTable();
+}
+
+function paintStockTable() {
+  const tbody = document.getElementById("stockTbody");
+  if (!tbody) return;
+  const admin = isAdmin();
+  const rows = getFilteredSortedStock();
+  const filterActive = !!(stockFilter.q || stockFilter.lowOnly);
+  const clearBtn = document.getElementById("stockClearFiltersBtn");
+  if (clearBtn) clearBtn.style.display = filterActive ? "" : "none";
+
+  tbody.innerHTML = rows.length ? rows.map(r => `
             <tr>
               <td><strong>${escapeHtml(r.category)}</strong></td>
               <td>${r.total}${r.receivedTotal ? `<div class="muted" style="font-size:11px;">incl. ${r.receivedTotal} received</div>` : ""}</td>
               <td>${r.assigned}${r.sentTotal ? `<div class="muted" style="font-size:11px;">${r.assignedToEmployees} to employees + ${r.sentTotal} sent to other offices</div>` : ""}</td>
-              <td style="${r.netAfterAssigned < 0 ? "color:var(--red)" : ""}">${r.netAfterAssigned}</td>
-              <td>${r.custodyHeld ? `<a href="#" onclick="event.preventDefault();assignFilter.custody='custody';goto('assignment');">${r.custodyHeld} 📦</a>` : "0"}</td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="faulty" value="${r.faulty}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="lost" value="${r.lost}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="scrap" value="${r.scrap}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
-              <td><strong style="${r.available < 0 ? "color:var(--red)" : ""}">${r.available}</strong></td>
-              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="threshold" value="${r.threshold}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
+              <td class="${r.netAfterAssigned < 0 ? "stock-negative" : ""}">${r.netAfterAssigned}</td>
+              <td class="stock-div">${r.custodyHeld ? `<a href="#" onclick="event.preventDefault();assignFilter.custody='custody';goto('assignment');">${r.custodyHeld} 📦</a>` : "0"}</td>
+              <td class="stock-div stock-div-accent"><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"}></td>
+              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="faulty" value="${r.faulty}" ${admin ? "" : "disabled"}></td>
+              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="lost" value="${r.lost}" ${admin ? "" : "disabled"}></td>
+              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="scrap" value="${r.scrap}" ${admin ? "" : "disabled"}></td>
+              <td class="stock-div"><strong class="${r.available < 0 ? "stock-negative" : ""}">${r.available}</strong></td>
+              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="threshold" value="${r.threshold}" ${admin ? "" : "disabled"}></td>
               <td>${statusBadge(r.low ? "⚠ Low Stock" : "OK")}</td>
             </tr>
-            ${r.available < 0 ? `<tr><td></td><td colspan="11" class="muted" style="font-size:11.5px;color:var(--red);padding-top:0;">${stockShortfallBreakdown(r)}</td></tr>` : ""}
-          `).join("")}
-        </tbody>
-      </table></div>
-    </div>
-  `;
+            ${r.available < 0 ? `<tr class="stock-note-row"><td></td><td colspan="11">${stockShortfallBreakdown(r)}</td></tr>` : ""}
+  `).join("") : `<tr class="empty-row"><td colspan="12">No categories match your search/filter. <a href="#" id="stockEmptyClear" style="color:var(--primary);font-weight:600;">Clear filters</a></td></tr>`;
+
+  const emptyClear = document.getElementById("stockEmptyClear");
+  if (emptyClear) emptyClear.onclick = (e) => { e.preventDefault(); document.getElementById("stockClearFiltersBtn").click(); };
+
   if (admin) {
     document.querySelectorAll(".stock-edit").forEach(inp => {
       inp.onchange = () => {
@@ -4542,7 +4611,7 @@ function renderStock() {
         DB.stockManual[cat][field] = Number(inp.value) || 0;
         saveMeta();
         logAction("Edited stock summary", `${cat} — ${field} set to ${DB.stockManual[cat][field]}`);
-        renderStock();
+        paintStockTable();
       };
     });
   }
