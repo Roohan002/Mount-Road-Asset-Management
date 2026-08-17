@@ -727,10 +727,14 @@ function computeStockSummary() {
     const assigned = assignedToEmployees + sentTotal;
     const manual = DB.stockManual[name] || { underRepair: 0, faulty: 0, lost: 0, scrap: 0, threshold: 5 };
     const total = refillTotal + receivedTotal;
+    // Total minus Assigned only — no Custody/Repair/Faulty/Lost/Scrap folded
+    // in. A quick "what's left after handouts" number, separate from
+    // Available (below), which nets out everything.
+    const netAfterAssigned = total - assigned;
     const available = total - assigned - custodyHeld - manual.underRepair - manual.faulty - manual.lost - manual.scrap;
     const low = available <= manual.threshold;
     return {
-      category: name, total, assigned, assignedToEmployees, sentTotal, receivedTotal, custodyHeld,
+      category: name, total, assigned, assignedToEmployees, sentTotal, receivedTotal, custodyHeld, netAfterAssigned,
       underRepair: manual.underRepair, faulty: manual.faulty, lost: manual.lost, scrap: manual.scrap,
       threshold: manual.threshold, available, low,
     };
@@ -4505,7 +4509,7 @@ function renderStock() {
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Category</th><th>Total Stock</th><th>Assigned</th><th title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th><th>Under Repair</th><th>Faulty</th>
+          <th>Category</th><th>Total Stock</th><th>Assigned</th><th title="Total Stock minus Assigned only — doesn't account for Custody, Repair, Faulty, Lost, or Scrap">Total − Assigned</th><th title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th><th>Under Repair</th><th>Faulty</th>
           <th>Lost</th><th>Scrap</th><th>Available</th><th>Threshold</th><th>Alert</th>
         </tr></thead>
         <tbody>
@@ -4514,6 +4518,7 @@ function renderStock() {
               <td><strong>${escapeHtml(r.category)}</strong></td>
               <td>${r.total}${r.receivedTotal ? `<div class="muted" style="font-size:11px;">incl. ${r.receivedTotal} received</div>` : ""}</td>
               <td>${r.assigned}${r.sentTotal ? `<div class="muted" style="font-size:11px;">${r.assignedToEmployees} to employees + ${r.sentTotal} sent to other offices</div>` : ""}</td>
+              <td style="${r.netAfterAssigned < 0 ? "color:var(--red)" : ""}">${r.netAfterAssigned}</td>
               <td>${r.custodyHeld ? `<a href="#" onclick="event.preventDefault();assignFilter.custody='custody';goto('assignment');">${r.custodyHeld} 📦</a>` : "0"}</td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="faulty" value="${r.faulty}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
@@ -4523,7 +4528,7 @@ function renderStock() {
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="threshold" value="${r.threshold}" ${admin ? "" : "disabled"} style="width:64px;padding:5px 7px;border-radius:6px;border:1px solid var(--border)"></td>
               <td>${statusBadge(r.low ? "⚠ Low Stock" : "OK")}</td>
             </tr>
-            ${r.available < 0 ? `<tr><td></td><td colspan="10" class="muted" style="font-size:11.5px;color:var(--red);padding-top:0;">${stockShortfallBreakdown(r)}</td></tr>` : ""}
+            ${r.available < 0 ? `<tr><td></td><td colspan="11" class="muted" style="font-size:11.5px;color:var(--red);padding-top:0;">${stockShortfallBreakdown(r)}</td></tr>` : ""}
           `).join("")}
         </tbody>
       </table></div>
@@ -5284,7 +5289,7 @@ function reportRows(kind) {
     case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "", "Linked Asset Request": a.sourceRequestId || "", "Reassigned From": a.reassignedFromEmployee || "", "Custody Holding": a.custodyHolder ? "Yes" : "No" }));
     case "returns": return getReturnedAssignments().map(a => ({ "Return Date": a.returnDate || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Returned By": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "" }));
     case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
-    case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "With Custodians": r.custodyHeld, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
+    case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Total - Assigned": r.netAfterAssigned, "With Custodians": r.custodyHeld, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
     case "refill": return DB.refills.map(r => ({ "Date": r.date || "", "Category": r.category || "", "Quantity Added": r.quantity || 0, "Added By": r.addedBy || "", "Source / Remarks": r.source || "" }));
     case "transfers": return DB.transfers.map(t => ({ "Date": t.date || "", "Direction": t.direction || "", "Other Office": t.otherOffice || "", "Asset Type": t.assetType || "", "Quantity": t.quantity || 0, "Tags / Serials": t.assetTags || "", "Handled By": t.handledBy || "", "Remarks": t.remarks || "" }));
     case "categories": return DB.categories.map(c => ({ "Category": c.name || "", "Notes": c.notes || "" }));
