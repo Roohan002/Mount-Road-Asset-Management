@@ -105,12 +105,15 @@ service cloud.firestore {
       }
       match /logs/{logId} {
         allow read: if canViewOffice(officeId);
-        // Append-only: anyone who can edit this office — OR a Team Lead logging
-        // their own actions (submitting a request, etc.) — can WRITE A NEW log
-        // entry, but nobody — not even an Admin — can modify or delete one that
-        // already exists. That's what makes the audit trail actually trustworthy.
+        // Anyone who can edit this office — OR a Team Lead logging their own
+        // actions (submitting a request, etc.) — can WRITE A NEW log entry.
+        // The CONTENT of an existing entry can never be changed by anyone
+        // (allow update: if false) — that part stays tamper-proof. Deleting
+        // an entry outright is Super-Admin-only, same as every other delete
+        // in this app — not a general-purpose "edit history" tool.
         allow create: if canEditOffice(officeId) || isTeamLead(officeId);
-        allow update, delete: if false;
+        allow update: if false;
+        allow delete: if isSuperAdmin();
       }
 
       // Asset Requests: Team Leads submit and track their OWN requests only;

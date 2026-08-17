@@ -5194,8 +5194,8 @@ function renderActivityLog() {
         <select class="filter-select" id="logUserFilter"><option value="">All users</option></select>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>When</th><th>User</th><th>Action</th><th>Details</th></tr></thead>
-        <tbody id="logTbody"><tr class="empty-row"><td colspan="4">Loading…</td></tr></tbody>
+        <thead><tr><th>When</th><th>User</th><th>Action</th><th>Details</th>${isSuperAdmin() ? "<th></th>" : ""}</tr></thead>
+        <tbody id="logTbody"><tr class="empty-row"><td colspan="5">Loading…</td></tr></tbody>
       </table></div>
     </div>
   `;
@@ -5208,11 +5208,11 @@ function renderActivityLog() {
 async function loadActivityLog() {
   if (!fdb || !currentOfficeId) return;
   const tbody = document.getElementById("logTbody");
-  if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="4">Loading…</td></tr>`;
+  if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="5">Loading…</td></tr>`;
   try {
     const snap = await logsCollRef().orderBy("ts", "desc").limit(500).get();
     activityLogCache = [];
-    snap.forEach(doc => activityLogCache.push(doc.data()));
+    snap.forEach(doc => activityLogCache.push({ ...doc.data(), _logId: doc.id }));
 
     const userSel = document.getElementById("logUserFilter");
     if (userSel) {
@@ -5223,13 +5223,14 @@ async function loadActivityLog() {
     paintLogTable();
   } catch (err) {
     console.error(err);
-    if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="4">Couldn't load the activity log — check your Firestore Rules cover the "logs" subcollection.</td></tr>`;
+    if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="5">Couldn't load the activity log — check your Firestore Rules cover the "logs" subcollection.</td></tr>`;
   }
 }
 
 function paintLogTable() {
   const tbody = document.getElementById("logTbody");
   if (!tbody) return;
+  const superAdmin = isSuperAdmin();
   let rows = [...activityLogCache];
   if (activityLogFilter.user) rows = rows.filter(l => l.email === activityLogFilter.user);
   if (activityLogFilter.q) {
@@ -5241,8 +5242,43 @@ function paintLogTable() {
       <td>${escapeHtml(l.email || "—")}</td>
       <td><strong>${escapeHtml(l.action || "—")}</strong></td>
       <td>${escapeHtml(l.details || "—")}</td>
+      ${superAdmin ? `<td><button class="btn btn-danger btn-sm btn-icon" title="Delete this entry (Super Admin only)" onclick="deleteActivityLogEntry('${l._logId}')">🗑️</button></td>` : ""}
     </tr>
-  `).join("") : `<tr class="empty-row"><td colspan="4">No activity recorded yet for this office.</td></tr>`;
+  `).join("") : `<tr class="empty-row"><td colspan="5">No activity recorded yet for this office.</td></tr>`;
+}
+
+// Deleting a log entry is Super-Admin-only, same as every other delete in
+// this app — see firestore.rules for the server-side enforcement. Unlike
+// every other delete here, though, THIS one still leaves a trace of itself:
+// removing an entry writes a fresh "Deleted activity log entry" line, so
+// there's at least a visible marker that something was removed and by whom
+// — even though, deliberately, that marker could itself be deleted later.
+function deleteActivityLogEntry(logId) {
+  if (!requireSuperAdminOrWarn() || !logId) return;
+  const rec = activityLogCache.find(l => l._logId === logId);
+  openModal("Delete this log entry?", `
+    <p class="muted" style="margin-top:0">${rec ? `<strong>${escapeHtml(rec.action || "")}</strong> — ${escapeHtml(rec.details || "")} (${escapeHtml(rec.email || "")}, ${fmtDateTime(rec.ts)})` : ""}</p>
+    <p class="muted">This permanently removes it from the audit trail. A new entry will note that a log line was deleted, but not what it said.</p>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="cancelDelLog">Cancel</button>
+      <button class="btn btn-danger" id="confirmDelLog">Delete</button>
+    </div>`, () => {
+    document.getElementById("cancelDelLog").onclick = closeModal;
+    document.getElementById("confirmDelLog").onclick = () => {
+      logsCollRef().doc(logId).delete()
+        .then(() => {
+          activityLogCache = activityLogCache.filter(l => l._logId !== logId);
+          logAction("Deleted activity log entry", rec ? `${rec.action || ""} — ${fmtDateTime(rec.ts)} (${rec.email || ""})` : logId);
+          closeModal();
+          toast("Log entry deleted");
+          paintLogTable();
+        })
+        .catch(err => {
+          console.error(err);
+          toast("Couldn't delete — check your connection or admin access", "err");
+        });
+    };
+  });
 }
 
 function fmtDateTime(iso) {
