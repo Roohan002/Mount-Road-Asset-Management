@@ -1282,6 +1282,15 @@ function teamStatCards(ov) {
 // A Team Lead's "home" — their own team's asset picture front and center
 // (who has what, who has nothing, category mix, recent activity), plus their
 // own request queue below it so both halves of the job are in one place.
+// Bulk stock an Admin has issued to THIS Team Lead specifically (their own
+// sign-in email is on the record — see openAssignForm's custody checkbox),
+// still sitting with them, not yet handed to a real employee.
+function myCustodyStock() {
+  const myEmail = ((fauth.currentUser || {}).email || "").toLowerCase();
+  if (!myEmail) return [];
+  return DB.assignments.filter(a => a.custodyHolder && a.status === "Assigned" && (a.custodianEmail || "").toLowerCase() === myEmail);
+}
+
 function renderTeamLeadDashboard() {
   const content = document.getElementById("content");
   const team = myTeam();
@@ -1290,9 +1299,30 @@ function renderTeamLeadDashboard() {
   const reqSummary = computeRequestsSummary(mine);
   const recentRequests = mine.slice(0, 6);
   const recentTeamActivity = sortAssignmentsNewestFirst(ov.teamAssignments).slice(0, 8);
+  const myCustody = sortAssignmentsNewestFirst(myCustodyStock());
 
   content.innerHTML = `
     ${viewerNotice()}
+    ${myCustody.length ? `
+      <div class="card" style="margin-bottom:18px;">
+        <div class="card-header">
+          <div><h2>📦 My Custody Stock</h2><div class="sub">Bulk stock issued to you to hold and hand out — tick off each one as you give it to someone</div></div>
+        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Asset</th><th>Asset Tag</th><th>Received</th><th></th></tr></thead>
+          <tbody>
+            ${myCustody.map(a => `
+              <tr>
+                <td><strong>${escapeHtml(a.assetName)}</strong></td>
+                <td>${a.assetTagNo ? `<span class="badge badge-grey">${escapeHtml(a.assetTagNo)}</span>` : "—"}</td>
+                <td>${fmtDate(a.date)}</td>
+                <td><button class="btn btn-primary btn-sm" onclick="openRedistributeForm('${a.uid}')">✅ Given to employee</button></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table></div>
+      </div>
+    ` : ""}
     ${!team ? `
       <div class="viewer-note" style="align-items:flex-start;border-color:var(--amber,#e2a13b);">
         <span style="font-size:16px;">👋</span>
@@ -1989,10 +2019,19 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
       <div class="field"><label>Employee ID</label><input type="text" id="f_empid" value="${escapeHtml(editing ? editing.employeeId || "" : (requestPrefill ? requestPrefill.employeeCode || "" : ""))}"></div>
     </div>
     ${!editing && !quickReturn ? `
-    <label class="checkbox-row" style="display:flex;align-items:center;gap:8px;margin:2px 0 14px;font-size:13px;color:var(--text-faint);">
+    <label class="checkbox-row" style="display:flex;align-items:center;gap:8px;margin:2px 0 8px;font-size:13px;color:var(--text-faint);">
       <input type="checkbox" id="f_custody">
       📦 Bulk stock lot held by the person above (Team Lead/Manager) to redistribute to their team later — not a personal assignment
-    </label>` : ""}
+    </label>
+    <div class="field" id="f_custody_email_wrap" style="display:none;margin-bottom:14px;">
+      <label>Custodian's login email <span class="muted" style="font-weight:500;">(lets them redistribute this stock themselves from their Dashboard — must be their real sign-in email)</span></label>
+      <input type="email" id="f_custody_email" placeholder="teamlead@company.com">
+    </div>` : ""}
+    ${editing && editing.custodyHolder ? `
+    <div class="field" style="margin-bottom:14px;">
+      <label>📦 Custodian's login email <span class="muted" style="font-weight:500;">(this is still an active custody holding — set this so they can redistribute it themselves from their Dashboard)</span></label>
+      <input type="email" id="f_custody_email_edit" value="${escapeHtml(editing.custodianEmail || "")}" placeholder="teamlead@company.com">
+    </div>` : ""}
     <div class="field-row">
       <div class="field"><label>Department</label>
         <select id="f_dept"><option value="">—</option>${depts.map(d => `<option ${(editing ? editing.department === d : (requestPrefill && requestPrefill.department === d)) ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}</select>
@@ -2073,6 +2112,16 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
       document.getElementById("assetSelectNone").onclick = () => {
         document.querySelectorAll(".f_asset_multi").forEach(cb => cb.checked = false);
       };
+      // The custodian's login email only matters (and is only asked for) once
+      // "bulk stock lot" is ticked — it's what lets that person redistribute
+      // their own custody stock themselves later, from their Dashboard.
+      const custodyChkToggle = document.getElementById("f_custody");
+      const custodyEmailWrap = document.getElementById("f_custody_email_wrap");
+      if (custodyChkToggle) {
+        custodyChkToggle.addEventListener("change", () => {
+          custodyEmailWrap.style.display = custodyChkToggle.checked ? "" : "none";
+        });
+      }
     }
 
     document.getElementById("cancelBtn").onclick = closeModal;
@@ -2103,6 +2152,8 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
         const wasReturned = editing.status === "Returned";
         const rec = { ...common, assetName: document.getElementById("f_asset").value };
         Object.assign(editing, rec);
+        const custodyEmailEdit = document.getElementById("f_custody_email_edit");
+        if (custodyEmailEdit) editing.custodianEmail = custodyEmailEdit.value.trim().toLowerCase();
         saveRecord("assignments", editing);
         if (!wasReturned && editing.status === "Returned") {
           applyReturnSideEffects(editing);
@@ -2134,6 +2185,15 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
         // lumping it in with real personal assignments. See openRedistributeForm().
         const custodyChk = document.getElementById("f_custody");
         const isCustody = !!(custodyChk && custodyChk.checked);
+        // Their real sign-in email — not just their display name — is what lets
+        // Firestore Rules (and openRedistributeForm) recognize THIS specific
+        // person as the one allowed to redistribute this specific stock later,
+        // straight from their own Dashboard, without needing Admin rights.
+        const custodyEmail = isCustody ? document.getElementById("f_custody_email").value.trim().toLowerCase() : "";
+        if (isCustody && !custodyEmail) {
+          toast("Enter the custodian's login email — it's what lets them redistribute this stock themselves", "err");
+          return;
+        }
 
         const summaryParts = [];
         picks.forEach(({ assetName, qty }) => {
@@ -2147,6 +2207,7 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
               assetTagNo: nextAssetTagNo(assetName),
               sourceRequestId: requestPrefill ? requestPrefill.requestId : "",
               custodyHolder: isCustody,
+              custodianEmail: isCustody ? custodyEmail : "",
             };
             DB.assignments.push(newRec);
             newRecords.push(newRec);
@@ -2363,10 +2424,21 @@ function openReassignForm(returnedUidVal) {
 // "Assigned" the whole time) instead of closing one record and opening a
 // new one. Stock Summary's "With Custodians" count drops by 1 and its
 // "Assigned" (personal) count rises by 1 the moment this saves.
+//
+// Self-service for Team Leads: an Admin can redistribute anyone's custody
+// stock; a Team Lead can ONLY redistribute a holding that's actually theirs
+// — the one where custodianEmail matches their own sign-in email (set once,
+// by the Admin, at bulk-issue time — see openAssignForm's custody checkbox).
+// That email match is also enforced server-side in firestore.rules, so this
+// client-side check is a UX nicety, not the real security boundary.
 function openRedistributeForm(uidVal) {
-  if (!requireAdminOrWarn()) return;
   const rec = DB.assignments.find(a => a.uid === uidVal);
   if (!rec) { toast("Record not found", "err"); return; }
+  const myEmail = ((fauth.currentUser || {}).email || "").toLowerCase();
+  const isMyOwnCustody = isTeamLead() && rec.custodianEmail && rec.custodianEmail.toLowerCase() === myEmail;
+  if (!isAdmin() && !isMyOwnCustody) {
+    toast("You can only redistribute custody stock that's held under your own login", "err"); return;
+  }
   if (!rec.custodyHolder || rec.status !== "Assigned") {
     toast("This isn't an active custody holding", "err"); return;
   }
@@ -2435,7 +2507,11 @@ function openRedistributeForm(uidVal) {
       // Master Inventory tracks who currently has the asset — update it the
       // same way a normal edit/reassign would, so it doesn't keep showing
       // the custodian as the holder after the unit's actually moved on.
-      if (rec.assetTagNo) {
+      // Admin-only: a Team Lead redistributing their own custody stock has
+      // no write access to Inventory (by design — that stays an Admin
+      // concern), so skip this rather than surface a confusing permission
+      // error on an action that otherwise succeeded.
+      if (isAdmin() && rec.assetTagNo) {
         const inv = DB.inventory.find(i => i.assetId === rec.assetTagNo);
         if (inv) {
           inv.assignedTo = empName;
@@ -3197,10 +3273,32 @@ function wireRequestForm(vals, editing) {
     draftBtn.textContent = "Saving…";
     submitRequestForm(vals, editing, "Draft").finally(() => { draftBtn.disabled = false; draftBtn.textContent = label; });
   };
-  g("rf_reviewBtn").onclick = () => {
+  g("rf_reviewBtn").onclick = async () => {
     readRequestFormValues(vals);
     const err = validateRequestForm(vals);
     if (err) { toast(err, "err"); return; }
+    // Re-fetch requests right before the duplicate check, instead of trusting
+    // whatever's already sitting in DB.requests — this app loads data once,
+    // not live, so a request someone else resolved (Fulfilled/Rejected/
+    // Cancelled) since this page was opened would otherwise still look
+    // "active" here and wrongly block a legitimate new submission until
+    // someone thinks to hit Refresh Data. One extra read, only at the exact
+    // moment it actually matters.
+    const reviewBtn = g("rf_reviewBtn");
+    const label = reviewBtn.textContent;
+    reviewBtn.disabled = true;
+    reviewBtn.textContent = "Checking…";
+    try {
+      const snap = await requestsQuery().get();
+      const list = [];
+      snap.forEach(d => list.push(d.data()));
+      DB.requests = list;
+    } catch (refreshErr) {
+      console.error("Couldn't refresh requests before duplicate check:", refreshErr);
+    } finally {
+      reviewBtn.disabled = false;
+      reviewBtn.textContent = label;
+    }
     showRequestReviewStep(vals, editing);
   };
 }
@@ -5391,7 +5489,7 @@ function reportRows(kind) {
   const stock = kind === "stock" ? computeStockSummary() : null;
   switch (kind) {
     case "employees": return DB.employees.map(e => ({ "Employee ID": e.id || "", "Name": e.name || "", "Department": e.department || "", "Email": e.email || "", "Phone": e.phone || "" }));
-    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "", "Linked Asset Request": a.sourceRequestId || "", "Reassigned From": a.reassignedFromEmployee || "", "Custody Holding": a.custodyHolder ? "Yes" : "No" }));
+    case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "", "Linked Asset Request": a.sourceRequestId || "", "Reassigned From": a.reassignedFromEmployee || "", "Custody Holding": a.custodyHolder ? "Yes" : "No", "Custodian Email": a.custodianEmail || "" }));
     case "returns": return getReturnedAssignments().map(a => ({ "Return Date": a.returnDate || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Returned By": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "" }));
     case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
     case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Total - Assigned": r.netAfterAssigned, "With Custodians": r.custodyHeld, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));

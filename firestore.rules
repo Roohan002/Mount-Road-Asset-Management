@@ -78,6 +78,16 @@ service cloud.firestore {
       match /assignments/{recordId} {
         allow read: if canViewOffice(officeId);
         allow create, update: if canEditOffice(officeId);
+        // Self-service redistribute: a Team Lead may update ONLY a record
+        // that's an active custody holding (bulk stock an Admin issued to
+        // them) AND where THEY are the recorded custodian — matched by
+        // their own sign-in email, set once at bulk-issue time. This is
+        // what lets a Team Lead hand one unit from their own custody stock
+        // to a real employee straight from their Dashboard, with no other
+        // write access to this collection at all. See openRedistributeForm().
+        allow update: if isTeamLead(officeId)
+          && resource.data.custodyHolder == true
+          && resource.data.custodianEmail == request.auth.token.email;
         allow delete: if isSuperAdmin();
       }
       match /inventory/{recordId} {
