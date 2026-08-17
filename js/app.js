@@ -4760,9 +4760,9 @@ function renderStock() {
         <thead><tr>
           <th class="stock-sortable" data-sort="category">Category <span class="stock-sort-arrow">${stockSortArrow("category")}</span></th>
           <th>Total Stock</th><th>Assigned</th><th title="Total Stock minus Assigned only — doesn't account for Custody, Repair, Faulty, Lost, or Scrap">Total − Assigned</th>
-          <th class="stock-div" title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th>
-          <th class="stock-div stock-div-accent">Under Repair</th><th>Faulty</th><th>Lost</th><th>Scrap</th>
-          <th class="stock-div stock-sortable" data-sort="available">Available <span class="stock-sort-arrow">${stockSortArrow("available")}</span></th><th>Threshold</th><th>Alert</th>
+          <th title="Bulk stock held by a Team Lead/Manager, not yet with an end user">With Custodians</th>
+          <th>Under Repair</th><th>Faulty</th><th>Lost</th><th>Scrap</th>
+          <th class="stock-sortable" data-sort="available">Available <span class="stock-sort-arrow">${stockSortArrow("available")}</span></th><th>Threshold</th><th>Alert</th>
         </tr></thead>
         <tbody id="stockTbody"></tbody>
       </table></div>
@@ -4804,12 +4804,12 @@ function paintStockTable() {
               <td>${r.total}${r.receivedTotal ? `<div class="muted" style="font-size:11px;">incl. ${r.receivedTotal} received</div>` : ""}</td>
               <td>${r.assigned}${r.sentTotal ? `<div class="muted" style="font-size:11px;">${r.assignedToEmployees} to employees + ${r.sentTotal} sent to other offices</div>` : ""}</td>
               <td class="${r.netAfterAssigned < 0 ? "stock-negative" : ""}">${r.netAfterAssigned}</td>
-              <td class="stock-div">${r.custodyHeld ? `<a href="#" onclick="event.preventDefault();assignFilter.custody='custody';goto('assignment');">${r.custodyHeld} 📦</a>` : "0"}</td>
-              <td class="stock-div stock-div-accent"><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"}></td>
+              <td>${r.custodyHeld ? `<a href="#" onclick="event.preventDefault();assignFilter.custody='custody';goto('assignment');">${r.custodyHeld} 📦</a>` : "0"}</td>
+              <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="underRepair" value="${r.underRepair}" ${admin ? "" : "disabled"}></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="faulty" value="${r.faulty}" ${admin ? "" : "disabled"}></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="lost" value="${r.lost}" ${admin ? "" : "disabled"}></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="scrap" value="${r.scrap}" ${admin ? "" : "disabled"}></td>
-              <td class="stock-div"><strong class="${r.available < 0 ? "stock-negative" : ""}">${r.available}</strong></td>
+              <td><strong class="${r.available < 0 ? "stock-negative" : ""}">${r.available}</strong></td>
               <td><input type="number" min="0" class="stock-edit" data-cat="${escapeHtml(r.category)}" data-field="threshold" value="${r.threshold}" ${admin ? "" : "disabled"}></td>
               <td>${statusBadge(r.low ? "⚠ Low Stock" : "OK")}</td>
             </tr>
