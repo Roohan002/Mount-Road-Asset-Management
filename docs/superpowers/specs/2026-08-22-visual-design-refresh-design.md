@@ -84,8 +84,11 @@ two alternatives considered and rejected:
 - Add `--font-heading` (Manrope) and `--font-body` (Inter) custom
   properties; apply `--font-body` as the base `body` font-family (already
   effectively the default everywhere via inheritance) and `--font-heading`
-  to `h1`/`h2`/`h3`/`.page-title`/`.stat-card .value`/table `th` — i.e.
-  titles, card numbers, and column headers, not every label.
+  to `h1`/`h2`/`h3`/`.page-title`/`.stat-card .value` — i.e. titles and
+  card numbers. Table column headers (`thead th`) stay on `--font-body`,
+  matching the approved mockup exactly (only the page title and the big
+  stat numbers used Manrope there — table headers were rendered in Inter
+  in both compared options).
 - Define (or tighten) a type scale: page title, section header, card
   label, body text, caption/muted text — replacing today's somewhat ad
   hoc mix of one-off `font-size` values on individual rules, without
