@@ -430,7 +430,7 @@ tbody tr:hover{ background: var(--surface-2); }
 .btn-primary:hover{ filter:brightness(1.06); }
 .btn-secondary{ background: var(--surface); color:var(--text); border-color: var(--border); }
 .btn-secondary:hover{ background: var(--surface-2); }
-.btn-danger{ background: var(--red-light); color:#c33d28; }
+.btn-danger{ background: var(--red-light); color: var(--badge-red-text); }
 .btn-danger:hover{ filter:brightness(.97); }
 .btn-sm{ padding:6px 10px; font-size:12px; border-radius:7px; }
 .btn-icon{ padding:6px 8px; }
@@ -444,7 +444,7 @@ tbody tr:hover{ background: var(--surface-2); }
   transition: border-color .12s, background .12s;
 }
 .field input:focus, .field select:focus, .field textarea:focus{
-  outline:none; border-color: var(--primary); background:#fff;
+  outline:none; border-color: var(--primary); background: var(--surface);
 }
 .field input[readonly]{ background: var(--surface); color: var(--text-muted); cursor: not-allowed; }
 .field-row{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
@@ -482,7 +482,7 @@ tbody tr:hover{ background: var(--surface-2); }
   width:100%; padding:9px 12px 9px 34px; border-radius:9px; border:1.5px solid var(--border);
   font-size:13px; background:var(--surface-2);
 }
-.search-box input:focus{ outline:none; border-color:var(--primary); background:#fff; }
+.search-box input:focus{ outline:none; border-color:var(--primary); background: var(--surface); }
 .search-box::before{
   content:"🔍"; position:absolute; left:11px; top:50%; transform:translateY(-50%); font-size:12px; opacity:.55;
 }
@@ -495,7 +495,7 @@ tbody tr:hover{ background: var(--surface-2); }
 }
 .modal-overlay.open{ display:flex; }
 .modal{
-  background:#fff; border-radius:16px; width:100%; max-width:560px; box-shadow: var(--shadow-lg);
+  background: var(--surface); border-radius:16px; width:100%; max-width:560px; box-shadow: var(--shadow-lg);
   animation: pop .16s ease; margin-bottom:40px;
 }
 .modal.modal-wide{ max-width:820px; }
@@ -540,7 +540,7 @@ tbody tr:hover{ background: var(--surface-2); }
   display:flex; align-items:center; gap:9px; padding:7px 8px; border-radius:7px; cursor:pointer;
   font-size:13.3px; color:var(--text);
 }
-.asset-check-row:hover{ background:#fff; }
+.asset-check-row:hover{ background: var(--surface); }
 .asset-check-row input[type="checkbox"]{ width:15px; height:15px; accent-color: var(--primary); cursor:pointer; }
 .asset-check-row .f_asset_qty, .asset-check-row .rf_asset_qty{
   margin-left:auto; width:58px; padding:3px 6px; font-size:12.5px; text-align:center;
