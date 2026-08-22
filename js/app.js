@@ -538,12 +538,14 @@ async function refreshAllData() {
   await Promise.all(tasks);
   updateDataLoadWarning();
   updateRequestsNavBadge();
+  renderNotifBell();
 }
 // Resets the "couldn't load" banner on sign-out/office-switch so a stale
 // warning from a previous session/office never lingers into the next one.
 function stopDataSync() {
   dataLoadFailures = new Set();
   updateDataLoadWarning();
+  closeNotifPanel();
 }
 
 function uid() {
@@ -948,6 +950,7 @@ function goto(page) {
   document.getElementById("sidebar").classList.remove("open");
   window.scrollTo(0, 0);
   updateRequestsNavBadge();
+  renderNotifBell();
 }
 // Unread-style count on the "Asset Requests" nav item — Submitted requests an
 // Admin hasn't looked at yet, same idea as a chat app's unread badge. Called
@@ -970,6 +973,225 @@ function updateRequestsNavBadge() {
     badge.remove();
   }
 }
+
+/* ---------------- Notification bell ----------------
+   A lightweight event feed derived entirely from data already in memory
+   (DB.requests + its embedded history[]) — no new Firestore collection, no
+   extra reads beyond what's already loaded. "Unread" is tracked per person
+   per office in localStorage (not Firestore), so opening the panel doesn't
+   cost a write — it just resets per-device instead of following you across
+   browsers, an acceptable tradeoff for staying on the free tier. */
+function notifSeenKey() {
+  return `notifSeen_${currentOfficeId || ""}_${(fauth.currentUser || {}).email || ""}`;
+}
+function getNotifSeenTs() {
+  return localStorage.getItem(notifSeenKey()) || "1970-01-01T00:00:00.000Z";
+}
+function setNotifSeenNow() {
+  localStorage.setItem(notifSeenKey(), nowISO());
+}
+
+// Admin/Office Admin/Super Admin: newly Submitted requests waiting on review.
+// Everyone (including a Team Lead, or an Admin filing on someone's behalf):
+// status changes on requests THEY submitted — approved, rejected, fulfilled,
+// partially fulfilled. Read straight off each request's own history[], so
+// there's nothing extra to fetch or keep in sync.
+function computeNotifications() {
+  if (!DB || !fauth || !fauth.currentUser) return [];
+  const admin = isAdmin();
+  const myEmail = fauth.currentUser.email || "";
+  const items = [];
+  (DB.requests || []).forEach(r => {
+    if (admin && r.status === "Submitted") {
+      items.push({
+        ts: r.updatedAt || r.createdAt || "",
+        icon: "📋",
+        text: `New request ${r.requestId || "(draft)"} — ${r.employeeName || "—"}`,
+        uid: r.uid,
+      });
+    }
+    if (r.requestedBy === myEmail) {
+      (r.history || []).forEach(h => {
+        if (["Approved", "Rejected", "Fulfilled", "Partially Fulfilled"].includes(h.toStatus)) {
+          const icon = h.toStatus === "Rejected" ? "❌" : h.toStatus === "Approved" ? "✅" : "📦";
+          items.push({
+            ts: h.ts,
+            icon,
+            text: `${r.requestId || r.uid} — ${h.toStatus}${r.employeeName ? ` (${r.employeeName})` : ""}`,
+            uid: r.uid,
+          });
+        }
+      });
+    }
+  });
+  items.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+  return items.slice(0, 30);
+}
+
+// Updates just the little red dot (cheap, safe to call constantly); only
+// repaints the actual dropdown list if it's currently open.
+function renderNotifBell() {
+  const dot = document.getElementById("notifDot");
+  if (!dot) return;
+  const seen = getNotifSeenTs();
+  const items = computeNotifications();
+  const unreadCount = items.filter(n => (n.ts || "") > seen).length;
+  dot.style.display = unreadCount > 0 ? "" : "none";
+
+  const panel = document.getElementById("notifPanel");
+  if (panel && panel.style.display !== "none") paintNotifPanel(items, seen);
+}
+
+function paintNotifPanel(items, seen) {
+  const panel = document.getElementById("notifPanel");
+  if (!panel) return;
+  panel.innerHTML = `
+    <div class="notif-panel-head">
+      <span>Notifications</span>
+      ${items.length ? `<button id="notifMarkReadBtn">Mark all read</button>` : ""}
+    </div>
+    <div class="notif-list">
+      ${items.length ? items.map(n => `
+        <button class="notif-item ${(n.ts || "") > seen ? "unread" : ""}" data-uid="${n.uid}">
+          <span class="notif-icon">${n.icon}</span>
+          <span class="notif-body">
+            <span class="notif-text">${escapeHtml(n.text)}</span>
+            <span class="notif-time">${fmtDateTime(n.ts)}</span>
+          </span>
+        </button>
+      `).join("") : `<div class="notif-empty">Nothing yet — you're all caught up.</div>`}
+    </div>
+  `;
+  panel.querySelectorAll(".notif-item").forEach(btn => {
+    btn.onclick = () => {
+      closeNotifPanel();
+      openRequestDetail(btn.dataset.uid);
+    };
+  });
+  const markBtn = document.getElementById("notifMarkReadBtn");
+  if (markBtn) markBtn.onclick = () => {
+    setNotifSeenNow();
+    renderNotifBell();
+  };
+}
+
+function toggleNotifPanel() {
+  const panel = document.getElementById("notifPanel");
+  if (!panel) return;
+  const opening = panel.style.display === "none";
+  panel.style.display = opening ? "" : "none";
+  if (opening) {
+    paintNotifPanel(computeNotifications(), getNotifSeenTs());
+    // Opening the panel is the "I looked" moment — mark read a moment later
+    // so the unread highlight is still visible when it first opens, instead
+    // of vanishing the instant the panel appears.
+    setTimeout(() => { setNotifSeenNow(); renderNotifBell(); }, 1200);
+  }
+}
+function closeNotifPanel() {
+  const panel = document.getElementById("notifPanel");
+  if (panel) panel.style.display = "none";
+}
+document.getElementById("notifBellBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  toggleNotifPanel();
+});
+document.addEventListener("click", (e) => {
+  const panel = document.getElementById("notifPanel");
+  const bell = document.getElementById("notifBellBtn");
+  if (!panel || panel.style.display === "none") return;
+  if (bell && (e.target === bell || bell.contains(e.target))) return;
+  if (panel.contains(e.target)) return;
+  closeNotifPanel();
+});
+
+/* ---------------- Global search ----------------
+   Searches whatever's already sitting in memory (DB.employees/assignments/
+   inventory/requests) — no extra Firestore reads at all, since everything
+   it looks through is already loaded for the page you're on. Jumping to an
+   Employee/Asset/Inventory result reuses that page's own existing search
+   filter (assignFilter.q, invFilter.q, empFilter.q) so it lands already
+   filtered down, instead of building a second, separate results screen. */
+function computeGlobalSearchResults(qRaw) {
+  const q = (qRaw || "").trim().toLowerCase();
+  if (!q || !DB) return null;
+  const employees = DB.employees
+    .filter(e => `${e.name || ""} ${e.id || ""} ${e.department || ""} ${e.email || ""}`.toLowerCase().includes(q))
+    .slice(0, 5);
+  const assets = DB.assignments
+    .filter(a => `${a.assetName || ""} ${a.assetTagNo || ""} ${a.employeeName || ""}`.toLowerCase().includes(q))
+    .slice(0, 5);
+  const inventory = (DB.inventory || [])
+    .filter(r => `${r.assetId || ""} ${r.assetName || ""} ${r.serial || ""} ${r.assignedTo || ""}`.toLowerCase().includes(q))
+    .slice(0, 5);
+  const requests = (DB.requests || [])
+    .filter(r => `${r.requestId || ""} ${r.employeeName || ""}`.toLowerCase().includes(q))
+    .slice(0, 5);
+  return { employees, assets, inventory, requests };
+}
+
+function paintGlobalSearch(q) {
+  const panel = document.getElementById("gsearchPanel");
+  if (!panel) return;
+  const results = computeGlobalSearchResults(q);
+  if (!results) { panel.style.display = "none"; return; }
+  const groups = [
+    { key: "employees", label: "Employees", icon: "👤", rows: results.employees, render: e => ({ text: e.name, sub: [e.id, e.department].filter(Boolean).join(" · ") }) },
+    { key: "assets", label: "Asset Assignment", icon: "🗂️", rows: results.assets, render: a => ({ text: `${a.assetName}${a.assetTagNo ? ` (${a.assetTagNo})` : ""}`, sub: a.employeeName || "" }) },
+    { key: "inventory", label: "Master Inventory", icon: "💻", rows: results.inventory, render: r => ({ text: r.assetId, sub: [r.assetName, r.assignedTo].filter(Boolean).join(" · ") }) },
+    { key: "requests", label: "Asset Requests", icon: "📋", rows: results.requests, render: r => ({ text: r.requestId || "(draft)", sub: r.employeeName || "" }) },
+  ].filter(g => g.rows.length);
+
+  if (!groups.length) {
+    panel.innerHTML = `<div class="notif-empty">No matches for "${escapeHtml(q)}"</div>`;
+    panel.style.display = "";
+    return;
+  }
+  panel.innerHTML = `<div class="gsearch-list">${groups.map(g => `
+    <div class="gsearch-group-label">${g.label}</div>
+    ${g.rows.map((row, i) => {
+      const info = g.render(row);
+      return `<button class="gsearch-item" data-group="${g.key}" data-idx="${i}">
+        <span class="gsearch-icon2">${g.icon}</span>
+        <span><span class="gsearch-text">${escapeHtml(info.text || "—")}</span>${info.sub ? `<div class="gsearch-sub">${escapeHtml(info.sub)}</div>` : ""}</span>
+      </button>`;
+    }).join("")}
+  `).join("")}</div>`;
+  panel.style.display = "";
+
+  panel.querySelectorAll(".gsearch-item").forEach(btn => {
+    btn.onclick = () => {
+      const group = btn.dataset.group;
+      const row = results[group][Number(btn.dataset.idx)];
+      closeGlobalSearch();
+      if (group === "employees") { empFilter.q = (row.name || "").toLowerCase(); goto("employees"); }
+      else if (group === "assets") { assignFilter.q = (row.assetTagNo || row.assetName || "").toLowerCase(); goto("assignment"); }
+      else if (group === "inventory") { invFilter.q = (row.assetId || "").toLowerCase(); goto("inventory"); }
+      else if (group === "requests") { openRequestDetail(row.uid); }
+    };
+  });
+}
+function closeGlobalSearch() {
+  const panel = document.getElementById("gsearchPanel");
+  if (panel) panel.style.display = "none";
+  const input = document.getElementById("gsearchInput");
+  if (input) input.value = "";
+}
+(() => {
+  const input = document.getElementById("gsearchInput");
+  if (!input) return;
+  input.addEventListener("input", () => paintGlobalSearch(input.value));
+  input.addEventListener("focus", () => { if (input.value.trim()) paintGlobalSearch(input.value); });
+  input.addEventListener("keydown", (e) => { if (e.key === "Escape") closeGlobalSearch(); });
+})();
+document.addEventListener("click", (e) => {
+  const wrap = document.querySelector(".gsearch-wrap");
+  if (!wrap) return;
+  const panel = document.getElementById("gsearchPanel");
+  if (!panel || panel.style.display === "none") return;
+  if (wrap.contains(e.target)) return;
+  closeGlobalSearch();
+});
 
 document.getElementById("nav").addEventListener("click", (e) => {
   const btn = e.target.closest(".nav-item");
@@ -1473,6 +1695,15 @@ function renderDashboard() {
 
   content.innerHTML = `
     ${viewerNotice()}
+    ${!isFreshOffice && lowStockRows.length ? `
+      <div class="viewer-note" style="align-items:flex-start;border-color:var(--amber);background:var(--amber-light);cursor:pointer;" title="Open Stock Summary, filtered to low stock" onclick="stockFilter.lowOnly=true;goto('stock');">
+        <span style="font-size:16px;line-height:1.4;">⚠️</span>
+        <div>
+          <strong>${lowStockRows.length} categor${lowStockRows.length === 1 ? "y is" : "ies are"} running low</strong>
+          <div style="margin-top:2px;">${lowStockRows.slice(0, 6).map(r => escapeHtml(r.category)).join(", ")}${lowStockRows.length > 6 ? `, +${lowStockRows.length - 6} more` : ""} — Available is at or below the threshold you set. Click to view.</div>
+        </div>
+      </div>
+    ` : ""}
     ${isFreshOffice ? `
       <div class="viewer-note" style="align-items:flex-start;">
         <span style="font-size:16px;line-height:1.4;">👋</span>
@@ -1743,6 +1974,7 @@ function wireAssignBulk(rows) {
       logAction("Bulk deleted assignments", `Deleted ${n} selected assignment record(s)`); toast("Selected assignments deleted"); paintAssignTable();
       if (currentPage === "assetRequests") renderAssetRequests();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
     });
   };
   const slipBtn = document.getElementById("bulkSlipBtn");
@@ -1767,6 +1999,7 @@ function wireAssignBulk(rows) {
         logAction("Bulk deleted assignments", `Deleted ${n} assignment record(s) matching current filters`); toast("All matching assignments deleted"); paintAssignTable();
         if (currentPage === "assetRequests") renderAssetRequests();
         if (currentPage === "dashboard") renderDashboard();
+        renderNotifBell();
       });
     };
   }
@@ -2252,6 +2485,7 @@ function openAssignForm(uidVal, quickReturn, requestPrefill) {
       closeModal();
       paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
     };
   });
 }
@@ -2311,6 +2545,7 @@ function deleteAssignment(uidVal) {
       deleteRecord("assignments", uidVal); logAction("Deleted assignment", rec ? `${rec.assetName} — ${rec.employeeName}` : uidVal); closeModal(); toast("Assignment deleted"); paintAssignTable();
       if (currentPage === "assetRequests") renderAssetRequests();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
     };
   });
 }
@@ -2429,6 +2664,7 @@ function openReassignForm(returnedUidVal) {
       if (currentPage === "returns") paintReturnsTable();
       if (currentPage === "assignment") paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
     };
   });
 }
@@ -2542,6 +2778,7 @@ function openRedistributeForm(uidVal) {
       if (currentPage === "assignment") paintAssignTable();
       if (currentPage === "stock") renderStock();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
     };
   });
 }
@@ -3491,6 +3728,7 @@ async function submitRequestForm(vals, editing, targetStatus) {
     : `Request ${rec.requestId} submitted`);
   if (currentPage === "assetRequests") renderAssetRequests();
   if (currentPage === "dashboard") renderDashboard();
+  renderNotifBell();
 }
 
 /* ---------- Admin review workflow (also used by Team Leads to view their own) ---------- */
@@ -3620,6 +3858,7 @@ function openRequestDetail(uidVal) {
       toast(label);
       if (currentPage === "assetRequests") renderAssetRequests();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
       if (opts && opts.reopen) openRequestDetail(rec.uid); else closeModal();
     };
 
@@ -3823,6 +4062,7 @@ function deleteRequest(uidVal) {
       if (currentPage === "assetRequests") renderAssetRequests();
       if (currentPage === "assignment") paintAssignTable();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
     };
   });
 }
@@ -4039,6 +4279,7 @@ function openFulfillFromCustodyForm(uidVal) {
       if (currentPage === "assignment") paintAssignTable();
       if (currentPage === "stock") renderStock();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
     };
   });
 }
@@ -4046,28 +4287,50 @@ function openFulfillFromCustodyForm(uidVal) {
 /* =========================================================
    MASTER INVENTORY
    ========================================================= */
-let invFilter = { q: "" };
+let invFilter = { q: "", warrantyOnly: false };
 let invSelected = new Set();
+
+// Where an asset's warranty stands today — "expired", "soon" (within 30
+// days), or "ok". Blank/never-set warranty dates are just left alone, not
+// treated as a problem — plenty of assets legitimately have none on file.
+function warrantyStatus(dateStr) {
+  if (!dateStr) return { state: "none", label: "—" };
+  const days = Math.floor((new Date(dateStr) - new Date(todayISO())) / 86400000);
+  if (days < 0) return { state: "expired", label: `Expired ${fmtDate(dateStr)}` };
+  if (days <= 30) return { state: "soon", label: `${fmtDate(dateStr)} (${days}d left)` };
+  return { state: "ok", label: fmtDate(dateStr) };
+}
 
 function renderInventory() {
   invSelected = new Set();
   const content = document.getElementById("content");
+  const warrantyAlerts = DB.inventory.filter(r => ["expired", "soon"].includes(warrantyStatus(r.warrantyExpiry).state));
   content.innerHTML = `
     ${viewerNotice()}
+    ${warrantyAlerts.length ? `
+      <div class="viewer-note" style="align-items:flex-start;border-color:var(--amber);background:var(--amber-light);cursor:pointer;" title="Filter to just these" onclick="invFilter.warrantyOnly=true;renderInventory();">
+        <span style="font-size:16px;line-height:1.4;">⚠️</span>
+        <div>
+          <strong>${warrantyAlerts.length} asset${warrantyAlerts.length === 1 ? "" : "s"} with warranty expired or expiring within 30 days</strong>
+          <div style="margin-top:2px;">${warrantyAlerts.slice(0, 6).map(r => escapeHtml(r.assetId)).join(", ")}${warrantyAlerts.length > 6 ? `, +${warrantyAlerts.length - 6} more` : ""} — click to filter the list below.</div>
+        </div>
+      </div>
+    ` : ""}
     <div class="card">
       <div class="card-header">
         <div><h2>Master Inventory</h2><div class="sub">${DB.inventory.length} individual assets tracked by Asset ID</div></div>
         ${isAdmin() ? `<button class="btn btn-primary" id="addInvBtn">+ Add Asset</button>` : ""}
       </div>
       <div class="toolbar">
-        <div class="search-box"><input type="text" id="invSearch" placeholder="Search asset ID, brand, serial, assignee..." /></div>
+        <div class="search-box"><input type="text" id="invSearch" placeholder="Search asset ID, brand, serial, assignee..." value="${escapeHtml(invFilter.q)}" /></div>
+        <label class="stock-lowonly-toggle"><input type="checkbox" id="invWarrantyOnly" ${invFilter.warrantyOnly ? "checked" : ""}> ⚠ Warranty issues only</label>
         <div id="invBulkBar"></div>
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
           ${isAdmin() ? `<th class="ck-col"><input type="checkbox" class="select-ck" id="invSelectAll"></th>` : ""}
           <th>Asset ID</th><th>Asset Name</th><th>Brand</th><th>Model</th><th>Serial</th>
-          <th>Purchase Date</th><th>Status</th><th>Assigned To</th><th>Floor</th><th>Condition</th>${isAdmin() ? "<th></th>" : ""}
+          <th>Purchase Date</th><th>Warranty</th><th>Status</th><th>Assigned To</th><th>Floor</th><th>Condition</th>${isAdmin() ? "<th></th>" : ""}
         </tr></thead>
         <tbody id="invTbody"></tbody>
       </table></div>
@@ -4075,6 +4338,7 @@ function renderInventory() {
   `;
   if (isAdmin()) document.getElementById("addInvBtn").onclick = () => openInvForm();
   document.getElementById("invSearch").oninput = (e) => { invFilter.q = e.target.value.toLowerCase(); paintInvTable(); };
+  document.getElementById("invWarrantyOnly").onchange = (e) => { invFilter.warrantyOnly = e.target.checked; paintInvTable(); };
   paintInvTable();
 }
 
@@ -4083,6 +4347,7 @@ function getFilteredInventory() {
   // added, so reversing gives most-recently-added items at the top.
   let rows = [...DB.inventory].reverse();
   if (invFilter.q) rows = rows.filter(r => Object.values(r).join(" ").toLowerCase().includes(invFilter.q));
+  if (invFilter.warrantyOnly) rows = rows.filter(r => ["expired", "soon"].includes(warrantyStatus(r.warrantyExpiry).state));
   return rows;
 }
 
@@ -4101,6 +4366,7 @@ function paintInvTable() {
       <td>${escapeHtml(r.model || "—")}</td>
       <td>${escapeHtml(r.serial || "—")}</td>
       <td>${r.purchaseDate ? fmtDate(r.purchaseDate) : "—"}</td>
+      <td>${(() => { const w = warrantyStatus(r.warrantyExpiry); return w.state === "expired" ? `<span class="badge badge-red">${escapeHtml(w.label)}</span>` : w.state === "soon" ? `<span class="badge badge-amber">${escapeHtml(w.label)}</span>` : escapeHtml(w.label); })()}</td>
       <td>${statusBadge(r.status)}</td>
       <td>${escapeHtml(r.assignedTo || "—")}</td>
       <td>${escapeHtml(r.floor || "—")}</td>
@@ -4112,7 +4378,7 @@ function paintInvTable() {
         </div>
       </td>` : ""}
     </tr>
-  `).join("") : `<tr class="empty-row"><td colspan="11">No assets yet — click "Add Asset" to register individual items (PCs, phones, etc.) beyond the category-level stock counts.</td></tr>`;
+  `).join("") : `<tr class="empty-row"><td colspan="12">No assets yet — click "Add Asset" to register individual items (PCs, phones, etc.) beyond the category-level stock counts.</td></tr>`;
 
   document.getElementById("invBulkBar").innerHTML = bulkToolbarHtml(invSelected.size, rows.length);
   wireInvBulk(rows);
@@ -4283,10 +4549,10 @@ function renderEmployees() {
         </div>
       </div>
       <div class="toolbar">
-        <div class="search-box"><input type="text" id="empSearch" placeholder="Search name or ID..." /></div>
+        <div class="search-box"><input type="text" id="empSearch" placeholder="Search name or ID..." value="${escapeHtml(empFilter.q)}" /></div>
         <select class="filter-select" id="empDeptFilter">
           <option value="">All departments</option>
-          ${depts.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join("")}
+          ${depts.map(d => `<option value="${escapeHtml(d)}" ${empFilter.dept === d ? "selected" : ""}>${escapeHtml(d)}</option>`).join("")}
         </select>
         <div id="empBulkBar"></div>
       </div>
@@ -5205,6 +5471,7 @@ function openTransferForm() {
       paintTransferTable();
       if (currentPage === "stock") renderStock();
       if (currentPage === "dashboard") renderDashboard();
+      renderNotifBell();
     };
   });
 }
@@ -5609,7 +5876,7 @@ function reportRows(kind) {
     case "employees": return DB.employees.map(e => ({ "Employee ID": e.id || "", "Name": e.name || "", "Department": e.department || "", "Email": e.email || "", "Phone": e.phone || "" }));
     case "assignment": return DB.assignments.map(a => ({ "Date": a.date || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Employee": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Assigned By": a.assignedBy || "", "Return Date": a.returnDate || "", "Status": a.status || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "", "Linked Asset Request": a.sourceRequestId || "", "Reassigned From": a.reassignedFromEmployee || "", "Custody Holding": a.custodyHolder ? "Yes" : "No", "Custodian Email": a.custodianEmail || "" }));
     case "returns": return getReturnedAssignments().map(a => ({ "Return Date": a.returnDate || "", "Asset": a.assetName || "", "Asset Tag": a.assetTagNo || "", "Returned By": a.employeeName || "", "Employee ID": a.employeeId || "", "Department": a.department || "", "Condition on Return": a.returnCondition || "", "Outcome": a.returnOutcome || "", "Remarks": a.remarks || "" }));
-    case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
+    case "inventory": return DB.inventory.map(r => ({ "Asset ID": r.assetId || "", "Asset Name": r.assetName || "", "Brand": r.brand || "", "Model": r.model || "", "Serial": r.serial || "", "Purchase Date": r.purchaseDate || "", "Purchase Cost": r.purchaseCost || "", "Vendor": r.vendor || "", "Warranty Expiry": r.warrantyExpiry || "", "Status": r.status || "", "Assigned To": r.assignedTo || "", "Floor": r.floor || "", "Condition": r.condition || "" }));
     case "stock": return stock.map(r => ({ "Category": r.category, "Total Stock": r.total, "Assigned": r.assigned, "Total - Assigned": r.netAfterAssigned, "With Custodians": r.custodyHeld, "Under Repair": r.underRepair, "Faulty": r.faulty, "Lost": r.lost, "Scrap": r.scrap, "Available": r.available, "Threshold": r.threshold, "Alert": r.low ? "Low Stock" : "OK" }));
     case "refill": return DB.refills.map(r => ({ "Date": r.date || "", "Category": r.category || "", "Quantity Added": r.quantity || 0, "Added By": r.addedBy || "", "Source / Remarks": r.source || "" }));
     case "transfers": return DB.transfers.map(t => ({ "Date": t.date || "", "Direction": t.direction || "", "Other Office": t.otherOffice || "", "Asset Type": t.assetType || "", "Quantity": t.quantity || 0, "Tags / Serials": t.assetTags || "", "Handled By": t.handledBy || "", "Remarks": t.remarks || "" }));
