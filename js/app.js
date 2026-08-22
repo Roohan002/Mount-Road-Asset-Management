@@ -3799,7 +3799,7 @@ function openRequestDetail(uidVal) {
     </div>
     ${admin && rec.status === "Approved" ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">📦</span><div>This request is approved but <strong>no asset has been handed over yet</strong> — nothing will show up on the Asset Assignment page until you click <strong>Assign Asset</strong> below and complete the handover.</div></div>` : ""}
     ${rec.status === "Partially Fulfilled" ? `<div class="viewer-note" style="border-color:var(--primary);"><span style="font-size:16px;">⏳</span><div><strong>Partially fulfilled</strong> — ${escapeHtml(getRequestItems(rec).filter(i => requestItemRemaining(i) > 0).map(i => `${requestItemLabel(i)} ×${requestItemRemaining(i)}`).join(", "))} still pending. Click <strong>Assign Asset</strong> once stock is available to give the rest.</div></div>` : ""}
-    ${rec.status === "Fulfilled" ? `<div class="viewer-note" style="border-color:var(--green,#22c55e);"><span style="font-size:16px;">✅</span><div>Fulfilled — everything on this request is recorded on the <a href="#" id="rd_gotoAssignment" style="color:var(--primary);font-weight:600;">Asset Assignment page</a>.</div></div>` : ""}
+    ${rec.status === "Fulfilled" ? `<div class="viewer-note" style="border-color:var(--teal);"><span style="font-size:16px;">✅</span><div>Fulfilled — everything on this request is recorded on the <a href="#" id="rd_gotoAssignment" style="color:var(--primary);font-weight:600;">Asset Assignment page</a>.</div></div>` : ""}
     ${teamConflict ? `<div class="viewer-note" style="align-items:flex-start;border-color:var(--red);background:var(--red-light);">
       <span style="font-size:16px;">⚠️</span>
       <div>
