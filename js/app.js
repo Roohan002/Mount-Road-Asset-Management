@@ -1218,6 +1218,30 @@ document.getElementById("refreshDataBtn").addEventListener("click", async () => 
     btn.textContent = label;
   }
 });
+// Theme toggle: cycles light -> dark -> follow-system -> light... A person
+// who has never touched it gets whatever their OS prefers (see the inline
+// script in index.html's <head>, which reads the same key before first
+// paint so there's no flash of the wrong theme); touching the toggle sets
+// an explicit override that sticks until they cycle back to "system."
+function applyThemePreference(pref) {
+  if (pref === "light" || pref === "dark") {
+    document.documentElement.setAttribute("data-theme", pref);
+    localStorage.setItem("themePreference", pref);
+  } else {
+    document.documentElement.removeAttribute("data-theme");
+    localStorage.removeItem("themePreference");
+  }
+  const label = document.getElementById("themeToggleLabel");
+  if (label) label.textContent = pref === "light" ? "Light" : pref === "dark" ? "Dark" : "Theme";
+}
+document.getElementById("themeToggleBtn").addEventListener("click", () => {
+  const current = localStorage.getItem("themePreference");
+  const next = current === "light" ? "dark" : current === "dark" ? null : "light";
+  applyThemePreference(next);
+});
+// Reflect whatever's already stored (set synchronously by index.html's
+// inline script) in the label on first paint.
+applyThemePreference(localStorage.getItem("themePreference"));
 document.getElementById("resetDataBtn").addEventListener("click", () => {
   // Wipes every record in the office — same "only a Super Admin can delete
   // anything" policy as the delete buttons themselves.
