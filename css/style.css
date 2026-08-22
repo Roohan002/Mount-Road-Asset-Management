@@ -135,6 +135,75 @@ h1, h2, h3, .page-title, .stat-card .value { font-family: var(--font-heading); }
 .page-title{ font-size: 18px; font-weight:700; margin:0; letter-spacing:-.01em; }
 .topbar-right{ margin-left:auto; display:flex; align-items:center; gap:8px; color: var(--text-muted); font-size:12.5px; }
 
+/* ---------- Notification bell ---------- */
+.notif-wrap{ position: relative; }
+.notif-bell{
+  position: relative; background:none; border:none; cursor:pointer;
+  font-size:19px; line-height:1; padding:8px; border-radius: 50%;
+  color: var(--text-muted); transition: background .15s ease, color .15s ease;
+}
+.notif-bell:hover{ background: var(--surface-2); color: var(--text); }
+.notif-bell:focus-visible{ outline:2px solid var(--primary); outline-offset:2px; }
+.notif-dot{
+  position:absolute; top:6px; right:6px; min-width:8px; height:8px; border-radius:50%;
+  background:#ef4444; border:1.5px solid var(--surface);
+}
+.notif-panel{
+  position:absolute; top: calc(100% + 8px); right:0; width:340px; max-width:88vw;
+  background: var(--surface); border:1px solid var(--border); border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg); z-index:60; overflow:hidden;
+}
+.notif-panel-head{
+  padding:12px 14px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between;
+  font-weight:700; font-size:13.5px; color:var(--text);
+}
+.notif-panel-head button{ background:none; border:none; color:var(--primary); font-size:11.5px; font-weight:600; cursor:pointer; }
+.notif-list{ max-height:360px; overflow-y:auto; }
+.notif-item{
+  display:flex; gap:10px; padding:11px 14px; text-align:left; width:100%;
+  background:none; border:none; border-bottom:1px solid var(--border); cursor:pointer; color:var(--text);
+}
+.notif-item:last-child{ border-bottom:none; }
+.notif-item:hover{ background: var(--surface-2); }
+.notif-item.unread{ background: var(--primary-light); }
+.notif-item .notif-icon{ font-size:15px; flex-shrink:0; }
+.notif-item .notif-body{ min-width:0; }
+.notif-item .notif-text{ font-size:12.8px; color:var(--text); line-height:1.35; }
+.notif-item .notif-time{ font-size:11px; color:var(--text-faint); margin-top:2px; }
+.notif-empty{ padding:28px 14px; text-align:center; color:var(--text-faint); font-size:12.8px; }
+
+/* ---------- Global search ---------- */
+.gsearch-wrap{ position:relative; }
+.gsearch-icon{
+  position:absolute; left:11px; top:50%; transform:translateY(-50%);
+  font-size:13px; color:var(--text-faint); pointer-events:none;
+}
+.gsearch-input{
+  width:220px; padding:8px 10px 8px 32px; border-radius:99px; border:1.5px solid var(--border);
+  background: var(--surface-2); color:var(--text); font-size:12.8px; font-family:inherit;
+  transition: width .18s ease, border-color .15s ease, background .15s ease;
+}
+.gsearch-input:focus{ outline:none; width:280px; border-color:var(--primary); background:var(--surface); }
+.gsearch-panel{
+  position:absolute; top: calc(100% + 8px); left:0; width:380px; max-width:88vw;
+  background: var(--surface); border:1px solid var(--border); border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg); z-index:60; overflow:hidden;
+}
+.gsearch-list{ max-height:420px; overflow-y:auto; }
+.gsearch-group-label{
+  padding:8px 14px 4px; font-size:10.5px; font-weight:800; letter-spacing:.05em;
+  text-transform:uppercase; color:var(--text-faint);
+}
+.gsearch-item{
+  display:flex; gap:10px; align-items:flex-start; padding:9px 14px; text-align:left; width:100%;
+  background:none; border:none; cursor:pointer; color:var(--text);
+}
+.gsearch-item:hover{ background: var(--surface-2); }
+.gsearch-item .gsearch-icon2{ font-size:14px; flex-shrink:0; margin-top:1px; }
+.gsearch-item .gsearch-text{ font-size:12.8px; font-weight:600; }
+.gsearch-item .gsearch-sub{ font-size:11px; color:var(--text-faint); margin-top:1px; }
+
 .content{ padding: 24px 28px 60px; max-width: 1400px; width:100%; margin: 0 auto; }
 
 /* ---------- Cards ---------- */
@@ -449,6 +518,9 @@ input:disabled, select:disabled, textarea:disabled{ background:var(--grey-light)
   .hamburger{ display:block; }
   .content{ padding: 18px 14px 50px; }
   .stat-grid{ grid-template-columns: 1fr 1fr; }
+  .gsearch-input{ width:120px; }
+  .gsearch-input:focus{ width:160px; }
+  .gsearch-panel{ width:300px; }
 }
 
 /* ---------- Loading & Firebase setup screens ---------- */
