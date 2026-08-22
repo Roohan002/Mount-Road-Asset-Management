@@ -7,3 +7,4 @@ ui-debug.log
 # OS cruft
 .DS_Store
 Thumbs.db
+.superpowers/
