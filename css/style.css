@@ -1,4 +1,4 @@
-﻿:root{
+:root{
   --bg: #f4f6fb;
   --surface: #ffffff;
   --surface-2: #f8f9fc;
@@ -43,10 +43,13 @@
   --badge-red-text: #c33d28;
   --badge-grey-text: #5b6172;
   --badge-purple-text: #6c3fd6;
+
+  color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    color-scheme: dark;
     --bg: #14161c;
     --surface: #1b1e27;
     --surface-2: #20232e;
@@ -85,6 +88,7 @@
   }
 }
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #14161c;
   --surface: #1b1e27;
   --surface-2: #20232e;
@@ -133,7 +137,7 @@ body{
   -webkit-font-smoothing: antialiased;
 }
 
-h1, h2, h3, .page-title, .stat-card .value { font-family: var(--font-heading); }
+h1, h2, h3, .page-title, .stat-value { font-family: var(--font-heading); }
 
 /* ---------- Layout ---------- */
 .app-shell{ display:flex; min-height:100vh; }

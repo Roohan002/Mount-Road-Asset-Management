@@ -1236,7 +1236,9 @@ function applyThemePreference(pref) {
 }
 document.getElementById("themeToggleBtn").addEventListener("click", () => {
   const current = localStorage.getItem("themePreference");
-  const next = current === "light" ? "dark" : current === "dark" ? null : "light";
+  const next = current === "light" ? "dark"
+    : current === "dark" ? null
+    : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
   applyThemePreference(next);
 });
 // Reflect whatever's already stored (set synchronously by index.html's
