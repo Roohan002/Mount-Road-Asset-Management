@@ -579,8 +579,8 @@ th.ck-col, td.ck-col{ width:38px; }
 
 /* ---------- Viewer / disabled states ---------- */
 .viewer-note{
-  display:flex; align-items:center; gap:8px; background: var(--amber-light); color:#8a5c15;
-  border:1px solid #f2ddb0; border-radius:10px; padding:10px 14px; font-size:12.8px; margin-bottom:16px;
+  display:flex; align-items:center; gap:8px; background: var(--amber-light); color:var(--badge-amber-text);
+  border:1px solid var(--amber); border-radius:10px; padding:10px 14px; font-size:12.8px; margin-bottom:16px;
 }
 input:disabled, select:disabled, textarea:disabled{ background:var(--grey-light); color:var(--text-faint); cursor:not-allowed; }
 .btn:disabled{ opacity:.45; cursor:not-allowed; }
@@ -786,8 +786,8 @@ input:disabled, select:disabled, textarea:disabled{ background:var(--grey-light)
 /* Smooth custom scrollbars everywhere */
 ::-webkit-scrollbar{ width:10px; height:10px; }
 ::-webkit-scrollbar-track{ background:transparent; }
-::-webkit-scrollbar-thumb{ background: #d3d7e6; border-radius:99px; border:2px solid var(--bg); }
-::-webkit-scrollbar-thumb:hover{ background:#b7bcd4; }
+::-webkit-scrollbar-thumb{ background: var(--border); border-radius:99px; border:2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover{ background: var(--text-faint); }
 .sidebar ::-webkit-scrollbar-thumb{ background: rgba(255,255,255,.18); border:none; }
 .sidebar ::-webkit-scrollbar-thumb:hover{ background: rgba(255,255,255,.3); }
 
